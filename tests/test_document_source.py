@@ -1,14 +1,14 @@
 import pytest
 import asyncio
 from typing import AsyncGenerator, Any
-from lance_indexer.plugins.base import (
+from mcp_indexer.plugins.base import (
     DocumentSource, 
     DocumentPointer, 
     create_embedding_chunks, 
     ChunkInfo
 )
-from lance_indexer.context import Context
-from lance_indexer.config import CollectionConfig
+from mcp_indexer.context import Context
+from mcp_indexer.config import CollectionConfig
 
 # Mock implementations for testing
 class MockDocumentPointer(DocumentPointer):

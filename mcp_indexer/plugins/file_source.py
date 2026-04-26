@@ -4,7 +4,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Generic, TypeVar, Any
 from pydantic import BaseModel, Field
-from lance_indexer.plugins.base import DocumentSource, DocumentPointer, ChunkInfo
+from mcp_indexer.plugins.base import DocumentSource, DocumentPointer, ChunkInfo
 
 class FileSourceConfig(BaseModel):
     """Base configuration for directory-based sources."""

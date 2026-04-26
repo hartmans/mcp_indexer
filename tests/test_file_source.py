@@ -4,9 +4,9 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import AsyncGenerator, Any
-from lance_indexer.plugins.file_source import FileSource, FileSourcePointer, FileSourceConfig
-from lance_indexer.context import Context
-from lance_indexer.config import CollectionConfig
+from mcp_indexer.plugins.file_source import FileSource, FileSourcePointer, FileSourceConfig
+from mcp_indexer.context import Context
+from mcp_indexer.config import CollectionConfig
 
 class ConcreteFileSource(FileSource):
     """Concrete implementation of FileSource for testing."""

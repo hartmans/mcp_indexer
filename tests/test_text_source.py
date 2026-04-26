@@ -4,8 +4,8 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import Any
-from lance_indexer.plugins.text_source import TextFileSource, TextFilePointer, TextFileSourceConfig
-from lance_indexer.context import Context
+from mcp_indexer.plugins.text_source import TextFileSource, TextFilePointer, TextFileSourceConfig
+from mcp_indexer.context import Context
 
 class SimpleCfg:
     def __init__(self, directory):

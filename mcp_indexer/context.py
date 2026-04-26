@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import lancedb
 from lancedb.embeddings import EmbeddingFunction
 from langchain_core.language_models.chat_models import BaseChatModel
-from lance_indexer.config import ConfigManager
+from mcp_indexer.config import ConfigManager
 
 @dataclass
 class Context:

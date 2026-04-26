@@ -2,8 +2,8 @@ import re
 from pathlib import Path
 from typing import List, Optional
 from pydantic import Field
-from lance_indexer.plugins.base import DocumentPointer, Document
-from lance_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSourcePointer
+from mcp_indexer.plugins.base import DocumentPointer, Document
+from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSourcePointer
 
 class TextFileSourceConfig(FileSourceConfig):
     """Configuration for the TextFileSource plugin."""
