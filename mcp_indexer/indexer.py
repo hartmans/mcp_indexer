@@ -1,9 +1,12 @@
+import asyncio
 import lancedb
 from typing import List, Optional, Any
 from datetime import datetime
 from mcp_indexer.context import Context
 from mcp_indexer.config import ConfigManager
 from mcp_indexer.plugins.base import Document, DocumentChunk, create_embedding_chunks
+
+INDEXING_WORKERS = 20
 
 class Indexer:
     """
@@ -28,34 +31,48 @@ class Indexer:
         )
         
         # 3. Ensure the LanceDB tables exist for this collection
-        # We use the collection_id as the table name
-        # We define the primary key for upsert functionality
-        table = self.context.db.create_table(
+        # Use a helper to get or create tables without overwriting existing data
+        table = self._get_or_create_table(
             collection_id, 
             schema=DocumentChunk, 
-            primary_key=["document_id", "chunk_id"],
-            mode="overwrite"
+            primary_key="chunk_id"
         )
         
         # Metadata table
-        meta_table = self.context.db.create_table(
+        meta_table = self._get_or_create_table(
             f"{collection_id}_meta", 
             schema=Document, 
-            primary_key="document_id",
-            mode="overwrite"
+            primary_key="document_id"
         )
 
-        # 4. Process documents
+        # 4. Process documents in parallel
+        sem = asyncio.Semaphore(INDEXING_WORKERS)
+        tasks = []
+
+        async def wrapped_process(pointer):
+            async with sem:
+                await self._process_document(pointer, col_config, table, meta_table)
+
         async for pointer in source.get_documents():
+            tasks.append(asyncio.create_task(wrapped_process(pointer)))
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _process_document(self, pointer, col_config, table, meta_table):
+        """
+        Processes a single document: generates summary, embedding, and chunks.
+        """
+        try:
             # a. Handle Document Metadata
             metadata_dict = await pointer.get_metadata()
             
             # Generate document summary and embedding
             doc_text = " ".join(await self._collect_all_text(pointer))
-            doc_summary = await self.context.llm([
+            doc_summary_list = await self.context.llm([
                 f"{col_config.summary_prompt}\n\n{doc_text}"
             ])
-            doc_summary = doc_summary[0]
+            doc_summary = doc_summary_list[0]
             
             doc_vector = await self.context.embedding.query(doc_summary)
 
@@ -81,10 +98,10 @@ class Indexer:
                     chunk_text = "".join(e_text_list)
                     
                     # Generate chunk summary and embedding
-                    chunk_summary = await self.context.llm([
+                    chunk_summary_list = await self.context.llm([
                         f"{col_config.summary_prompt}\n\n{chunk_text}"
                     ])
-                    chunk_summary = chunk_summary[0]
+                    chunk_summary = chunk_summary_list[0]
                     
                     chunk_vector = await self.context.embedding.query(chunk_summary)
                     
@@ -99,6 +116,21 @@ class Indexer:
             
             if chunks_to_index:
                 table.upsert(chunks_to_index)
+        except Exception as e:
+            print(f"Error processing document {pointer.document_id}: {e}")
+
+    def _get_or_create_table(self, name: str, schema: Any, primary_key: Any):
+        """
+        Returns the table if it exists, otherwise creates it.
+        """
+        try:
+            return self.context.db.open_table(name)
+        except:
+            return self.context.db.create_table(
+                name, 
+                schema=schema, 
+                primary_key=primary_key
+            )
 
     async def _collect_all_text(self, pointer) -> List[str]:
         """Helper to collect all text from a document for high-level summary."""
