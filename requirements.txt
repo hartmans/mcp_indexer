@@ -1,0 +1,9 @@
+lancedb
+pydantic
+mcp
+openai
+
+langchain
+langgraph
+pytest
+pytest-asyncio
