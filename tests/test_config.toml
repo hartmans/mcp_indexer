@@ -1,0 +1,22 @@
+[server]
+db_uri = "/tmp/lancedb_test"
+log_level = "DEBUG"
+
+[server.llm]
+model = "gemma4:31b"
+model_provider = "ollama"
+base_url = "http://localhost:11434"
+
+[server.embedding]
+model = "qwen3-embedding:4b"
+model_provider = "ollama"
+base_url = "http://localhost:11434"
+
+[defaults]
+summary_prompt = "Summarize the following text concisely..."
+embedding_model = "qwen3-embedding:4b"
+
+[collections.test_col]
+tool_prefix = "test"
+description = "Test collection"
+source_config = { type = "text", content = "hello world" }

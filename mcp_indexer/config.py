@@ -9,6 +9,8 @@ class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
     db_uri: str = "~/.lancedb"
     log_level: str = "INFO"
+    llm: Dict[str, Any] = Field(default_factory=dict)
+    embedding: Dict[str, Any] = Field(default_factory=dict)
 
 class CollectionInfraConfig(BaseModel):
     """
