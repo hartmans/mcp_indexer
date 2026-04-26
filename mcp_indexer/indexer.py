@@ -29,9 +29,11 @@ class Indexer:
         
         # 3. Ensure the LanceDB tables exist for this collection
         # We use the collection_id as the table name
+        # We define the primary key for upsert functionality
         table = self.context.db.create_table(
             collection_id, 
             schema=DocumentChunk, 
+            primary_key=["document_id", "chunk_id"],
             mode="overwrite"
         )
         
@@ -39,6 +41,7 @@ class Indexer:
         meta_table = self.context.db.create_table(
             f"{collection_id}_meta", 
             schema=Document, 
+            primary_key="document_id",
             mode="overwrite"
         )
 
@@ -48,7 +51,6 @@ class Indexer:
             metadata_dict = await pointer.get_metadata()
             
             # Generate document summary and embedding
-            # Using the prompt from the collection config
             doc_text = " ".join(await self._collect_all_text(pointer))
             doc_summary = await self.context.llm([
                 f"{col_config.summary_prompt}\n\n{doc_text}"
