@@ -22,6 +22,7 @@ class Indexer:
         """
         # 1. Resolve configuration
         col_config = self.config_manager.get_collection_config(collection_id)
+        server_config = self.config_manager.get_server_config()
         
         # 2. Initialize the plugin
         source = source_plugin_class(
@@ -31,7 +32,6 @@ class Indexer:
         )
         
         # 3. Ensure the LanceDB tables exist for this collection
-        # Use a helper to get or create tables without overwriting existing data
         table = self._get_or_create_table(
             collection_id, 
             schema=DocumentChunk, 
@@ -51,7 +51,14 @@ class Indexer:
 
         async def wrapped_process(pointer):
             async with sem:
-                await self._process_document(pointer, col_config, table, meta_table)
+                await self._process_document(
+                    pointer, 
+                    col_config, 
+                    table, 
+                    meta_table, 
+                    server_config.min_size, 
+                    server_config.max_size
+                )
 
         async for pointer in source.get_documents():
             tasks.append(asyncio.create_task(wrapped_process(pointer)))
@@ -59,7 +66,7 @@ class Indexer:
         if tasks:
             await asyncio.gather(*tasks)
 
-    async def _process_document(self, pointer, col_config, table, meta_table):
+    async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         """
         Processes a single document: generates summary, embedding, and chunks.
         """
@@ -92,8 +99,8 @@ class Indexer:
                 # Transform semantic chunks -> embedding chunks
                 async for e_meta, e_text_list in create_embedding_chunks(
                     self._wrap_semantic_chunk((meta, text_list)), 
-                    min_size=100, 
-                    max_size=1000
+                    min_size=min_size, 
+                    max_size=max_size
                 ):
                     chunk_text = "".join(e_text_list)
                     

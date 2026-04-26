@@ -11,6 +11,8 @@ class ServerConfig(BaseModel):
     log_level: str = "INFO"
     llm: Dict[str, Any] = Field(default_factory=dict)
     embedding: Dict[str, Any] = Field(default_factory=dict)
+    min_size: int = 500
+    max_size: int = 5000
 
 class CollectionInfraConfig(BaseModel):
     """
