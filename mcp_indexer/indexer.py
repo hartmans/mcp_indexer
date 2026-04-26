@@ -77,7 +77,7 @@ class Indexer:
             # Generate document summary and embedding
             doc_text = " ".join(await self._collect_all_text(pointer))
             doc_summary_list = await self.context.llm([
-                f"{col_config.summary_prompt}\n\n{doc_text}"
+                f"{col_config.doc_summary_prompt}\n\n{doc_text}"
             ])
             doc_summary = doc_summary_list[0]
             
@@ -106,7 +106,7 @@ class Indexer:
                     
                     # Generate chunk summary and embedding
                     chunk_summary_list = await self.context.llm([
-                        f"{col_config.summary_prompt}\n\n{chunk_text}"
+                        f"{col_config.chunk_summary_prompt}\n\n{chunk_text}"
                     ])
                     chunk_summary = chunk_summary_list[0]
                     
@@ -134,10 +134,10 @@ class Indexer:
             return self.context.db.open_table(name)
         except:
             return self.context.db.create_table(
-                name, 
-                schema=schema, 
-                primary_key=primary_key
-            )
+            name, 
+            schema=schema, 
+            primary_key=primary_key
+        )
 
     async def _collect_all_text(self, pointer) -> List[str]:
         """Helper to collect all text from a document for high-level summary."""

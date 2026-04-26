@@ -20,7 +20,8 @@ class CollectionInfraConfig(BaseModel):
     Fields here can be provided as global defaults.
     """
     model_config = ConfigDict(extra="ignore")
-    summary_prompt: str = "Summarize the following text concisely..."
+    doc_summary_prompt: str = "Summarize the following document concisely..."
+    chunk_summary_prompt: str = "Summarize the following text chunk concisely..."
     embedding_model: str = "text-embedding-3-small"
 
 class CollectionConfig(CollectionInfraConfig):
