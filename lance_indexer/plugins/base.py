@@ -42,8 +42,14 @@ class DocumentPointer:
     
     source: "DocumentSource"
     document_id: str
-    title: str = ""
 
+    async def get_metadata(self)-> dict[str,str]:
+        '''
+        Returns metadata, which should include at least title.
+        If the metadata includes summary or keywords these will be used rather than having the indexer construct them.
+        '''
+        ...
+    
     async def get_chunks(self)-> AsyncGenerator[ChunkInfo]:
         '''
         Returns the chunks of the document. 
@@ -174,7 +180,7 @@ p = TypeVar("p", bound=DocumentPointer)
 class DocumentSource(Generic[p]):
     '''An abstract plugin representing a source of documents. It can:
 
-    * Initialize for a give collection given a collection config
+    * Initialize  given a collection config
 
     * Get all documents modified since a given time.
 
@@ -194,6 +200,16 @@ class DocumentSource(Generic[p]):
         self.context = context
         self.config = collection_config
         self.id = collection_id
+        
+        # Use source_prefix if defined as class var, otherwise use class name
+        prefix = getattr(self, 'source_prefix', self.__class__.__name__.lower())
+        self.id_prefix = f"{prefix}:{self.id}:"
+
+    def strip_id_prefix(self, document_id: str) -> str:
+        """Removes the source:collection: prefix from a document_id. Raises if prefix not found."""
+        if not document_id.startswith(self.id_prefix):
+            raise ValueError(f"document_id '{document_id}' does not start with expected prefix '{self.id_prefix}'")
+        return document_id[len(self.id_prefix):]
 
         
     async def get_documents(self, last_modified:datetime|None = None)-> AsyncGenerator[p]:
@@ -202,7 +218,7 @@ class DocumentSource(Generic[p]):
         '''
         ...
 
-    def fetch_document(document_id:str)-> p:
+    async def fetch_document(document_id:str)-> p:
         ...
 
 

@@ -13,7 +13,8 @@ from lance_indexer.config import CollectionConfig
 # Mock implementations for testing
 class MockDocumentPointer(DocumentPointer):
     def __init__(self, source, document_id, title, chunks_data):
-        super().__init__(source, document_id, title)
+        super().__init__(source, document_id)
+        self.title = title
         self.chunks_data = chunks_data # list of (metadata, text_list)
 
     async def get_chunks(self) -> AsyncGenerator[ChunkInfo, None]:
