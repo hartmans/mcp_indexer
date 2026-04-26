@@ -4,6 +4,8 @@ from typing import List, Any, Dict, Tuple, Optional
 from langchain.chat_models import init_chat_model
 from langchain.embeddings import init_embeddings
 
+VECTOR_DIMENSIONS = 768
+
 class BatchCall:
     """
     Base class providing async batching and queueing logic.
@@ -120,20 +122,24 @@ class EmbeddingCall(BatchCall):
     Wrapper for a LangChain Embeddings model with batching for documents
     and real-time processing for queries.
     """
-    def __init__(self, **kwargs):
+    def __init__(self, dimensions: int = VECTOR_DIMENSIONS, **kwargs):
+        self.dimensions = dimensions
         # Initialize the embedding model using the factory pattern
         embeddings = init_embeddings(**kwargs)
         super().__init__(embeddings)
 
-    async def query(self, text: str) -> List[float]:
+    async def query(self, text: str, dimensions: Optional[int] = None) -> List[float]:
         """
         Real-time query embedding without queuing.
         """
-        return await self.model.aembed_query(text)
+        dims = dimensions if dimensions is not None else self.dimensions
+        res = await self.model.aembed_query(text)
+        return res[:dims]
 
     async def _execute_batch(self, texts: List[str]) -> List[Any]:
         return await self.model.aembed_documents(texts)
 
     def _process_item(self, item: Any) -> List[float]:
         # Embedding results are typically lists of floats already
-        return item
+        # Truncate to the configured dimensions
+        return item[:self.dimensions]

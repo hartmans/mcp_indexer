@@ -17,14 +17,15 @@ class FileSourcePointer(DocumentPointer):
     A DocumentPointer for a file on disk.
     """
     def __init__(self, source: "FileSource", document_id: str, path: Path):
-        super().__init__(source, document_id)
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        super().__init__(source, document_id, last_modified=mtime)
         self.path = path
 
     async def get_metadata(self) -> dict[str, str]:
         """Returns basic file metadata."""
         return {
             "title": self.path.name,
-            "last_modified": str(datetime.fromtimestamp(self.path.stat().st_mtime))
+            "last_modified": str(self.last_modified)
         }
 
     async def fetch_semantic_chunk(self, chunk_metadata: dict[str, Any]) -> list[str]:
@@ -75,8 +76,8 @@ class FileSource(DocumentSource[P]):
     def __init__(self, collection_id: str, *, context, collection_config):
         super().__init__(collection_id, context=context, collection_config=collection_config)
         
-        self.source_blob = collection_config.source_blob
-        self.source_config: FileSourceConfig
+        # Ensure the config is validated using the Pydantic model
+        self.source_config = collection_config.resolve_source_config(FileSourceConfig)
 
     def _is_included(self, path: Path) -> bool:
         """Check if a path matches include patterns and does not match exclude patterns."""

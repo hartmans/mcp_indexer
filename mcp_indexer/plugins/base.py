@@ -6,6 +6,8 @@ from lancedb.pydantic import LanceModel, Vector
 from pydantic import Field
 from ..context import Context
 from ..config import CollectionConfig
+from ..llm import VECTOR_DIMENSIONS
+
 class DocumentChunk(LanceModel):
     '''A DocumentChunk as stored in the database after indexing has been handled.
     This is *not* a type used within DocumentSources.
@@ -19,14 +21,14 @@ class DocumentChunk(LanceModel):
     summary: str = Field(
         default="",
         description="An llm summary of this chunk.")
-    embedding: Vector(768) # pyright: ignore[reportInvalidTypeForm]
+    embedding: Vector(VECTOR_DIMENSIONS) # pyright: ignore[reportInvalidTypeForm]
     metadata: dict = Field(default=dict)
 
 
 class Document(LanceModel):
     document_id: str
     title: str = Field(description="Title or file name of this document")
-    embedding: Vector(768) = Field( # pyright: ignore[reportInvalidTypeForm]
+    embedding: Vector(VECTOR_DIMENSIONS) = Field( # pyright: ignore[reportInvalidTypeForm]
         description="Embedding either of the entire document or of the chunk level summaries.")
     keywords: list[str] = []
     summary: str = ""
@@ -42,6 +44,7 @@ class DocumentPointer:
     
     source: "DocumentSource"
     document_id: str
+    last_modified: datetime
 
     async def get_metadata(self)-> dict[str,str]:
         '''
@@ -192,6 +195,8 @@ class DocumentSource(Generic[p]):
 
     * Get all valid document_ids in a collection to facilitate deleting outdated documents
 
+    * Get all valid document_ids in a collection to facilitate deleting outdated documents
+
     '''
     
     def __init__(self, collection_id:str,
@@ -211,7 +216,6 @@ class DocumentSource(Generic[p]):
             raise ValueError(f"document_id '{document_id}' does not start with expected prefix '{self.id_prefix}'")
         return document_id[len(self.id_prefix):]
 
-        
     async def get_documents(self, last_modified:datetime|None = None)-> AsyncGenerator[p]:
         '''
         Async Generator yielding the set of documents modified since the given time.
