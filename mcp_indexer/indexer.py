@@ -15,6 +15,7 @@ class Indexer:
     def __init__(self, context: Context, config_manager: ConfigManager):
         self.context = context
         self.config_manager = config_manager
+        self.sem = asyncio.Semaphore(INDEXING_WORKERS)
 
     async def index_collection(self, collection_id: str, source_plugin_class: Any):
         """
@@ -46,50 +47,31 @@ class Indexer:
         except:
             pass
 
-        sem = asyncio.Semaphore(INDEXING_WORKERS)
-        
-        # Use a completion event to know when all tasks are finished
-        # since we are not keeping a list of tasks.
-        pending_tasks = 0
-        completion_event = asyncio.Event()
-
-        def on_task_done(fut):
-            nonlocal pending_tasks
-            pending_tasks -= 1
-            try:
-                fut.result()
-            except Exception as e:
-                # Error is already printed inside _process_document, 
-                # but we can log it here if needed.
-                pass
-            if pending_tasks == 0:
-                completion_event.set()
-
         async for pointer in source.get_documents(last_modified=None):
             if pointer.document_id in existing_docs:
                 continue
             
-            # Acquire semaphore slot BEFORE creating the task to prevent backpressure
-            await sem.acquire()
-            pending_tasks += 1
-            
-            # Create the task and attach the callback
+            await self.sem.acquire()
             task = asyncio.create_task(self._wrapped_process(
                 pointer, col_config, table, meta_table, 
-                server_config.min_size, server_config.max_size, sem
+                server_config.min_size, server_config.max_size
             ))
-            task.add_done_callback(on_task_done)
-        
-        if pending_tasks > 0:
-            await completion_event.wait()
+            task.add_done_callback(lambda fut: self._on_task_done(fut))
 
-    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size, sem):
+    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size):
         try:
             await self._process_document(
                 pointer, col_config, table, meta_table, min_size, max_size
             )
         finally:
-            sem.release()
+            self.sem.release()
+
+    def _on_task_done(self, fut):
+        try:
+            fut.result()
+        except Exception as e:
+            # In a real system, we might log this to a file or monitoring service
+            print(f"Task failed: {e}")
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         """
