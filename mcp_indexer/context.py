@@ -1,7 +1,13 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import lancedb
+import os
+from typing import Dict, Any, TYPE_CHECKING
 from mcp_indexer.config import ConfigManager
 from mcp_indexer.llm import LlmCall, EmbeddingCall
+
+# Global registry for DocumentSource plugins
+SOURCE_REGISTRY: Dict[str, type] = {}
+
 
 @dataclass
 class Context:
@@ -12,6 +18,7 @@ class Context:
     embedding: EmbeddingCall
     llm: LlmCall
     config: ConfigManager
+    collections: Dict[str, "DocumentSource"] = field(default_factory=dict)
 
     def get_table(self, table_name: str):
         """Helper to get a LanceDB table."""
@@ -25,17 +32,44 @@ class Context:
         config_manager = ConfigManager(config_path)
         server_config = config_manager.get_server_config()
         
-        # Initialize LLM and Embedding calls using the server config
         llm_call = LlmCall(**server_config.llm)
         embedding_call = EmbeddingCall(**server_config.embedding)
         
-        # Initialize LanceDB connection
-        # Note: in a real scenario, we might need to handle the path expansion
-        db = lancedb.connect(server_config.db_uri)
+        # Expand tilde in db_uri
+        db_uri = os.path.expanduser(server_config.db_uri)
+        db = lancedb.connect(db_uri)
         
-        return Context(
+        ctx = Context(
             db=db,
             embedding=embedding_call,
             llm=llm_call,
             config=config_manager
         )
+        
+        ctx.build_collections()
+        return ctx
+
+    def build_collections(self):
+        """
+        Builds the collections mapping based on the configuration.
+        Raises ValueError if a collection cannot be initialized.
+        """
+        for collection_id in self.config.list_collections():
+            col_config = self.config.get_collection_config(collection_id)
+            
+            prefix = col_config.source_blob.get("type")
+            if not prefix:
+                raise ValueError(f"Collection '{collection_id}' is missing 'type' in source_config.")
+                
+            cls = SOURCE_REGISTRY.get(prefix)
+            if not cls:
+                raise ValueError(f"No DocumentSource plugin registered for prefix '{prefix}' (collection '{collection_id}').")
+                
+            self.collections[collection_id] = cls(
+                collection_id=collection_id,
+                context=self,
+                collection_config=col_config
+            )
+
+if TYPE_CHECKING:
+    from .plugins.base import DocumentSource

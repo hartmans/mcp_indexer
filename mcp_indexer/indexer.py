@@ -1,6 +1,8 @@
 import asyncio
 import lancedb
 import logging
+import argparse
+import sys
 from typing import List, Optional, Any
 from datetime import datetime
 from mcp_indexer.context import Context
@@ -20,28 +22,31 @@ class Indexer:
         self.config_manager = config_manager
         self.sem = asyncio.Semaphore(INDEXING_WORKERS)
 
-    async def index_collection(self, collection_id: str, source_plugin_class: Any):
+    async def index_all(self):
         """
-        Indexes a specific collection using the provided plugin class.
+        Indexes all configured collections.
+        """
+        tasks = []
+        for collection_id, source in self.context.collections.items():
+            tasks.append(self.index_collection(collection_id, source))
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def index_collection(self, collection_id: str, source: Any):
+        """
+        Indexes a specific collection using the provided source plugin.
         """
         col_config = self.config_manager.get_collection_config(collection_id)
         server_config = self.config_manager.get_server_config()
         
-        source = source_plugin_class(
-            collection_id=collection_id,
-            context=self.context,
-            collection_config=col_config
-        )
-        
         table = self._get_or_create_table(
             collection_id, 
             schema=DocumentChunk, 
-            primary_key="chunk_id"
         )
         meta_table = self._get_or_create_table(
             f"{collection_id}_meta", 
             schema=Document, 
-            primary_key="document_id"
         )
 
         existing_docs = set()
@@ -79,16 +84,11 @@ class Indexer:
             logger.error(f"Task failed: {e}")
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
-        """
-        Processes a single document: generates summary, embedding, and chunks.
-        """
         try:
-            # 1. Extract all semantic chunks first
             semantic_chunks = []
             async for meta, text_list in pointer.get_chunks(min_size, max_size):
                 semantic_chunks.append((meta, text_list))
 
-            # 2. Parallelize: Semantic summaries vs Embedding calls
             summary_tasks = [
                 self._summarize_semantic_chunk(text_list, col_config.chunk_summary_prompt)
                 for _, text_list in semantic_chunks
@@ -103,7 +103,6 @@ class Indexer:
             summaries = await asyncio.gather(*summary_tasks)
             embeddings_batches = await asyncio.gather(*embedding_tasks)
 
-            # 3. Construct DocumentChunks
             all_chunks_to_upsert = []
             for i, (meta, _) in enumerate(semantic_chunks):
                 sem_summary = summaries[i]
@@ -114,12 +113,12 @@ class Indexer:
                     all_chunks_to_upsert.append(DocumentChunk(
                         document_id=pointer.document_id,
                         chunk_id=f"{pointer.document_id}?c={len(all_chunks_to_upsert)}",
+                        text=emb_chunks_info[j][1],
                         summary=sem_summary,
                         embedding=batch_embeddings[j],
                         metadata=e_meta
                     ))
 
-            # 4. Handle Document Summary
             metadata_dict = await pointer.get_metadata()
             doc_summary = metadata_dict.get("summary")
             if not doc_summary:
@@ -140,7 +139,6 @@ class Indexer:
                 keywords=metadata_dict.get("keywords", [])
             )
             
-            # Atomic merge
             table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"target.document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
             
             meta_table.upsert([doc_record])
@@ -157,7 +155,7 @@ class Indexer:
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)
 
-    def _get_or_create_table(self, name: str, schema: Any, primary_key: Any):
+    def _get_or_create_table(self, name: str, schema: Any):
         try:
             return self.context.db.open_table(name)
         except Exception as e:
@@ -165,11 +163,26 @@ class Indexer:
             return self.context.db.create_table(
                 name, 
                 schema=schema, 
-                primary_key=primary_key
             )
-
     async def search(self, collection_id: str, query: str, limit: int = 5):
         query_vector = await self.context.embedding.query(query)
         table = self.context.db.open_table(collection_id)
         results = table.search(query_vector).limit(limit).to_pydantic(DocumentChunk)
         return results
+
+async def main():
+    parser = argparse.ArgumentParser(description="LanceDB Indexer CLI")
+    parser.add_argument("--config", required=True, help="Path to the config TOML file")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    ctx = Context.build_context(args.config)
+    indexer = Indexer(ctx, ctx.config)
+    await indexer.index_all()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

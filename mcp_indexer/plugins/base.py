@@ -1,18 +1,17 @@
 import dataclasses
 from datetime import datetime
-from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator
-from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator, Literal
+from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator, Literal, Dict, Type
 from lancedb.pydantic import LanceModel, Vector
 from pydantic import Field
 from ..context import Context
 from ..config import CollectionConfig
 from ..llm import VECTOR_DIMENSIONS
+from ..context import SOURCE_REGISTRY
 
 class DocumentChunk(LanceModel):
     '''A DocumentChunk as stored in the database after indexing has been handled.
     This is *not* a type used within DocumentSources.
     '''
-
     document_id:str = Field(description="Unique identifier for the document to which this chunk belongs.")
     chunk_id: str = Field(description="Identifier of this chunk; document_id should be a prefix")
     text: str|None = Field(
@@ -22,7 +21,7 @@ class DocumentChunk(LanceModel):
         default="",
         description="An llm summary of this chunk.")
     embedding: Vector(VECTOR_DIMENSIONS) # pyright: ignore[reportInvalidTypeForm]
-    metadata: dict = Field(default=dict)
+    metadata: dict[str, str] = Field(default=dict)
 
 
 class Document(LanceModel):
@@ -41,7 +40,6 @@ class DocumentPointer:
     '''
     A potentially abstract class representing a document to be indexed. Returned from DocumentSource.
     '''
-    
     source: "DocumentSource"
     document_id: str
     last_modified: datetime
@@ -72,12 +70,7 @@ def create_embedding_chunks(
     offset = 0
     
     while offset < text_len:
-        # In this simplified version, we just slice. 
-        # A more complex version would look for boundaries.
-        # But for the base helper, we'll stick to size.
         end = min(offset + max_size, text_len)
-        
-        # Check min_size for the last chunk
         if offset > 0 and (end - offset) < min_size:
             if results:
                 last_meta, last_text = results[-1]
@@ -88,28 +81,13 @@ def create_embedding_chunks(
         chunk_text = text[offset:end]
         chunk_meta = {**metadata, 'o': offset, 's': len(chunk_text)}
         results.append((chunk_meta, chunk_text))
-        
         offset = end
         
     return results
 
 p = TypeVar("p", bound=DocumentPointer)
 class DocumentSource(Generic[p]):
-    '''An abstract plugin representing a source of documents. It can:
-
-    * Initialize  given a collection config
-
-    * Get all documents modified since a given time.
-
-    * Reindex a document given a document_id
-
-    *  Fetch a document given a document_id
-
-    * Fetch a chunk given a chunk metadata
-
-    * Get all valid document_ids in a collection to facilitate deleting outdated documents
-
-    '''
+    '''An abstract plugin representing a source of documents.'''
     
     def __init__(self, collection_id:str,
                  *, context:Context,
@@ -120,6 +98,12 @@ class DocumentSource(Generic[p]):
         
         prefix = getattr(self, 'source_prefix', self.__class__.__name__.lower())
         self.id_prefix = f"{prefix}:{self.id}:"
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        prefix = getattr(cls, 'source_prefix', cls.__name__.lower())
+        if prefix not in SOURCE_REGISTRY:
+            SOURCE_REGISTRY[prefix] = cls
 
     def strip_id_prefix(self, document_id: str) -> str:
         if not document_id.startswith(self.id_prefix):
