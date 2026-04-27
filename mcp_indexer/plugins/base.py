@@ -1,8 +1,10 @@
 import dataclasses
+import json
 from datetime import datetime
-from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator, Literal, Dict, Type
+from types import MappingProxyType
+from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator, Literal, Dict, Type, Mapping
 from lancedb.pydantic import LanceModel, Vector
-from pydantic import Field
+from pydantic import Field, model_validator
 from ..context import Context
 from ..config import CollectionConfig
 from ..llm import VECTOR_DIMENSIONS
@@ -21,7 +23,54 @@ class DocumentChunk(LanceModel):
         default="",
         description="An llm summary of this chunk.")
     embedding: Vector(VECTOR_DIMENSIONS) # pyright: ignore[reportInvalidTypeForm]
-    metadata: dict[str, str] = Field(default=dict)
+    metadata_str: str = Field(
+        default="{}",
+        description="JSON-encoded chunk metadata used to retrieve the source chunk.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_metadata_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        if "metadata" in normalized:
+            normalized["metadata_str"] = cls._serialize_metadata(normalized.pop("metadata"))
+        elif "metadata_str" in normalized:
+            normalized["metadata_str"] = cls._serialize_metadata(normalized["metadata_str"])
+
+        return normalized
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return MappingProxyType(self._deserialize_metadata(self.metadata_str))
+
+    @metadata.setter
+    def metadata(self, value: Mapping[str, Any]) -> None:
+        self.metadata_str = self._serialize_metadata(value)
+
+    @staticmethod
+    def _serialize_metadata(value: Mapping[str, Any] | str | None) -> str:
+        if value is None:
+            return "{}"
+
+        if isinstance(value, str):
+            parsed = DocumentChunk._deserialize_metadata(value)
+            return json.dumps(parsed, sort_keys=True)
+
+        return json.dumps(dict(value), sort_keys=True)
+
+    @staticmethod
+    def _deserialize_metadata(value: str | None) -> dict[str, Any]:
+        if not value:
+            return {}
+
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise TypeError("DocumentChunk metadata must decode to a JSON object.")
+
+        return parsed
 
 
 class Document(LanceModel):
