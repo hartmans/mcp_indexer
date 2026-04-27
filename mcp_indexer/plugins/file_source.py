@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Generic, TypeVar, Any
+from urllib.parse import quote, unquote
 from pydantic import BaseModel, Field
 from mcp_indexer.plugins.base import DocumentSource, DocumentPointer, ChunkInfo
 
@@ -53,6 +54,7 @@ class FileSource(DocumentSource[P]):
     """
     An abstract DocumentSource for files on disk.
     """
+    safe_document_path_chars = "/-_.!@+[]()"
     semantic_boundary_regexps: tuple[bytes, ...] = ()
     embedding_boundary_regexps: tuple[bytes, ...] = (rb"\n\s*\n",)
 
@@ -68,14 +70,21 @@ class FileSource(DocumentSource[P]):
             return False
         return True
 
+    def encode_document_path(self, relative_path: str) -> str:
+        return quote(relative_path, safe=self.safe_document_path_chars)
+
+    def decode_document_path(self, encoded_path: str) -> str:
+        return unquote(encoded_path)
+
     async def get_documents(self, last_modified: Optional[datetime] = None) -> AsyncGenerator[P, None]:
         root = self.source_config.directory
         for path in root.rglob("*"):
             if path.is_file() and self._is_included(path):
                 mtime = datetime.fromtimestamp(path.stat().st_mtime)
                 if last_modified is None or mtime > last_modified:
-                    relative_path = str(path.relative_to(root))
-                    full_doc_id = f"{self.id_prefix}{relative_path}"
+                    relative_path = path.relative_to(root).as_posix()
+                    encoded_path = self.encode_document_path(relative_path)
+                    full_doc_id = f"{self.id_prefix}{encoded_path}"
                     yield self.fetch_document(full_doc_id)
 
     async def split_text(self, metadata: dict[str, Any], text_bytes: bytes, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
@@ -131,6 +140,6 @@ class FileSource(DocumentSource[P]):
             current_semantic_start = current_semantic_end
 
     def fetch_document(self, document_id: str) -> P:
-        relative_path_str = self.strip_id_prefix(document_id)
+        relative_path_str = self.decode_document_path(self.strip_id_prefix(document_id))
         absolute_path = self.source_config.directory / relative_path_str
         return FileSourcePointer(self, document_id, absolute_path) # type: ignore

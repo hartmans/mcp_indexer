@@ -54,6 +54,8 @@ class Context:
         Builds the collections mapping based on the configuration.
         Raises ValueError if a collection cannot be initialized.
         """
+        import mcp_indexer.plugins  # noqa: F401
+
         for collection_id in self.config.list_collections():
             col_config = self.config.get_collection_config(collection_id)
             

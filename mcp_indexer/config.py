@@ -13,6 +13,7 @@ class ServerConfig(BaseModel):
     embedding: Dict[str, Any] = Field(default_factory=dict)
     min_size: int = 500
     max_size: int = 5000
+    max_to_summarize: int = 65536
     llm_batch_size: int = 10
     embedding_batch_size: int = 10
 
@@ -23,9 +24,8 @@ class CollectionInfraConfig(BaseModel):
     """
     model_config = ConfigDict(extra="ignore")
     doc_summary_prompt: str = "Summarize the following document concisely..."
-    chunk_summary_prompt: str = "Summarize the following text chunk concisely..."
-    embedding_model: str = "text-embedding-3-small"
-
+    chunk_summary_prompt: str = ""
+    
 class CollectionConfig(CollectionInfraConfig):
     """
     The resolved configuration for a specific collection.

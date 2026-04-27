@@ -10,6 +10,7 @@ class TextFileSourceConfig(FileSourceConfig):
     # We can add specific text-plugin settings here if needed, 
     # e.g., custom encoding or specific parsing flags.
     encoding: str = "utf-8"
+    summary_length: int = 65536
 
 class TextFilePointer(FileSourcePointer):
     """
@@ -20,8 +21,17 @@ class TextFilePointer(FileSourcePointer):
         Extracts metadata from a text file. 
         For a simple implementation, we use the filename as the title.
         """
-        # We can extend this to look for Frontmatter (YAML) or specific headers
         meta = await super().get_metadata()
+        text = self.path.read_text(
+            encoding=self.source.source_config.encoding,
+            errors="replace",
+        )
+        if len(text) <= self.source.source_config.summary_length and self.source.context.llm is not None:
+            prompt = [
+                    ('system',self.source.config.doc_summary_prompt),
+                    ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{text}")]
+            summaries = await self.source.context.llm([prompt])
+            meta["summary"] = summaries[0]
         return meta
 
 class TextFileSource(FileSource[TextFilePointer]):
@@ -57,6 +67,6 @@ class TextFileSource(FileSource[TextFilePointer]):
 
     def fetch_document(self, document_id: str) -> TextFilePointer:
         """Resolves a document_id into a TextFilePointer."""
-        relative_path_str = self.strip_id_prefix(document_id)
+        relative_path_str = self.decode_document_path(self.strip_id_prefix(document_id))
         absolute_path = self.source_config.directory / relative_path_str
         return TextFilePointer(self, document_id, absolute_path)

@@ -13,10 +13,11 @@ model_provider = "ollama"
 base_url = "http://localhost:11434"
 
 [defaults]
-summary_prompt = "Summarize the following text concisely..."
+doc_summary_prompt = "Summarize the following document concisely..."
+chunk_summary_prompt = "Summarize the following text chunk concisely..."
 embedding_model = "qwen3-embedding:4b"
 
 [collections.test_col]
 tool_prefix = "test"
 description = "Test collection"
-source_config = { type = "text", content = "hello world" }
+source_config = { type = "text", directory = "tests/sample_docs" }

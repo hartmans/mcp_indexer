@@ -21,6 +21,9 @@ class Indexer:
         self.context = context
         self.config_manager = config_manager
         self.sem = asyncio.Semaphore(INDEXING_WORKERS)
+        self._active_tasks = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     async def index_all(self):
         """
@@ -59,40 +62,53 @@ class Indexer:
         async for pointer in source.get_documents(last_modified=None):
             if pointer.document_id in existing_docs:
                 continue
-            
-            async with self.sem:
-                task = asyncio.create_task(self._wrapped_process(
-                    pointer, col_config, table, meta_table, 
-                    server_config.min_size, server_config.max_size
-                ))
-                task.add_done_callback(lambda fut: self._on_task_done(fut))
+
+            await self.sem.acquire()
+            self._active_tasks += 1
+            self._idle.clear()
+            task = asyncio.create_task(self._wrapped_process(
+                pointer, col_config, table, meta_table,
+                server_config.min_size, server_config.max_size
+            ))
+            task.add_done_callback(lambda fut: self._on_task_done(fut))
 
     async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size):
-        async with self.sem:
-            try:
-                await self._process_document(
-                    pointer, col_config, table, meta_table, min_size, max_size
-                )
-            except Exception as e:
-                logger.error(f"Error in _wrapped_process for {pointer.document_id}: {e}")
-                raise e
+        try:
+            await self._process_document(
+                pointer, col_config, table, meta_table, min_size, max_size
+            )
+        except Exception as e:
+            logger.error(f"Error in _wrapped_process for {pointer.document_id}: {e}")
+            raise e
+        finally:
+            self.sem.release()
+            self._active_tasks -= 1
+            if self._active_tasks == 0:
+                self._idle.set()
 
     def _on_task_done(self, fut):
         try:
             fut.result()
         except Exception as e:
-            logger.error(f"Task failed: {e}")
+            logger.exception(f"Task failed: {e}")
+
+    async def wait_for_idle(self):
+        await self._idle.wait()
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         try:
+            server_config = self.config_manager.get_server_config()
             semantic_chunks = []
             async for meta, text_list in pointer.get_chunks(min_size, max_size):
                 semantic_chunks.append((meta, text_list))
 
-            summary_tasks = [
-                self._summarize_semantic_chunk(text_list, col_config.chunk_summary_prompt)
-                for _, text_list in semantic_chunks
-            ]
+            summary_tasks = []
+            for _, text_list in semantic_chunks:
+                chunk_text = " ".join(text_list)
+                if len(chunk_text) > server_config.max_to_summarize:
+                    summary_tasks.append(self._summary_too_big())
+                else:
+                    summary_tasks.append(self._summarize_semantic_chunk(text_list, col_config.chunk_summary_prompt or col_config.doc_summary_prompt))
             
             embedding_tasks = []
             for meta, text_list in semantic_chunks:
@@ -123,8 +139,9 @@ class Indexer:
             doc_summary = metadata_dict.get("summary")
             if not doc_summary:
                 doc_summary_text = "\n\n".join(summaries)
-                doc_summary_list = await self.context.llm([
-                    f"{col_config.doc_summary_prompt}\n\n{doc_summary_text}"
+                doc_summary_list = await self.context.llm([[
+                    ('system', col_config.doc_summary_prompt),
+                    ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}")]
                 ])
                 doc_summary = doc_summary_list[0]
             
@@ -139,9 +156,9 @@ class Indexer:
                 keywords=metadata_dict.get("keywords", [])
             )
             
-            table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"target.document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
+            table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
             
-            meta_table.upsert([doc_record])
+            meta_table.merge_insert(["document_id"]).when_matched_update_all().when_not_matched_insert_all().execute([doc_record])
 
         except Exception as e:
             logger.error(f"Error processing document {pointer.document_id}: {e}")
@@ -149,8 +166,14 @@ class Indexer:
 
     async def _summarize_semantic_chunk(self, text_list: list[str], prompt: str) -> str:
         text = " ".join(text_list)
-        res = await self.context.llm([f"{prompt}\n\n{text}"])
+        res = await self.context.llm([[
+                                       ('system',prompt),
+                                       ('user',f'Write no more than three sentences to summarize this chunk:\n\n{text}'),
+                                       ]])
         return res[0]
+
+    async def _summary_too_big(self) -> str:
+        return "too big to summarize"
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)
@@ -176,6 +199,7 @@ async def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.getLogger('httpx').setLevel(logging.ERROR)
     
     ctx = Context.build_context(args.config)
     indexer = Indexer(ctx, ctx.config)

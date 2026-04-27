@@ -108,11 +108,11 @@ class LlmCall(BatchCall):
     """
     Wrapper for a LangChain ChatModel with request batching.
     """
-    def __init__(self, batch_size: int = 10, **kwargs):
+    def __init__(self, batch_size: int = 10, batch_timeout: float = 3.0, **kwargs):
         llm = init_chat_model(**kwargs).with_retry(stop_after_attempt=3)
-        super().__init__(llm, batch_size=batch_size)
+        super().__init__(llm, batch_size=batch_size, batch_timeout=batch_timeout)
 
-    async def _execute_batch(self, prompts: List[str]) -> List[Any]:
+    async def _execute_batch(self, prompts: List[str|list[dict]]) -> List[Any]:
         return await self.model.abatch(prompts)
 
     def _process_item(self, item: Any) -> str:
@@ -123,10 +123,10 @@ class EmbeddingCall(BatchCall):
     Wrapper for a LangChain Embeddings model with batching for documents
     and real-time processing for queries.
     """
-    def __init__(self, dimensions: int = VECTOR_DIMENSIONS, batch_size: int = 10, **kwargs):
+    def __init__(self, dimensions: int = VECTOR_DIMENSIONS, batch_size: int = 10, batch_timeout: float = 3.0, **kwargs):
         self.dimensions = dimensions
         embeddings = init_embeddings(**kwargs)
-        super().__init__(embeddings, batch_size=batch_size)
+        super().__init__(embeddings, batch_size=batch_size, batch_timeout=batch_timeout)
 
     async def query(self, text: str, dimensions: Optional[int] = None) -> List[float]:
         dims = dimensions if dimensions is not None else self.dimensions
