@@ -31,7 +31,7 @@ def temp_text_env():
 
 @pytest.fixture
 def mock_context():
-    return Context(db=None, embedding_fn=None, llm=None, config=None)
+    return Context(db=None, embedding=None, llm=None, config=None)
 
 @pytest.mark.asyncio
 async def test_text_source_config_resolution(temp_text_env, mock_context):

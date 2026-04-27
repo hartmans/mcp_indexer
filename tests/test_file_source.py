@@ -30,7 +30,7 @@ def temp_file_env():
 
 @pytest.fixture
 def mock_context():
-    return Context(db=None, embedding_fn=None, llm=None, config=None)
+    return Context(db=None, embedding=None, llm=None, config=None)
 
 @pytest.fixture
 def mock_col_config():

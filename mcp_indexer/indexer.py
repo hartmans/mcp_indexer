@@ -1,10 +1,13 @@
 import asyncio
 import lancedb
+import logging
 from typing import List, Optional, Any
 from datetime import datetime
 from mcp_indexer.context import Context
 from mcp_indexer.config import ConfigManager
 from mcp_indexer.plugins.base import Document, DocumentChunk, create_embedding_chunks
+
+logger = logging.getLogger(__name__)
 
 INDEXING_WORKERS = 20
 
@@ -44,14 +47,14 @@ class Indexer:
         existing_docs = set()
         try:
             existing_docs = set(meta_table.to_pandas()["document_id"].tolist())
-        except:
+        except Exception as e:
+            logger.debug(f"Could not load existing documents for {collection_id}: {e}")
             pass
 
         async for pointer in source.get_documents(last_modified=None):
             if pointer.document_id in existing_docs:
                 continue
             
-            # Block here until a worker slot is available before spawning the task
             async with self.sem:
                 task = asyncio.create_task(self._wrapped_process(
                     pointer, col_config, table, meta_table, 
@@ -60,21 +63,20 @@ class Indexer:
                 task.add_done_callback(lambda fut: self._on_task_done(fut))
 
     async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size):
-        # The task itself also needs to hold a slot while doing work
         async with self.sem:
             try:
                 await self._process_document(
                     pointer, col_config, table, meta_table, min_size, max_size
                 )
             except Exception as e:
-                print(f"Error in _wrapped_process for {pointer.document_id}: {e}")
+                logger.error(f"Error in _wrapped_process for {pointer.document_id}: {e}")
                 raise e
 
     def _on_task_done(self, fut):
         try:
             fut.result()
         except Exception as e:
-            print(f"Task failed: {e}")
+            logger.error(f"Task failed: {e}")
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         """
@@ -112,7 +114,6 @@ class Indexer:
                     all_chunks_to_upsert.append(DocumentChunk(
                         document_id=pointer.document_id,
                         chunk_id=f"{pointer.document_id}?c={len(all_chunks_to_upsert)}",
-                        text=emb_chunks_info[j][1],
                         summary=sem_summary,
                         embedding=batch_embeddings[j],
                         metadata=e_meta
@@ -145,7 +146,7 @@ class Indexer:
             meta_table.upsert([doc_record])
 
         except Exception as e:
-            print(f"Error processing document {pointer.document_id}: {e}")
+            logger.error(f"Error processing document {pointer.document_id}: {e}")
             raise e
 
     async def _summarize_semantic_chunk(self, text_list: list[str], prompt: str) -> str:
@@ -159,7 +160,8 @@ class Indexer:
     def _get_or_create_table(self, name: str, schema: Any, primary_key: Any):
         try:
             return self.context.db.open_table(name)
-        except:
+        except Exception as e:
+            logger.debug(f"Table {name} not found, creating it. Error: {e}")
             return self.context.db.create_table(
                 name, 
                 schema=schema, 

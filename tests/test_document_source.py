@@ -118,7 +118,7 @@ async def test_create_embedding_chunks_small_tail():
 @pytest.mark.asyncio
 async def test_document_source_fetch_chunk():
     # Context is a dataclass; pass None for required fields
-    ctx = Context(db=None, embedding_fn=None, llm=None, config=None)
+    ctx = Context(db=None, embedding=None, llm=None, config=None)
     # Use a simple dict/mock for CollectionConfig
     cfg = MagicMock(spec=CollectionConfig) if 'MagicMock' in globals() else None
     docs_data = {
@@ -144,7 +144,7 @@ async def test_document_source_fetch_chunk():
 
 @pytest.mark.asyncio
 async def test_document_source_fetch_chunk_not_found():
-    ctx = Context(db=None, embedding_fn=None, llm=None, config=None)
+    ctx = Context(db=None, embedding=None, llm=None, config=None)
     cfg = None
     source = MockDocumentSource("col1", ctx, cfg, {})
     

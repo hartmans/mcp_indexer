@@ -7,3 +7,5 @@
 
 
 * Use ~/venv/bin/python as your python
+
+* Tests are pytest, use monkeypatch and build your own mocks rather than using unittest facilities.

@@ -1,8 +1,11 @@
 import asyncio
 import time
+import logging
 from typing import List, Any, Dict, Tuple, Optional
 from langchain.chat_models import init_chat_model
 from langchain.embeddings import init_embeddings
+
+logger = logging.getLogger(__name__)
 
 VECTOR_DIMENSIONS = 768
 
@@ -53,7 +56,7 @@ class BatchCall:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"{self.__class__.__name__} worker error: {e}")
+                logger.error(f"{self.__class__.__name__} worker error: {e}")
                 await asyncio.sleep(1)
                 continue
 
