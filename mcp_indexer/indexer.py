@@ -40,7 +40,6 @@ class Indexer:
             primary_key="document_id"
         )
 
-        # Filter for new documents only
         existing_docs = set()
         try:
             existing_docs = set(meta_table.to_pandas()["document_id"].tolist())
@@ -80,27 +79,17 @@ class Indexer:
                 semantic_chunks.append((meta, text_list))
 
             # 2. Parallelize: Semantic summaries vs Embedding calls
-            # We need semantic summaries for both the chunks and potentially the doc summary.
-            semantic_summaries = []
-            
-            # Start semantic summarization tasks
             summary_tasks = [
                 self._summarize_semantic_chunk(text_list, col_config.chunk_summary_prompt)
                 for _, text_list in semantic_chunks
             ]
             
-            # Start embedding tasks for each semantic chunk
             embedding_tasks = []
             for meta, text_list in semantic_chunks:
-                # Use the helper to split the semantic chunk into embedding chunks
                 embedding_chunks = create_embedding_chunks(meta, text_list, min_size, max_size)
-                
-                # Extract texts for batch embedding
                 texts = [t for _, t in embedding_chunks]
-                # We'll call the embedding model for this batch
                 embedding_tasks.append(self._embed_batch(texts))
 
-            # Wait for both to complete
             summaries = await asyncio.gather(*summary_tasks)
             embeddings_batches = await asyncio.gather(*embedding_tasks)
 
@@ -109,8 +98,6 @@ class Indexer:
             for i, (meta, _) in enumerate(semantic_chunks):
                 sem_summary = summaries[i]
                 batch_embeddings = embeddings_batches[i]
-                
-                # The embedding_chunks list from create_embedding_chunks
                 emb_chunks_info = create_embedding_chunks(meta, semantic_chunks[i][1], min_size, max_size)
                 
                 for j, (e_meta, _) in enumerate(emb_chunks_info):
@@ -124,7 +111,6 @@ class Indexer:
                     ))
 
             # 4. Handle Document Summary
-            # If not in metadata, build it from semantic summaries
             metadata_dict = await pointer.get_metadata()
             doc_summary = metadata_dict.get("summary")
             if not doc_summary:
@@ -145,12 +131,16 @@ class Indexer:
                 keywords=metadata_dict.get("keywords", [])
             )
             
-            # Atomic update for the document:
-            # Since we want to delete chunks not present in the new set, 
-            # and LanceDB doesn't have a simple "replace all for doc_id" with merge_insert,
-            # the most consistent way is delete then insert.
-            table.delete(f"document_id = '{pointer.document_id}'")
+            # --- Consistent Update Strategy ---
+            # 1. Upsert new/updated chunks first. (Document remains searchable)
             table.upsert(all_chunks_to_upsert)
+            
+            # 2. Delete chunks that are no longer part of this document.
+            new_ids = [c.chunk_id for c in all_chunks_to_upsert]
+            id_list_str = ", ".join([f"'{i}'" for i in new_ids])
+            table.delete(f"document_id = '{pointer.document_id}' AND chunk_id NOT IN ({id_list_str})")
+            
+            # 3. Finally, update the document metadata.
             meta_table.upsert([doc_record])
 
         except Exception as e:
@@ -162,7 +152,6 @@ class Indexer:
         return res[0]
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        # We use the __call__ of EmbeddingCall which handles the batching/queueing
         return await self.context.embedding(texts)
 
     def _get_or_create_table(self, name: str, schema: Any, primary_key: Any):
