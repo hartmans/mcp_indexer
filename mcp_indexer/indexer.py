@@ -131,16 +131,9 @@ class Indexer:
                 keywords=metadata_dict.get("keywords", [])
             )
             
-            # --- Consistent Update Strategy ---
-            # 1. Upsert new/updated chunks first. (Document remains searchable)
-            table.upsert(all_chunks_to_upsert)
+            # Atomic merge: Update/Insert new chunks and delete stale chunks for this doc
+            table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"target.document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
             
-            # 2. Delete chunks that are no longer part of this document.
-            new_ids = [c.chunk_id for c in all_chunks_to_upsert]
-            id_list_str = ", ".join([f"'{i}'" for i in new_ids])
-            table.delete(f"document_id = '{pointer.document_id}' AND chunk_id NOT IN ({id_list_str})")
-            
-            # 3. Finally, update the document metadata.
             meta_table.upsert([doc_record])
 
         except Exception as e:
