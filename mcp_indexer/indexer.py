@@ -51,26 +51,29 @@ class Indexer:
             if pointer.document_id in existing_docs:
                 continue
             
-            await self.sem.acquire()
-            task = asyncio.create_task(self._wrapped_process(
-                pointer, col_config, table, meta_table, 
-                server_config.min_size, server_config.max_size
-            ))
-            task.add_done_callback(lambda fut: self._on_task_done(fut))
+            # Block here until a worker slot is available before spawning the task
+            async with self.sem:
+                task = asyncio.create_task(self._wrapped_process(
+                    pointer, col_config, table, meta_table, 
+                    server_config.min_size, server_config.max_size
+                ))
+                task.add_done_callback(lambda fut: self._on_task_done(fut))
 
     async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size):
-        try:
-            await self._process_document(
-                pointer, col_config, table, meta_table, min_size, max_size
-            )
-        finally:
-            self.sem.release()
+        # The task itself also needs to hold a slot while doing work
+        async with self.sem:
+            try:
+                await self._process_document(
+                    pointer, col_config, table, meta_table, min_size, max_size
+                )
+            except Exception as e:
+                print(f"Error in _wrapped_process for {pointer.document_id}: {e}")
+                raise e
 
     def _on_task_done(self, fut):
         try:
             fut.result()
         except Exception as e:
-            # In a real system, we might log this to a file or monitoring service
             print(f"Task failed: {e}")
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
