@@ -13,6 +13,8 @@ class ServerConfig(BaseModel):
     embedding: Dict[str, Any] = Field(default_factory=dict)
     min_size: int = 500
     max_size: int = 5000
+    llm_batch_size: int = 10
+    embedding_batch_size: int = 10
 
 class CollectionInfraConfig(BaseModel):
     """

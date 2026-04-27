@@ -11,11 +11,10 @@ class BatchCall:
     Base class providing async batching and queueing logic.
     Subclasses must implement _execute_batch and _process_item.
     """
-    BATCH_SIZE = 10
-    BATCH_TIMEOUT = 3.0
-
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, batch_size: int = 10, batch_timeout: float = 3.0):
         self.model = model
+        self.batch_size = batch_size
+        self.batch_timeout = batch_timeout
         self.queue: asyncio.Queue = asyncio.Queue()
         self.buffer: List[Tuple[int, str, int]] = []
         self._worker_task = asyncio.create_task(self._queue_worker())
@@ -38,7 +37,7 @@ class BatchCall:
         while True:
             should_dispatch_partial = False
             try:
-                current_timeout = None if not self.buffer else self.BATCH_TIMEOUT
+                current_timeout = None if not self.buffer else self.batch_timeout
                 future, prompts = await asyncio.wait_for(self.queue.get(), timeout=current_timeout)
                 
                 f_id = id(future)
@@ -58,13 +57,13 @@ class BatchCall:
                 await asyncio.sleep(1)
                 continue
 
-            while len(self.buffer) > 0 and (len(self.buffer) >= self.BATCH_SIZE or should_dispatch_partial):
-                batch_size = min(len(self.buffer), self.BATCH_SIZE)
+            while len(self.buffer) > 0 and (len(self.buffer) >= self.batch_size or should_dispatch_partial):
+                batch_size = min(len(self.buffer), self.batch_size)
                 batch_to_send = self.buffer[:batch_size]
                 self.buffer = self.buffer[batch_size:]
                 await self._dispatch_batch(batch_to_send, pending_requests)
                 
-                if batch_size < self.BATCH_SIZE:
+                if batch_size < self.batch_size:
                     should_dispatch_partial = False
 
     async def _dispatch_batch(self, items: List[Tuple[int, str, int]], pending_requests: Dict[int, Dict[str, Any]]):
@@ -106,10 +105,9 @@ class LlmCall(BatchCall):
     """
     Wrapper for a LangChain ChatModel with request batching.
     """
-    def __init__(self, **kwargs):
-        # Initialize the model using the factory pattern and add retries
+    def __init__(self, batch_size: int = 10, **kwargs):
         llm = init_chat_model(**kwargs).with_retry(stop_after_attempt=3)
-        super().__init__(llm)
+        super().__init__(llm, batch_size=batch_size)
 
     async def _execute_batch(self, prompts: List[str]) -> List[Any]:
         return await self.model.abatch(prompts)
@@ -122,16 +120,12 @@ class EmbeddingCall(BatchCall):
     Wrapper for a LangChain Embeddings model with batching for documents
     and real-time processing for queries.
     """
-    def __init__(self, dimensions: int = VECTOR_DIMENSIONS, **kwargs):
+    def __init__(self, dimensions: int = VECTOR_DIMENSIONS, batch_size: int = 10, **kwargs):
         self.dimensions = dimensions
-        # Initialize the embedding model using the factory pattern
         embeddings = init_embeddings(**kwargs)
-        super().__init__(embeddings)
+        super().__init__(embeddings, batch_size=batch_size)
 
     async def query(self, text: str, dimensions: Optional[int] = None) -> List[float]:
-        """
-        Real-time query embedding without queuing.
-        """
         dims = dimensions if dimensions is not None else self.dimensions
         res = await self.model.aembed_query(text)
         return res[:dims]
@@ -140,6 +134,4 @@ class EmbeddingCall(BatchCall):
         return await self.model.aembed_documents(texts)
 
     def _process_item(self, item: Any) -> List[float]:
-        # Embedding results are typically lists of floats already
-        # Truncate to the configured dimensions
         return item[:self.dimensions]
