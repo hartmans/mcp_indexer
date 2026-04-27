@@ -47,26 +47,49 @@ class Indexer:
             pass
 
         sem = asyncio.Semaphore(INDEXING_WORKERS)
-        tasks = []
+        
+        # Use a completion event to know when all tasks are finished
+        # since we are not keeping a list of tasks.
+        pending_tasks = 0
+        completion_event = asyncio.Event()
 
-        async def wrapped_process(pointer):
-            if pointer.document_id in existing_docs:
-                return
-            async with sem:
-                await self._process_document(
-                    pointer, 
-                    col_config, 
-                    table, 
-                    meta_table, 
-                    server_config.min_size, 
-                    server_config.max_size
-                )
+        def on_task_done(fut):
+            nonlocal pending_tasks
+            pending_tasks -= 1
+            try:
+                fut.result()
+            except Exception as e:
+                # Error is already printed inside _process_document, 
+                # but we can log it here if needed.
+                pass
+            if pending_tasks == 0:
+                completion_event.set()
 
         async for pointer in source.get_documents(last_modified=None):
-            tasks.append(asyncio.create_task(wrapped_process(pointer)))
+            if pointer.document_id in existing_docs:
+                continue
+            
+            # Acquire semaphore slot BEFORE creating the task to prevent backpressure
+            await sem.acquire()
+            pending_tasks += 1
+            
+            # Create the task and attach the callback
+            task = asyncio.create_task(self._wrapped_process(
+                pointer, col_config, table, meta_table, 
+                server_config.min_size, server_config.max_size, sem
+            ))
+            task.add_done_callback(on_task_done)
         
-        if tasks:
-            await asyncio.gather(*tasks)
+        if pending_tasks > 0:
+            await completion_event.wait()
+
+    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size, sem):
+        try:
+            await self._process_document(
+                pointer, col_config, table, meta_table, min_size, max_size
+            )
+        finally:
+            sem.release()
 
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         """
@@ -131,13 +154,14 @@ class Indexer:
                 keywords=metadata_dict.get("keywords", [])
             )
             
-            # Atomic merge: Update/Insert new chunks and delete stale chunks for this doc
+            # Atomic merge
             table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"target.document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
             
             meta_table.upsert([doc_record])
 
         except Exception as e:
             print(f"Error processing document {pointer.document_id}: {e}")
+            raise e
 
     async def _summarize_semantic_chunk(self, text_list: list[str], prompt: str) -> str:
         text = " ".join(text_list)
