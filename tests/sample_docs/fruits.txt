@@ -1,0 +1,5 @@
+Apple is a fruit.
+
+Banana is also a fruit.
+
+They are both delicious.
