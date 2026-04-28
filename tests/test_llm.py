@@ -18,6 +18,18 @@ class MockChatModel:
     def with_retry(self, **kwargs):
         return self
 
+
+class MockShortChatModel(MockChatModel):
+    async def abatch(self, inputs):
+        self.calls.append(inputs)
+        return [MockMessage(content=f"Response to {p}") for p in inputs[:-1]]
+
+
+class MockNoneChatModel(MockChatModel):
+    async def abatch(self, inputs):
+        self.calls.append(inputs)
+        return [MockMessage(content=None) for _ in inputs]
+
 class MockEmbeddings:
     def __init__(self):
         self.calls = []
@@ -34,6 +46,32 @@ class MockEmbeddings:
 def mock_llm_factory():
     original_factory = llm_module.init_chat_model
     mock_model = MockChatModel()
+    
+    def factory(**kwargs):
+        return mock_model
+        
+    llm_module.init_chat_model = factory
+    yield mock_model
+    llm_module.init_chat_model = original_factory
+
+
+@pytest.fixture
+def mock_short_llm_factory():
+    original_factory = llm_module.init_chat_model
+    mock_model = MockShortChatModel()
+    
+    def factory(**kwargs):
+        return mock_model
+        
+    llm_module.init_chat_model = factory
+    yield mock_model
+    llm_module.init_chat_model = original_factory
+
+
+@pytest.fixture
+def mock_none_llm_factory():
+    original_factory = llm_module.init_chat_model
+    mock_model = MockNoneChatModel()
     
     def factory(**kwargs):
         return mock_model
@@ -111,6 +149,21 @@ async def test_llm_timeout_dispatch(mock_llm_factory):
     assert res == ["Response to P1", "Response to P2", "Response to P3"]
     assert len(mock_llm_factory.calls) == 1
     assert len(mock_llm_factory.calls[0]) == 3
+
+
+@pytest.mark.asyncio
+async def test_llm_raises_on_short_batch_result(mock_short_llm_factory):
+    caller = LlmCall(model="test", batch_timeout=0.05)
+
+    with pytest.raises(ValueError, match="returned 1 results for 2 prompts"):
+        await caller(["P1", "P2"])
+
+
+@pytest.mark.asyncio
+async def test_llm_allows_none_content(mock_none_llm_factory):
+    caller = LlmCall(model="test", batch_timeout=0.05)
+    res = await asyncio.wait_for(caller(["Hello"]), timeout=0.2)
+    assert res == [None]
 
 @pytest.mark.asyncio
 async def test_embedding_call(mock_emb_factory):

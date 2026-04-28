@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import lancedb
 import logging
 import argparse
@@ -11,7 +12,20 @@ from mcp_indexer.plugins.base import Document, DocumentChunk, create_embedding_c
 
 logger = logging.getLogger(__name__)
 
-INDEXING_WORKERS = 20
+INDEXING_WORKERS = 64
+
+
+@dataclass
+class SummarySpan:
+    offset: int
+    size: int
+    text: str
+
+
+@dataclass
+class SemanticChunkPlan:
+    embedding_chunks: list[tuple[dict[str, Any], str]]
+    summary_spans: list[SummarySpan]
 
 class Indexer:
     """
@@ -98,39 +112,48 @@ class Indexer:
     async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
         try:
             server_config = self.config_manager.get_server_config()
-            semantic_chunks = []
-            async for meta, text_list in pointer.get_chunks(min_size, max_size):
-                semantic_chunks.append((meta, text_list))
+            plans = [
+                self._build_semantic_chunk_plan(meta, text_list, min_size, max_size, server_config.max_to_summarize)
+                async for meta, text_list in pointer.get_chunks(min_size, max_size)
+            ]
 
-            summary_tasks = []
-            for _, text_list in semantic_chunks:
-                chunk_text = " ".join(text_list)
-                if len(chunk_text) > server_config.max_to_summarize:
-                    summary_tasks.append(self._summary_too_big())
-                else:
-                    summary_tasks.append(self._summarize_semantic_chunk(text_list, col_config.chunk_summary_prompt or col_config.doc_summary_prompt))
-            
-            embedding_tasks = []
-            for meta, text_list in semantic_chunks:
-                embedding_chunks = create_embedding_chunks(meta, text_list, min_size, max_size)
-                texts = [t for _, t in embedding_chunks]
-                embedding_tasks.append(self._embed_batch(texts))
+            summary_prompt = col_config.chunk_summary_prompt or col_config.doc_summary_prompt
+            summary_tasks = [self._summarize_text(span.text, summary_prompt) for plan in plans for span in plan.summary_spans]
+            embedding_tasks = [
+                self._embed_batch([text for _, text in plan.embedding_chunks])
+                for plan in plans
+            ]
 
-            summaries = await asyncio.gather(*summary_tasks)
-            embeddings_batches = await asyncio.gather(*embedding_tasks)
+            summary_results, embeddings_batches = await asyncio.gather(
+                asyncio.gather(*summary_tasks),
+                asyncio.gather(*embedding_tasks),
+            )
+
+            chunk_summary_groups: list[list[str]] = []
+            summary_index = 0
+            for plan in plans:
+                span_count = len(plan.summary_spans)
+                span_summaries = summary_results[summary_index:summary_index + span_count]
+                summary_index += span_count
+                chunk_summary_groups.append(span_summaries)
 
             all_chunks_to_upsert = []
-            for i, (meta, _) in enumerate(semantic_chunks):
-                sem_summary = summaries[i]
+            for i, plan in enumerate(plans):
                 batch_embeddings = embeddings_batches[i]
-                emb_chunks_info = create_embedding_chunks(meta, semantic_chunks[i][1], min_size, max_size)
-                
-                for j, (e_meta, _) in enumerate(emb_chunks_info):
+                span_summaries = chunk_summary_groups[i]
+
+                for j, (e_meta, e_text) in enumerate(plan.embedding_chunks):
+                    chunk_summary = self._summary_for_embedding_chunk(
+                        e_meta,
+                        plan.summary_spans,
+                        span_summaries,
+                    )
                     all_chunks_to_upsert.append(DocumentChunk(
                         document_id=pointer.document_id,
                         chunk_id=f"{pointer.document_id}?c={len(all_chunks_to_upsert)}",
-                        text=emb_chunks_info[j][1],
-                        summary=sem_summary,
+                        # We do not need to store text for now
+                        # text=e_text,
+                        summary=chunk_summary,
                         embedding=batch_embeddings[j],
                         metadata=e_meta
                     ))
@@ -138,14 +161,14 @@ class Indexer:
             metadata_dict = await pointer.get_metadata()
             doc_summary = metadata_dict.get("summary")
             if not doc_summary:
-                doc_summary_text = "\n\n".join(summaries)
+                doc_summary_text = "\n\n".join(summary_results)
                 doc_summary_list = await self.context.llm([[
                     ('system', col_config.doc_summary_prompt),
                     ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}")]
                 ])
                 doc_summary = doc_summary_list[0]
             
-            doc_vector = await self.context.embedding.query(doc_summary)
+            doc_vector = (await self.context.embedding([doc_summary]))[0]
 
             doc_record = Document(
                 document_id=pointer.document_id,
@@ -164,16 +187,53 @@ class Indexer:
             logger.error(f"Error processing document {pointer.document_id}: {e}")
             raise e
 
-    async def _summarize_semantic_chunk(self, text_list: list[str], prompt: str) -> str:
-        text = " ".join(text_list)
+    async def _summarize_text(self, text: str, prompt: str) -> str:
         res = await self.context.llm([[
                                        ('system',prompt),
                                        ('user',f'Write no more than three sentences to summarize this chunk:\n\n{text}'),
                                        ]])
         return res[0]
 
-    async def _summary_too_big(self) -> str:
-        return "too big to summarize"
+    def _build_semantic_chunk_plan(self, metadata: dict[str, Any], text_list: list[str], min_size: int, max_size: int, max_to_summarize: int) -> SemanticChunkPlan:
+        text = "".join(text_list)
+        return SemanticChunkPlan(
+            embedding_chunks=create_embedding_chunks(metadata, text_list, min_size, max_size),
+            summary_spans=self._split_summary_spans(text, max_to_summarize),
+        )
+
+    def _split_summary_spans(self, text: str, max_to_summarize: int) -> list[SummarySpan]:
+        if len(text) <= max_to_summarize:
+            return [SummarySpan(offset=0, size=len(text), text=text)]
+
+        split_size = max(1, max_to_summarize // 2)
+        spans = []
+        for offset in range(0, len(text), split_size):
+            chunk_text = text[offset:offset + split_size]
+            spans.append(SummarySpan(offset=offset, size=len(chunk_text), text=chunk_text))
+        return spans
+
+    def _summary_for_embedding_chunk(
+        self,
+        embedding_metadata: dict[str, Any],
+        summary_spans: list[SummarySpan],
+        span_summaries: list[str],
+    ) -> str:
+        if len(span_summaries) == 1:
+            return span_summaries[0]
+
+        start = int(embedding_metadata.get("o", 0))
+        end = start + int(embedding_metadata.get("s", 0))
+        best_index = 0
+        best_overlap = -1
+
+        for index, span in enumerate(summary_spans):
+            span_end = span.offset + span.size
+            overlap = max(0, min(end, span_end) - max(start, span.offset))
+            if overlap > best_overlap:
+                best_index = index
+                best_overlap = overlap
+
+        return span_summaries[best_index]
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)

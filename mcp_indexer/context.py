@@ -32,8 +32,14 @@ class Context:
         config_manager = ConfigManager(config_path)
         server_config = config_manager.get_server_config()
         
-        llm_call = LlmCall(**server_config.llm)
-        embedding_call = EmbeddingCall(**server_config.embedding)
+        llm_call = LlmCall(
+            batch_size=server_config.llm_batch_size,
+            **server_config.llm,
+        )
+        embedding_call = EmbeddingCall(
+            batch_size=server_config.embedding_batch_size,
+            **server_config.embedding,
+        )
         
         # Expand tilde in db_uri
         db_uri = os.path.expanduser(server_config.db_uri)

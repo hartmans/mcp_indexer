@@ -117,6 +117,7 @@ async def test_indexer_indexes_text_documents_end_to_end(tmp_path):
     assert {row["title"] for row in meta_rows} == {"alpha.txt", "beta.txt"}
     assert any("alpha" in row["summary"].lower() for row in meta_rows)
     assert any("beta" in row["summary"].lower() for row in meta_rows)
+    assert not any(call[0] == "query" for call in context.embedding.calls)
 
     search_results = await indexer.search("notes", "alpha", limit=2)
     assert search_results
@@ -125,10 +126,10 @@ async def test_indexer_indexes_text_documents_end_to_end(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_indexer_marks_oversized_chunks_without_chunk_llm_summary(tmp_path):
+async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(tmp_path):
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
-    big_text = "alpha " * 20
+    big_text = "aaaaabbbbbcccccddddd"
     (docs_dir / "alpha.txt").write_text(big_text, encoding="utf-8")
 
     collection_config = CollectionConfig.model_validate({
@@ -141,8 +142,8 @@ async def test_indexer_marks_oversized_chunks_without_chunk_llm_summary(tmp_path
     })
     server_config = ServerConfig.model_validate({
         "db_uri": str(tmp_path / "db"),
-        "min_size": 10,
-        "max_size": 1000,
+        "min_size": 1,
+        "max_size": 5,
         "max_to_summarize": 10,
     })
     config_manager = FakeConfigManager("notes", collection_config, server_config)
@@ -163,15 +164,17 @@ async def test_indexer_marks_oversized_chunks_without_chunk_llm_summary(tmp_path
 
     chunk_rows = context.db.open_table("notes").to_pandas().to_dict("records")
     meta_rows = context.db.open_table("notes_meta").to_pandas().to_dict("records")
+    chunk_rows.sort(key=lambda row: row["chunk_id"])
 
-    assert len(chunk_rows) == 1
-    assert chunk_rows[0]["summary"] == "too big to summarize"
-    assert len(llm.calls) == 1
-    assert llm.calls[0] == [[
+    assert len(chunk_rows) == 4
+    assert [row["summary"] for row in chunk_rows] == ["aaaaa", "bbbbb", "ccccc", "ddddd"]
+    assert len(llm.calls) == 5
+    assert llm.calls[-1] == [[
         ("system", "Summarize the document"),
-        ("user", "Write no more than two paragraphs to summarize the following document:\n\ntoo big to summarize"),
+        ("user", "Write no more than two paragraphs to summarize the following document:\n\naaaaa\n\nbbbbb\n\nccccc\n\nddddd"),
     ]]
-    assert meta_rows[0]["summary"] == "too big to summarize"
+    assert meta_rows[0]["summary"] == "aaaaa\n\nbbbbb\n\nccccc\n\nddddd"
+    assert [call[0] for call in context.embedding.calls] == ["docs", "docs"]
 
 
 @pytest.mark.asyncio

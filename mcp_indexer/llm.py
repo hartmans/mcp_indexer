@@ -8,6 +8,7 @@ from langchain.embeddings import init_embeddings
 logger = logging.getLogger(__name__)
 
 VECTOR_DIMENSIONS = 768
+_MISSING = object()
 
 class BatchCall:
     """
@@ -46,7 +47,7 @@ class BatchCall:
                 f_id = id(future)
                 pending_requests[f_id] = {
                     "future": future,
-                    "results": [None] * len(prompts),
+                    "results": [_MISSING] * len(prompts),
                     "expected": len(prompts)
                 }
                 for idx, p in enumerate(prompts):
@@ -76,6 +77,10 @@ class BatchCall:
         prompts = [item[1] for item in items]
         try:
             results = await self._execute_batch(prompts)
+            if len(results) != len(items):
+                raise ValueError(
+                    f"{self.__class__.__name__} returned {len(results)} results for {len(items)} prompts"
+                )
             
             for (f_id, _, idx), res in zip(items, results):
                 val = self._process_item(res)
@@ -84,7 +89,7 @@ class BatchCall:
                     req = pending_requests[f_id]
                     req["results"][idx] = val
                     
-                    if all(r is not None for r in req["results"]):
+                    if all(r is not _MISSING for r in req["results"]):
                         fut = req["future"]
                         if not fut.done():
                             fut.set_result(req["results"])

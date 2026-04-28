@@ -1,6 +1,8 @@
 [server]
 db_uri = "/tmp/lancedb_test"
 log_level = "DEBUG"
+llm_batch_size = 7
+embedding_batch_size = 13
 
 [server.llm]
 model = "gemma4:31b"

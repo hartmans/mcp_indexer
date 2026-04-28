@@ -39,8 +39,10 @@ def test_build_context(monkeypatch):
     # Verify the config was passed correctly to the calls
     assert ctx.llm.kwargs["model"] == "gemma4:31b"
     assert ctx.llm.kwargs["model_provider"] == "ollama"
+    assert ctx.llm.kwargs["batch_size"] == 7
     assert ctx.embedding.kwargs["model"] == "qwen3-embedding:4b"
     assert ctx.embedding.kwargs["model_provider"] == "ollama"
+    assert ctx.embedding.kwargs["batch_size"] == 13
 
 def test_context_get_table():
     mock_db = MockDb()
