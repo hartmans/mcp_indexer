@@ -40,9 +40,14 @@ def test_build_context(monkeypatch):
     assert ctx.llm.kwargs["model"] == "gemma4:31b"
     assert ctx.llm.kwargs["model_provider"] == "ollama"
     assert ctx.llm.kwargs["batch_size"] == 7
+    assert ctx.llm.kwargs["request_timeout"] == 400.0
+    assert ctx.llm.kwargs["timeout_retries"] is None
     assert ctx.embedding.kwargs["model"] == "qwen3-embedding:4b"
-    assert ctx.embedding.kwargs["model_provider"] == "ollama"
+    assert ctx.embedding.kwargs["provider"] == "ollama"
+    assert "model_provider" not in ctx.embedding.kwargs
     assert ctx.embedding.kwargs["batch_size"] == 13
+    assert ctx.embedding.kwargs["request_timeout"] == 400.0
+    assert ctx.embedding.kwargs["timeout_retries"] is None
 
 def test_context_get_table():
     mock_db = MockDb()

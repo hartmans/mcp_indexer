@@ -34,11 +34,18 @@ class Context:
         
         llm_call = LlmCall(
             batch_size=server_config.llm_batch_size,
+            request_timeout=server_config.llm_request_timeout,
+            timeout_retries=server_config.llm_timeout_retries,
             **server_config.llm,
         )
+        embedding_config = server_config.embedding.copy()
+        if "model_provider" in embedding_config and "provider" not in embedding_config:
+            embedding_config["provider"] = embedding_config.pop("model_provider")
         embedding_call = EmbeddingCall(
             batch_size=server_config.embedding_batch_size,
-            **server_config.embedding,
+            request_timeout=server_config.embedding_request_timeout,
+            timeout_retries=server_config.embedding_timeout_retries,
+            **embedding_config,
         )
         
         # Expand tilde in db_uri

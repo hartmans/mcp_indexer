@@ -1,18 +1,29 @@
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 import lancedb
 import logging
 import argparse
 import sys
+import time
 from typing import List, Optional, Any
 from datetime import datetime
+from pydantic import BaseModel
 from mcp_indexer.context import Context
 from mcp_indexer.config import ConfigManager
 from mcp_indexer.plugins.base import Document, DocumentChunk, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
 
-INDEXING_WORKERS = 64
+INDEXING_WORKERS = 10
+MONITOR_INTERVAL_SECONDS = 30.0
+MONITOR_STALL_THRESHOLD_SECONDS = 40.0
+DEBUG_STATS_FILENAME = "indexer-stats.jsonl"
+
+
+def monitor_time() -> float:
+    return time.monotonic()
 
 
 @dataclass
@@ -27,17 +38,27 @@ class SemanticChunkPlan:
     embedding_chunks: list[tuple[dict[str, Any], str]]
     summary_spans: list[SummarySpan]
 
+
+class DocumentIndexingStats(BaseModel):
+    document_id: str
+    semantic_chunks: int = 0
+    embedding_chunks: int = 0
+    summary_spans: int = 0
+
 class Indexer:
     """
     Orchestrates the indexing process across multiple collections.
     """
-    def __init__(self, context: Context, config_manager: ConfigManager):
+    def __init__(self, context: Context, config_manager: ConfigManager, debug: bool = False):
         self.context = context
         self.config_manager = config_manager
+        self.debug = debug
         self.sem = asyncio.Semaphore(INDEXING_WORKERS)
-        self._active_tasks = 0
         self._idle = asyncio.Event()
         self._idle.set()
+        self._running_documents: dict[asyncio.Task, DocumentIndexingStats] = {}
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._debug_stats_path = Path(DEBUG_STATS_FILENAME)
 
     async def index_all(self):
         """
@@ -78,44 +99,118 @@ class Indexer:
                 continue
 
             await self.sem.acquire()
-            self._active_tasks += 1
-            self._idle.clear()
+            stats = DocumentIndexingStats(document_id=pointer.document_id)
             task = asyncio.create_task(self._wrapped_process(
                 pointer, col_config, table, meta_table,
-                server_config.min_size, server_config.max_size
+                server_config.min_size, server_config.max_size, stats
             ))
-            task.add_done_callback(lambda fut: self._on_task_done(fut))
+            self._track_task(task, stats)
+            task.add_done_callback(self._on_task_done)
 
-    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size):
+    def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
+        self._running_documents[task] = stats
+        self._idle.clear()
+        self._ensure_monitor_task()
+
+    def _ensure_monitor_task(self) -> None:
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor_running_documents())
+
+    async def _monitor_running_documents(self) -> None:
+        last_run = monitor_time()
+        previous_tasks: set[asyncio.Task] = set()
+        try:
+            while True:
+                await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+                now = monitor_time()
+                elapsed = now - last_run
+                last_run = now
+
+                if elapsed > MONITOR_STALL_THRESHOLD_SECONDS:
+                    logger.error(
+                        "Indexing monitor woke after %.2fs, exceeding the %.2fs threshold",
+                        elapsed,
+                        MONITOR_STALL_THRESHOLD_SECONDS,
+                    )
+
+                running_items = list(self._running_documents.items())
+                if not running_items:
+                    return
+
+                current_tasks = {task for task, _ in running_items}
+                tasks_to_log = current_tasks & previous_tasks
+                previous_tasks = current_tasks
+
+                for task, stats in running_items:
+                    if task not in tasks_to_log:
+                        continue
+                    logger.info(
+                        "Still indexing document_id=%s semantic_chunks=%d embedding_chunks=%d summary_spans=%d",
+                        stats.document_id,
+                        stats.semantic_chunks,
+                        stats.embedding_chunks,
+                        stats.summary_spans,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._monitor_task is asyncio.current_task():
+                self._monitor_task = None
+
+    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size, stats):
         try:
             await self._process_document(
-                pointer, col_config, table, meta_table, min_size, max_size
+                pointer, col_config, table, meta_table, min_size, max_size, stats
             )
         except Exception as e:
             logger.error(f"Error in _wrapped_process for {pointer.document_id}: {e}")
             raise e
         finally:
             self.sem.release()
-            self._active_tasks -= 1
-            if self._active_tasks == 0:
-                self._idle.set()
 
-    def _on_task_done(self, fut):
+    def _on_task_done(self, fut: asyncio.Task) -> None:
+        stats = self._running_documents.pop(fut, None)
+        if stats is not None and self.debug:
+            self._append_debug_stats(stats)
+
+        if not self._running_documents:
+            if self._monitor_task is not None and not self._monitor_task.done():
+                self._monitor_task.cancel()
+            self._idle.set()
+
         try:
             fut.result()
         except Exception as e:
             logger.exception(f"Task failed: {e}")
 
+    def _append_debug_stats(self, stats: DocumentIndexingStats) -> None:
+        with self._debug_stats_path.open("a", encoding="utf-8") as handle:
+            handle.write(stats.model_dump_json())
+            handle.write("\n")
+            handle.flush()
+
     async def wait_for_idle(self):
         await self._idle.wait()
+        if self._monitor_task is not None:
+            with suppress(asyncio.CancelledError):
+                await self._monitor_task
 
-    async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size):
+    async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size, stats: DocumentIndexingStats):
         try:
             server_config = self.config_manager.get_server_config()
-            plans = [
-                self._build_semantic_chunk_plan(meta, text_list, min_size, max_size, server_config.max_to_summarize)
-                async for meta, text_list in pointer.get_chunks(min_size, max_size)
-            ]
+            plans = []
+            async for meta, text_list in pointer.get_chunks(min_size, max_size):
+                plan = self._build_semantic_chunk_plan(
+                    meta,
+                    text_list,
+                    min_size,
+                    max_size,
+                    server_config.max_to_summarize,
+                )
+                plans.append(plan)
+                stats.semantic_chunks += 1
+                stats.embedding_chunks += len(plan.embedding_chunks)
+                stats.summary_spans += len(plan.summary_spans)
 
             summary_prompt = col_config.chunk_summary_prompt or col_config.doc_summary_prompt
             summary_tasks = [self._summarize_text(span.text, summary_prompt) for plan in plans for span in plan.summary_spans]
@@ -256,14 +351,20 @@ class Indexer:
 async def main():
     parser = argparse.ArgumentParser(description="LanceDB Indexer CLI")
     parser.add_argument("--config", required=True, help="Path to the config TOML file")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=f"Write per-document indexing statistics to {DEBUG_STATS_FILENAME}",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logging.getLogger('httpx').setLevel(logging.ERROR)
     
     ctx = Context.build_context(args.config)
-    indexer = Indexer(ctx, ctx.config)
+    indexer = Indexer(ctx, ctx.config, debug=args.debug)
     await indexer.index_all()
+    await indexer.wait_for_idle()
 
 if __name__ == "__main__":
     try:
