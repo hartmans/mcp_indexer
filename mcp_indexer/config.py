@@ -18,8 +18,8 @@ class ServerConfig(BaseModel):
     embedding_batch_size: int = 10
     llm_request_timeout: float | None = 400.0
     embedding_request_timeout: float | None = 400.0
-    llm_timeout_retries: int | None = None
-    embedding_timeout_retries: int | None = None
+    llm_timeout_retries: int = 20
+    embedding_timeout_retries: int = 20
 
 class CollectionInfraConfig(BaseModel):
     """

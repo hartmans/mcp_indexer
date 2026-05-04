@@ -1,15 +1,14 @@
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
-from typing import List, Any, Dict, Tuple, Optional, TypeVar
+from typing import List, Any, Dict, Tuple, Optional
 from langchain.chat_models import init_chat_model
 from langchain.embeddings import init_embeddings
+from langchain.embeddings.base import _infer_model_and_provider
 
 logger = logging.getLogger(__name__)
 
 VECTOR_DIMENSIONS = 768
 _MISSING = object()
-T = TypeVar("T")
 
 class BatchCall:
     """
@@ -21,14 +20,10 @@ class BatchCall:
         model: Any,
         batch_size: int = 10,
         batch_timeout: float = 3.0,
-        request_timeout: Optional[float] = 400.0,
-        timeout_retries: Optional[int] = None,
     ):
         self.model = model
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
-        self.request_timeout = request_timeout
-        self.timeout_retries = timeout_retries
         self.queue: asyncio.Queue = asyncio.Queue()
         self.buffer: List[Tuple[int, str, int]] = []
         self._worker_task = asyncio.create_task(self._queue_worker())
@@ -119,34 +114,6 @@ class BatchCall:
     def _process_item(self, item: Any) -> Any:
         raise NotImplementedError
 
-    async def _await_with_timeout_retry(
-        self,
-        operation: Callable[[], Awaitable[T]],
-        *,
-        label: str,
-    ) -> T:
-        attempt = 1
-        while True:
-            try:
-                if self.request_timeout is None:
-                    return await operation()
-                return await asyncio.wait_for(operation(), timeout=self.request_timeout)
-            except asyncio.TimeoutError:
-                if self.timeout_retries is not None and attempt >= self.timeout_retries:
-                    raise
-                retry_label = (
-                    f"{attempt + 1}/{self.timeout_retries}"
-                    if self.timeout_retries is not None
-                    else f"{attempt + 1}"
-                )
-                logger.warning(
-                    "%s timed out after %.2fs; retrying (%s)",
-                    label,
-                    self.request_timeout,
-                    retry_label,
-                )
-                attempt += 1
-
 class LlmCall(BatchCall):
     """
     Wrapper for a LangChain ChatModel with request batching.
@@ -154,25 +121,18 @@ class LlmCall(BatchCall):
     def __init__(
         self,
         batch_size: int = 10,
-        batch_timeout: float = 3.0,
+        batch_timeout: float = 0.25,
         request_timeout: Optional[float] = 400.0,
-        timeout_retries: Optional[int] = None,
+        timeout_retries: int = 20,
         **kwargs,
     ):
+        kwargs.setdefault("timeout", request_timeout)
+        kwargs.setdefault("max_retries", timeout_retries)
         llm = init_chat_model(**kwargs).with_retry(stop_after_attempt=3)
-        super().__init__(
-            llm,
-            batch_size=batch_size,
-            batch_timeout=batch_timeout,
-            request_timeout=request_timeout,
-            timeout_retries=timeout_retries,
-        )
+        super().__init__(llm, batch_size=batch_size, batch_timeout=batch_timeout)
 
     async def _execute_batch(self, prompts: List[str|list[dict]]) -> List[Any]:
-        return await self._await_with_timeout_retry(
-            lambda: self.model.abatch(prompts),
-            label="LLM batch request",
-        )
+        return await self.model.abatch(prompts)
 
     def _process_item(self, item: Any) -> str:
         return item.content if hasattr(item, 'content') else str(item)
@@ -186,40 +146,33 @@ class EmbeddingCall(BatchCall):
         self,
         dimensions: int = VECTOR_DIMENSIONS,
         batch_size: int = 10,
-        batch_timeout: float = 3.0,
+        batch_timeout: float = 0.25,
         request_timeout: Optional[float] = 400.0,
-        timeout_retries: Optional[int] = None,
+        timeout_retries: int = 20,
         **kwargs,
     ):
         self.dimensions = dimensions
-        provider = kwargs.get("provider") or kwargs.get("model_provider")
-        if provider == "openai" and "check_embedding_ctx_length" not in kwargs:
+        try:
+            provider, _ = _infer_model_and_provider(kwargs["model"], provider=kwargs.get("provider"))
+        except ValueError:
+            provider = kwargs.get("provider")
+        kwargs.setdefault("timeout", request_timeout)
+        kwargs.setdefault("max_retries", timeout_retries)
+        if provider in {"openai", "azure_openai"} and "check_embedding_ctx_length" not in kwargs:
             # LangChain's OpenAI wrapper tokenizes with tiktoken and sends token
             # ids for length-safe embedding. OpenAI-compatible local servers
             # such as vLLM need raw strings unless their tokenizer is identical.
             kwargs["check_embedding_ctx_length"] = False
         embeddings = init_embeddings(**kwargs)
-        super().__init__(
-            embeddings,
-            batch_size=batch_size,
-            batch_timeout=batch_timeout,
-            request_timeout=request_timeout,
-            timeout_retries=timeout_retries,
-        )
+        super().__init__(embeddings, batch_size=batch_size, batch_timeout=batch_timeout)
 
     async def query(self, text: str, dimensions: Optional[int] = None) -> List[float]:
         dims = dimensions if dimensions is not None else self.dimensions
-        res = await self._await_with_timeout_retry(
-            lambda: self.model.aembed_query(text),
-            label="embedding query request",
-        )
+        res = await self.model.aembed_query(text)
         return res[:dims]
 
     async def _execute_batch(self, texts: List[str]) -> List[Any]:
-        return await self._await_with_timeout_retry(
-            lambda: self.model.aembed_documents(texts),
-            label="embedding document request",
-        )
+        return await self.model.aembed_documents(texts)
 
     def _process_item(self, item: Any) -> List[float]:
         return item[:self.dimensions]
