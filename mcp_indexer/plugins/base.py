@@ -15,14 +15,16 @@ class DocumentChunk(LanceModel):
     This is *not* a type used within DocumentSources.
     '''
     document_id:str = Field(description="Unique identifier for the document to which this chunk belongs.")
+    order: int = Field(description="Order of the chunk within the document, starting at 0")
     chunk_id: str = Field(description="Identifier of this chunk; document_id should be a prefix")
     text: str|None = Field(
         default=None,
         description="Full text of this chunk. If the document source can retrieve easily it can supply the embedding explicitly and avoid duplicating the text.")
-    summary: str = Field(
-        default="",
-        description="An llm summary of this chunk.")
     embedding: Vector(VECTOR_DIMENSIONS) # pyright: ignore[reportInvalidTypeForm]
+    summary_span: int|None = Field(
+        default=None,
+        description="Which summary span covers this chunk; None if not yet summarized.",
+    )
     metadata_str: str = Field(
         default="{}",
         description="JSON-encoded chunk metadata used to retrieve the source chunk.",
@@ -82,6 +84,11 @@ class Document(LanceModel):
     summary: str = ""
     last_modified: datetime = Field(json_schema_extra={"tz": "UTC"})
 
+class ChunkSummary(LanceModel):
+    document_id: str
+    summary_span: int
+    summary: str
+    
 ChunkInfo = tuple[dict[str,Any], list[str]]
 
 @dataclasses.dataclass
