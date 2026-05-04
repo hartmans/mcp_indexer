@@ -12,7 +12,8 @@ class MockDb:
 
 def test_build_context(monkeypatch):
     # Mock lancedb.connect to avoid actual DB creation
-    monkeypatch.setattr("lancedb.connect", lambda uri: "mock_db")
+    mock_db = MockDb()
+    monkeypatch.setattr("lancedb.connect", lambda uri: mock_db)
     
     # Mock LlmCall and EmbeddingCall to avoid actual LLM/Embedding calls
     class MockLlmCall(LlmCall):
@@ -31,7 +32,7 @@ def test_build_context(monkeypatch):
     config_path = "tests/test_config.toml"
     ctx = Context.build_context(config_path)
 
-    assert ctx.db == "mock_db"
+    assert ctx.db is mock_db
     assert ctx.config is not None
     assert isinstance(ctx.llm, MockLlmCall)
     assert isinstance(ctx.embedding, MockEmbeddingCall)

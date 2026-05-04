@@ -61,6 +61,12 @@ class FakeConfigManager:
         return self.server_config
 
 
+async def run_indexing_pipeline(indexer: Indexer):
+    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
+    await indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False)
+    await indexer.index_all(index=False, summarize_chunks=False, summarize_documents=True)
+
+
 @pytest.mark.asyncio
 async def test_indexer_indexes_text_documents_end_to_end(tmp_path):
     docs_dir = tmp_path / "docs"
@@ -97,10 +103,10 @@ async def test_indexer_indexes_text_documents_end_to_end(tmp_path):
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
-    indexer = Indexer(context, config_manager)
-    await indexer.index_all()
-    await indexer.wait_for_idle()
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
 
     chunk_table = context.db.open_table("notes")
     meta_table = context.db.open_table("notes_meta")
@@ -157,17 +163,20 @@ async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(tmp_pat
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
-    indexer = Indexer(context, config_manager)
-    await indexer.index_all()
-    await indexer.wait_for_idle()
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
 
     chunk_rows = context.db.open_table("notes").to_pandas().to_dict("records")
     meta_rows = context.db.open_table("notes_meta").to_pandas().to_dict("records")
+    summary_rows = context.db.open_table("notes_summary").to_pandas().to_dict("records")
     chunk_rows.sort(key=lambda row: row["chunk_id"])
+    summary_rows.sort(key=lambda row: row["summary_span"])
 
     assert len(chunk_rows) == 4
-    assert [row["summary"] for row in chunk_rows] == ["aaaaa", "bbbbb", "ccccc", "ddddd"]
+    assert [row["summary_span"] for row in chunk_rows] == [0, 1, 2, 3]
+    assert [row["summary"] for row in summary_rows] == ["aaaaa", "bbbbb", "ccccc", "ddddd"]
     assert len(llm.calls) == 5
     assert llm.calls[-1] == [[
         ("system", "Summarize the document"),
@@ -209,10 +218,10 @@ async def test_indexer_uses_escaped_file_paths_in_document_ids(tmp_path):
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
-    indexer = Indexer(context, config_manager)
-    await indexer.index_all()
-    await indexer.wait_for_idle()
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
 
     chunk_rows = context.db.open_table("notes").to_pandas().to_dict("records")
 

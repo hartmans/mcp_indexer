@@ -85,6 +85,7 @@ class Context:
                 context=self,
                 collection_config=col_config
             )
+            self.collections[collection_id].build_tables()
 
 if TYPE_CHECKING:
     from .plugins.base import DocumentSource

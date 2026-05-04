@@ -1,8 +1,3 @@
-import re
-from pathlib import Path
-from typing import List, Optional
-from pydantic import Field
-from mcp_indexer.plugins.base import DocumentPointer, Document
 from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSourcePointer
 
 class TextFileSourceConfig(FileSourceConfig):
@@ -21,18 +16,7 @@ class TextFilePointer(FileSourcePointer):
         Extracts metadata from a text file. 
         For a simple implementation, we use the filename as the title.
         """
-        meta = await super().get_metadata()
-        text = self.path.read_text(
-            encoding=self.source.source_config.encoding,
-            errors="replace",
-        )
-        if len(text) <= self.source.source_config.summary_length and self.source.context.llm is not None:
-            prompt = [
-                    ('system',self.source.config.doc_summary_prompt),
-                    ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{text}")]
-            summaries = await self.source.context.llm([prompt])
-            meta["summary"] = summaries[0]
-        return meta
+        return await super().get_metadata()
 
 class TextFileSource(FileSource[TextFilePointer]):
     """
@@ -64,6 +48,20 @@ class TextFileSource(FileSource[TextFilePointer]):
         super().__init__(collection_id, context=context, collection_config=collection_config)
         # Resolve the specific TextFileSourceConfig
         self.source_config = collection_config.resolve_source_config(TextFileSourceConfig)
+
+    async def get_document_summary(self, document_id: str) -> str:
+        pointer = self.fetch_document(document_id)
+        text = pointer.path.read_text(
+            encoding=self.source_config.encoding,
+            errors="replace",
+        )
+        if len(text) <= self.source_config.summary_length and self.context.llm is not None:
+            prompt = [
+                    ('system',self.config.doc_summary_prompt),
+                    ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{text}")]
+            summaries = await self.context.llm([prompt])
+            return summaries[0]
+        return ""
 
     def fetch_document(self, document_id: str) -> TextFilePointer:
         """Resolves a document_id into a TextFilePointer."""

@@ -111,7 +111,7 @@ async def test_text_file_pointer_retrieval(temp_text_env, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_text_file_pointer_get_metadata_adds_summary_for_small_documents(tmp_path):
+async def test_text_file_source_get_document_summary_summarizes_small_documents(tmp_path):
     path = tmp_path / "small.txt"
     path.write_text("Short document body", encoding="utf-8")
 
@@ -119,10 +119,13 @@ async def test_text_file_pointer_get_metadata_adds_summary_for_small_documents(t
     context = Context(db=None, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=100))
 
-    meta = await source.fetch_document(f"{source.id_prefix}small.txt").get_metadata()
+    pointer = source.fetch_document(f"{source.id_prefix}small.txt")
+    meta = await pointer.get_metadata()
+    summary = await source.get_document_summary(pointer.document_id)
 
     assert meta["title"] == "small.txt"
-    assert meta["summary"] == "summary:Short document body"
+    assert "summary" not in meta
+    assert summary == "summary:Short document body"
     assert len(llm.calls) == 1
 
 

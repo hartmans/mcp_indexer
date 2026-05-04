@@ -78,8 +78,12 @@ class DocumentChunk(LanceModel):
 class Document(LanceModel):
     document_id: str
     title: str = Field(description="Title or file name of this document")
+    title_strength: int = Field(
+        default=0,
+        description="Strength of title in terms of confidence: 10 is an explicitly set user title; 8 is a title extracted as part of summarization"
+    )
     embedding: Vector(VECTOR_DIMENSIONS) = Field( # pyright: ignore[reportInvalidTypeForm]
-        description="Embedding either of the entire document or of the chunk level summaries.")
+        description="Embedding document of the summary.")
     keywords: list[str] = []
     summary: str = ""
     last_modified: datetime = Field(json_schema_extra={"tz": "UTC"})
@@ -88,7 +92,7 @@ class ChunkSummary(LanceModel):
     document_id: str
     summary_span: int
     summary: str
-    
+
 ChunkInfo = tuple[dict[str,Any], list[str]]
 
 @dataclasses.dataclass
@@ -151,6 +155,9 @@ class DocumentSource(Generic[p]):
         self.context = context
         self.config = collection_config
         self.id = collection_id
+        self.chunk_table = None
+        self.meta_table = None
+        self.summary_table = None
         
         prefix = getattr(self, 'source_prefix', self.__class__.__name__.lower())
         self.id_prefix = f"{prefix}:{self.id}:"
@@ -166,12 +173,25 @@ class DocumentSource(Generic[p]):
             raise ValueError(f"document_id '{document_id}' does not start with expected prefix '{self.id_prefix}'")
         return document_id[len(self.id_prefix):]
 
+    def build_tables(self) -> None:
+        self.chunk_table = self._get_or_create_table(self.id, DocumentChunk)
+        self.meta_table = self._get_or_create_table(f"{self.id}_meta", Document)
+        self.summary_table = self._get_or_create_table(f"{self.id}_summary", ChunkSummary)
+
+    def _get_or_create_table(self, name: str, schema: type[LanceModel]):
+        try:
+            return self.context.db.open_table(name)
+        except Exception:
+            return self.context.db.create_table(name, schema=schema)
+
     async def get_documents(self, last_modified:datetime|None = None)-> AsyncGenerator[p, None]:
         ...
 
     async def fetch_document(document_id:str)-> p:
         ...
 
+    async def get_document_summary(self, document_id: str) -> str:
+        return ""
 
     async def fetch_chunk(self, document_id: str, chunk_metadata: dict[str, Any], scope: Literal['semantic', 'embedding']) -> str:
         pointer = self.fetch_document(document_id)

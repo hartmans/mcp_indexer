@@ -1,18 +1,18 @@
+import argparse
 import asyncio
+import json
+import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-import lancedb
-import logging
-import argparse
-import sys
-import time
-from typing import List, Optional, Any
-from datetime import datetime
+from typing import Any, List, Optional
+
+from lancedb import col, lit
 from pydantic import BaseModel
+
 from mcp_indexer.context import Context
-from mcp_indexer.config import ConfigManager
-from mcp_indexer.plugins.base import Document, DocumentChunk, create_embedding_chunks
+from mcp_indexer.llm import VECTOR_DIMENSIONS
+from mcp_indexer.plugins.base import ChunkSummary, Document, DocumentChunk, DocumentSource, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,8 @@ DEBUG_STATS_FILENAME = "indexer-stats.jsonl"
 
 
 def monitor_time() -> float:
+    import time
+
     return time.monotonic()
 
 
@@ -36,22 +38,32 @@ class SummarySpan:
 @dataclass
 class SemanticChunkPlan:
     embedding_chunks: list[tuple[dict[str, Any], str]]
-    summary_spans: list[SummarySpan]
+
+
+@dataclass
+class ReconstructedSemanticChunk:
+    metadata: dict[str, Any]
+    embedding_rows: list[dict[str, Any]]
+    text: str
 
 
 class DocumentIndexingStats(BaseModel):
     document_id: str
+    operation: str = "index"
     semantic_chunks: int = 0
     embedding_chunks: int = 0
     summary_spans: int = 0
 
+
 class Indexer:
     """
-    Orchestrates the indexing process across multiple collections.
+    Orchestrates indexing, chunk summarization, and document summarization.
     """
-    def __init__(self, context: Context, config_manager: ConfigManager, debug: bool = False):
+
+    def __init__(self, context: Context, debug: bool = False):
         self.context = context
-        self.config_manager = config_manager
+        self._require_built_collections()
+        self.server_config = context.config.get_server_config()
         self.debug = debug
         self.sem = asyncio.Semaphore(INDEXING_WORKERS)
         self._idle = asyncio.Event()
@@ -60,52 +72,111 @@ class Indexer:
         self._monitor_task: Optional[asyncio.Task] = None
         self._debug_stats_path = Path(DEBUG_STATS_FILENAME)
 
-    async def index_all(self):
-        """
-        Indexes all configured collections.
-        """
-        tasks = []
-        for collection_id, source in self.context.collections.items():
-            tasks.append(self.index_collection(collection_id, source))
-        
-        if tasks:
-            await asyncio.gather(*tasks)
+    def _require_built_collections(self) -> None:
+        if not self.context.collections:
+            raise ValueError("Context has no collections; call Context.build_collections() before creating an Indexer.")
 
-    async def index_collection(self, collection_id: str, source: Any):
-        """
-        Indexes a specific collection using the provided source plugin.
-        """
-        col_config = self.config_manager.get_collection_config(collection_id)
-        server_config = self.config_manager.get_server_config()
-        
-        table = self._get_or_create_table(
-            collection_id, 
-            schema=DocumentChunk, 
-        )
-        meta_table = self._get_or_create_table(
-            f"{collection_id}_meta", 
-            schema=Document, 
-        )
+        for collection_id, source in self.context.collections.items():
+            missing = [
+                name for name in ("chunk_table", "meta_table", "summary_table")
+                if getattr(source, name, None) is None
+            ]
+            if missing:
+                missing_names = ", ".join(missing)
+                raise ValueError(
+                    f"Collection '{collection_id}' has no built tables ({missing_names}); "
+                    "call Context.build_collections() before creating an Indexer."
+                )
+
+    async def index_all(
+        self,
+        *,
+        index: bool = True,
+        summarize_chunks: bool = True,
+        summarize_documents: bool = True,
+    ):
+        loops = []
+        for source in self.context.collections.values():
+            if index:
+                loops.append(self.index_collection(source))
+            if summarize_chunks:
+                loops.append(self.summarize_chunks_collection(source))
+            if summarize_documents:
+                loops.append(self.summarize_documents_collection(source))
+
+        if loops:
+            await asyncio.gather(*loops)
+        await self.wait_for_idle()
+
+    async def index_collection(self, source: DocumentSource):
+        meta_table = source.meta_table
 
         existing_docs = set()
         try:
             existing_docs = set(meta_table.to_pandas()["document_id"].tolist())
         except Exception as e:
-            logger.debug(f"Could not load existing documents for {collection_id}: {e}")
-            pass
+            logger.debug(f"Could not load existing documents for {source.id}: {e}")
 
         async for pointer in source.get_documents(last_modified=None):
             if pointer.document_id in existing_docs:
                 continue
 
-            await self.sem.acquire()
-            stats = DocumentIndexingStats(document_id=pointer.document_id)
-            task = asyncio.create_task(self._wrapped_process(
-                pointer, col_config, table, meta_table,
-                server_config.min_size, server_config.max_size, stats
-            ))
-            self._track_task(task, stats)
-            task.add_done_callback(self._on_task_done)
+            stats = DocumentIndexingStats(document_id=pointer.document_id, operation="index")
+            await self._schedule_document_task(
+                self.index_document(pointer, stats),
+                stats,
+            )
+
+    async def summarize_chunks_collection(self, source: DocumentSource):
+        try:
+            chunks = source.chunk_table.to_pandas()
+        except Exception as e:
+            logger.debug(f"Could not load chunks for {source.id}: {e}")
+            return
+
+        if "summary_span" not in chunks.columns or chunks.empty:
+            return
+
+        unsummarized = chunks[chunks["summary_span"].isna()]
+        for document_id in sorted(unsummarized["document_id"].dropna().unique()):
+            stats = DocumentIndexingStats(document_id=document_id, operation="chunk_summary")
+            await self._schedule_document_task(
+                self.summarize_document_chunks(source, document_id),
+                stats,
+            )
+
+    async def summarize_documents_collection(self, source: DocumentSource):
+        try:
+            documents = source.meta_table.to_pandas()
+        except Exception as e:
+            logger.debug(f"Could not load document metadata for {source.id}: {e}")
+            return
+
+        if "summary" not in documents.columns or documents.empty:
+            return
+
+        candidates = documents[documents["summary"].fillna("").astype(str) == ""]
+        for document_id in sorted(candidates["document_id"].dropna().unique()):
+            stats = DocumentIndexingStats(document_id=document_id, operation="document_summary")
+            await self._schedule_document_task(
+                self.summarize_document(source, document_id),
+                stats,
+            )
+
+    async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> None:
+        await self.sem.acquire()
+        task = asyncio.create_task(self._run_with_semaphore(coro, stats))
+        self._track_task(task, stats)
+        task.add_done_callback(self._on_task_done)
+
+    async def _run_with_semaphore(self, coro, stats: DocumentIndexingStats):
+        try:
+            return await coro
+        except Exception as e:
+            logger.error(f"Error in {stats.operation} for {stats.document_id}: {e}")
+            raise
+        finally:
+            self.sem.release()
 
     def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
         self._running_documents[task] = stats
@@ -145,7 +216,8 @@ class Indexer:
                     if task not in tasks_to_log:
                         continue
                     logger.info(
-                        "Still indexing document_id=%s semantic_chunks=%d embedding_chunks=%d summary_spans=%d",
+                        "Still running %s document_id=%s semantic_chunks=%d embedding_chunks=%d summary_spans=%d",
+                        stats.operation,
                         stats.document_id,
                         stats.semantic_chunks,
                         stats.embedding_chunks,
@@ -156,17 +228,6 @@ class Indexer:
         finally:
             if self._monitor_task is asyncio.current_task():
                 self._monitor_task = None
-
-    async def _wrapped_process(self, pointer, col_config, table, meta_table, min_size, max_size, stats):
-        try:
-            await self._process_document(
-                pointer, col_config, table, meta_table, min_size, max_size, stats
-            )
-        except Exception as e:
-            logger.error(f"Error in _wrapped_process for {pointer.document_id}: {e}")
-            raise e
-        finally:
-            self.sem.release()
 
     def _on_task_done(self, fut: asyncio.Task) -> None:
         stats = self._running_documents.pop(fut, None)
@@ -195,105 +256,185 @@ class Indexer:
             with suppress(asyncio.CancelledError):
                 await self._monitor_task
 
-    async def _process_document(self, pointer, col_config, table, meta_table, min_size, max_size, stats: DocumentIndexingStats):
-        try:
-            server_config = self.config_manager.get_server_config()
-            plans = []
-            async for meta, text_list in pointer.get_chunks(min_size, max_size):
-                plan = self._build_semantic_chunk_plan(
-                    meta,
-                    text_list,
-                    min_size,
-                    max_size,
-                    server_config.max_to_summarize,
-                )
-                plans.append(plan)
-                stats.semantic_chunks += 1
-                stats.embedding_chunks += len(plan.embedding_chunks)
-                stats.summary_spans += len(plan.summary_spans)
-
-            summary_prompt = col_config.chunk_summary_prompt or col_config.doc_summary_prompt
-            summary_tasks = [self._summarize_text(span.text, summary_prompt) for plan in plans for span in plan.summary_spans]
-            embedding_tasks = [
-                self._embed_batch([text for _, text in plan.embedding_chunks])
-                for plan in plans
-            ]
-
-            summary_results, embeddings_batches = await asyncio.gather(
-                asyncio.gather(*summary_tasks),
-                asyncio.gather(*embedding_tasks),
+    async def index_document(self, pointer, stats: DocumentIndexingStats):
+        source = pointer.source
+        plans = []
+        async for meta, text_list in pointer.get_chunks(self.server_config.min_size, self.server_config.max_size):
+            plan = self._build_semantic_chunk_plan(
+                meta,
+                text_list,
+                self.server_config.min_size,
+                self.server_config.max_size,
             )
+            plans.append(plan)
+            stats.semantic_chunks += 1
+            stats.embedding_chunks += len(plan.embedding_chunks)
 
-            chunk_summary_groups: list[list[str]] = []
-            summary_index = 0
-            for plan in plans:
-                span_count = len(plan.summary_spans)
-                span_summaries = summary_results[summary_index:summary_index + span_count]
-                summary_index += span_count
-                chunk_summary_groups.append(span_summaries)
+        embedding_tasks = [
+            self._embed_batch([text for _, text in plan.embedding_chunks])
+            for plan in plans
+        ]
+        embeddings_batches = await asyncio.gather(*embedding_tasks) if embedding_tasks else []
 
-            all_chunks_to_upsert = []
-            for i, plan in enumerate(plans):
-                batch_embeddings = embeddings_batches[i]
-                span_summaries = chunk_summary_groups[i]
+        all_chunks_to_upsert = []
+        for i, plan in enumerate(plans):
+            batch_embeddings = embeddings_batches[i]
+            for j, (e_meta, _e_text) in enumerate(plan.embedding_chunks):
+                order = len(all_chunks_to_upsert)
+                all_chunks_to_upsert.append(DocumentChunk(
+                    document_id=pointer.document_id,
+                    order=order,
+                    chunk_id=f"{pointer.document_id}?c={order}",
+                    embedding=batch_embeddings[j],
+                    summary_span=None,
+                    metadata=e_meta,
+                ))
 
-                for j, (e_meta, e_text) in enumerate(plan.embedding_chunks):
-                    chunk_summary = self._summary_for_embedding_chunk(
-                        e_meta,
-                        plan.summary_spans,
-                        span_summaries,
-                    )
-                    all_chunks_to_upsert.append(DocumentChunk(
-                        document_id=pointer.document_id,
-                        chunk_id=f"{pointer.document_id}?c={len(all_chunks_to_upsert)}",
-                        # We do not need to store text for now
-                        # text=e_text,
-                        summary=chunk_summary,
-                        embedding=batch_embeddings[j],
-                        metadata=e_meta
-                    ))
+        metadata_dict = await pointer.get_metadata()
+        doc_record = Document(
+            document_id=pointer.document_id,
+            title=metadata_dict.get("title", "Untitled"),
+            title_strength=int(metadata_dict.get("title_strength", 0)),
+            last_modified=pointer.last_modified,
+            summary="",
+            embedding=[0.0] * VECTOR_DIMENSIONS,
+            keywords=metadata_dict.get("keywords", []),
+        )
 
-            metadata_dict = await pointer.get_metadata()
-            doc_summary = metadata_dict.get("summary")
-            if not doc_summary:
-                doc_summary_text = "\n\n".join(summary_results)
-                doc_summary_list = await self.context.llm([[
-                    ('system', col_config.doc_summary_prompt),
-                    ('user', f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}")]
-                ])
-                doc_summary = doc_summary_list[0]
-            
-            doc_vector = (await self.context.embedding([doc_summary]))[0]
+        doc_filter = self._document_filter(pointer.document_id)
+        source.summary_table.delete(doc_filter)
+        source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
+            .when_matched_update_all() \
+            .when_not_matched_insert_all() \
+            .when_not_matched_by_source_delete(doc_filter) \
+            .execute(all_chunks_to_upsert)
+        source.meta_table.merge_insert(["document_id"]) \
+            .when_matched_update_all() \
+            .when_not_matched_insert_all() \
+            .execute([doc_record])
 
-            doc_record = Document(
-                document_id=pointer.document_id,
-                title=metadata_dict.get("title", "Untitled"),
-                last_modified=pointer.last_modified,
-                summary=doc_summary,
-                embedding=doc_vector,
-                keywords=metadata_dict.get("keywords", [])
-            )
-            
-            table.merge_insert(["document_id", "chunk_id"])                 .when_matched_update_all()                 .when_not_matched_insert_all()                 .when_not_matched_by_source_delete(f"document_id = '{pointer.document_id}'")                 .execute(all_chunks_to_upsert)
-            
-            meta_table.merge_insert(["document_id"]).when_matched_update_all().when_not_matched_insert_all().execute([doc_record])
+    async def summarize_document_chunks(self, source: DocumentSource, document_id: str) -> bool:
+        semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
+        if not semantic_chunks:
+            return False
 
-        except Exception as e:
-            logger.error(f"Error processing document {pointer.document_id}: {e}")
-            raise e
+        summary_prompt = source.config.chunk_summary_prompt or source.config.doc_summary_prompt
+
+        updated_rows: list[dict[str, Any]] = []
+        summary_records: list[ChunkSummary] = []
+        next_summary_span = 0
+
+        for semantic_chunk in semantic_chunks:
+            spans = self._split_summary_spans(semantic_chunk.text, self.server_config.max_to_summarize)
+            summaries = await asyncio.gather(*[
+                self._summarize_text(span.text, summary_prompt)
+                for span in spans
+            ])
+
+            for offset, summary in enumerate(summaries):
+                summary_records.append(ChunkSummary(
+                    document_id=document_id,
+                    summary_span=next_summary_span + offset,
+                    summary=summary,
+                ))
+
+            for row in semantic_chunk.embedding_rows:
+                metadata = self._deserialize_metadata(row["metadata_str"])
+                local_index = self._summary_span_for_embedding_chunk(metadata, spans)
+                updated = dict(row)
+                updated["summary_span"] = next_summary_span + local_index
+                updated_rows.append(updated)
+
+            next_summary_span += len(spans)
+
+        doc_filter = self._document_filter(document_id)
+        source.summary_table.delete(doc_filter)
+        source.summary_table.add(summary_records)
+        source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
+            .when_matched_update_all() \
+            .execute(updated_rows)
+        return True
+
+    async def summarize_document(self, source: DocumentSource, document_id: str) -> bool:
+        pointer = source.fetch_document(document_id)
+        metadata_dict = await pointer.get_metadata()
+
+        doc_summary = await source.get_document_summary(document_id)
+        if not doc_summary:
+            span_summaries = self._load_summary_texts(source, document_id)
+            if not span_summaries:
+                return False
+            doc_summary_text = "\n\n".join(span_summaries)
+            doc_summary_list = await self.context.llm([[
+                ("system", source.config.doc_summary_prompt),
+                ("user", f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}"),
+            ]])
+            doc_summary = doc_summary_list[0]
+
+        doc_vector = (await self.context.embedding([doc_summary]))[0]
+        doc_record = Document(
+            document_id=document_id,
+            title=metadata_dict.get("title", "Untitled"),
+            title_strength=int(metadata_dict.get("title_strength", 0)),
+            last_modified=pointer.last_modified,
+            summary=doc_summary,
+            embedding=doc_vector,
+            keywords=metadata_dict.get("keywords", []),
+        )
+
+        source.meta_table.merge_insert(["document_id"]) \
+            .when_matched_update_all() \
+            .when_not_matched_insert_all() \
+            .execute([doc_record])
+        return True
+
+    async def _reconstruct_semantic_chunks(self, source: DocumentSource, document_id: str) -> list[ReconstructedSemanticChunk]:
+        rows = source.chunk_table.to_pandas().to_dict("records")
+        document_rows = [
+            row for row in rows
+            if row["document_id"] == document_id
+        ]
+        document_rows.sort(key=lambda row: int(row["order"]))
+
+        grouped_rows: dict[str, list[dict[str, Any]]] = {}
+        grouped_metadata: dict[str, dict[str, Any]] = {}
+        for row in document_rows:
+            embedding_metadata = self._deserialize_metadata(row["metadata_str"])
+            semantic_metadata = {
+                key: value
+                for key, value in embedding_metadata.items()
+                if key not in ("o", "s")
+            }
+            key = self._metadata_identity(semantic_metadata)
+            grouped_rows.setdefault(key, []).append(row)
+            grouped_metadata.setdefault(key, semantic_metadata)
+
+        semantic_chunks = []
+        for key, rows_for_semantic_chunk in grouped_rows.items():
+            text = await source.fetch_chunk(document_id, grouped_metadata[key], scope="semantic")
+            semantic_chunks.append(ReconstructedSemanticChunk(
+                metadata=grouped_metadata[key],
+                embedding_rows=rows_for_semantic_chunk,
+                text=text,
+            ))
+        return semantic_chunks
 
     async def _summarize_text(self, text: str, prompt: str) -> str:
         res = await self.context.llm([[
-                                       ('system',prompt),
-                                       ('user',f'Write no more than three sentences to summarize this chunk:\n\n{text}'),
-                                       ]])
+            ("system", prompt),
+            ("user", f"Write no more than three sentences to summarize this chunk:\n\n{text}"),
+        ]])
         return res[0]
 
-    def _build_semantic_chunk_plan(self, metadata: dict[str, Any], text_list: list[str], min_size: int, max_size: int, max_to_summarize: int) -> SemanticChunkPlan:
-        text = "".join(text_list)
+    def _build_semantic_chunk_plan(
+        self,
+        metadata: dict[str, Any],
+        text_list: list[str],
+        min_size: int,
+        max_size: int,
+    ) -> SemanticChunkPlan:
         return SemanticChunkPlan(
             embedding_chunks=create_embedding_chunks(metadata, text_list, min_size, max_size),
-            summary_spans=self._split_summary_spans(text, max_to_summarize),
         )
 
     def _split_summary_spans(self, text: str, max_to_summarize: int) -> list[SummarySpan]:
@@ -307,14 +448,13 @@ class Indexer:
             spans.append(SummarySpan(offset=offset, size=len(chunk_text), text=chunk_text))
         return spans
 
-    def _summary_for_embedding_chunk(
+    def _summary_span_for_embedding_chunk(
         self,
         embedding_metadata: dict[str, Any],
         summary_spans: list[SummarySpan],
-        span_summaries: list[str],
-    ) -> str:
-        if len(span_summaries) == 1:
-            return span_summaries[0]
+    ) -> int:
+        if len(summary_spans) == 1:
+            return 0
 
         start = int(embedding_metadata.get("o", 0))
         end = start + int(embedding_metadata.get("s", 0))
@@ -328,25 +468,34 @@ class Indexer:
                 best_index = index
                 best_overlap = overlap
 
-        return span_summaries[best_index]
+        return best_index
+
+    def _load_summary_texts(self, source: DocumentSource, document_id: str) -> list[str]:
+        summaries = source.summary_table.to_pandas()
+        if summaries.empty:
+            return []
+
+        rows = summaries[summaries["document_id"] == document_id].sort_values("summary_span")
+        return rows["summary"].dropna().astype(str).tolist()
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)
 
-    def _get_or_create_table(self, name: str, schema: Any):
-        try:
-            return self.context.db.open_table(name)
-        except Exception as e:
-            logger.debug(f"Table {name} not found, creating it. Error: {e}")
-            return self.context.db.create_table(
-                name, 
-                schema=schema, 
-            )
+    def _document_filter(self, document_id: str) -> str:
+        return (col("document_id") == lit(document_id)).to_sql()
+
+    def _metadata_identity(self, metadata: dict[str, Any]) -> str:
+        return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+
+    def _deserialize_metadata(self, metadata_str: str | None) -> dict[str, Any]:
+        return DocumentChunk._deserialize_metadata(metadata_str)
+
     async def search(self, collection_id: str, query: str, limit: int = 5):
         query_vector = await self.context.embedding.query(query)
-        table = self.context.db.open_table(collection_id)
-        results = table.search(query_vector).limit(limit).to_pydantic(DocumentChunk)
+        source = self.context.collections[collection_id]
+        results = source.chunk_table.search(query_vector).limit(limit).to_pydantic(DocumentChunk)
         return results
+
 
 async def main():
     parser = argparse.ArgumentParser(description="LanceDB Indexer CLI")
@@ -356,15 +505,32 @@ async def main():
         action="store_true",
         help=f"Write per-document indexing statistics to {DEBUG_STATS_FILENAME}",
     )
+    parser.add_argument("--index", action="store_true", help="Run chunk indexing")
+    parser.add_argument("--summarize-chunks", action="store_true", help="Run chunk summarization")
+    parser.add_argument("--summarize-documents", action="store_true", help="Run document summarization")
     args = parser.parse_args()
+    operation_flags = (args.index, args.summarize_chunks, args.summarize_documents)
+    if any(operation_flags):
+        run_index = args.index
+        run_summarize_chunks = args.summarize_chunks
+        run_summarize_documents = args.summarize_documents
+    else:
+        run_index = True
+        run_summarize_chunks = True
+        run_summarize_documents = True
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.getLogger('httpx').setLevel(logging.ERROR)
-    
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.getLogger("httpx").setLevel(logging.ERROR)
+
     ctx = Context.build_context(args.config)
-    indexer = Indexer(ctx, ctx.config, debug=args.debug)
-    await indexer.index_all()
+    indexer = Indexer(ctx, debug=args.debug)
+    await indexer.index_all(
+        index=run_index,
+        summarize_chunks=run_summarize_chunks,
+        summarize_documents=run_summarize_documents,
+    )
     await indexer.wait_for_idle()
+
 
 if __name__ == "__main__":
     try:

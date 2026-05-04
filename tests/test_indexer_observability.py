@@ -77,6 +77,12 @@ class FakeConfigManager:
         return self.server_config
 
 
+async def run_indexing_pipeline(indexer: Indexer):
+    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
+    await indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False)
+    await indexer.index_all(index=False, summarize_chunks=False, summarize_documents=True)
+
+
 def build_collection_config(docs_dir, summary_length: int = 65536) -> CollectionConfig:
     return CollectionConfig.model_validate({
         "collection_id": "notes",
@@ -119,22 +125,28 @@ async def test_indexer_debug_writes_document_stats_jsonl(tmp_path, monkeypatch):
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
     monkeypatch.chdir(tmp_path)
 
-    indexer = Indexer(context, config_manager, debug=True)
-    await indexer.index_all()
-    await indexer.wait_for_idle()
+    indexer = Indexer(context, debug=True)
+    await run_indexing_pipeline(indexer)
 
     stats_path = tmp_path / DEBUG_STATS_FILENAME
     lines = stats_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
+    assert len(lines) == 3
 
-    stats = json.loads(lines[0])
-    assert stats["document_id"].endswith("alpha.txt")
-    assert stats["semantic_chunks"] == 1
-    assert stats["embedding_chunks"] == 1
-    assert stats["summary_spans"] == 1
+    stats = [json.loads(line) for line in lines]
+    index_stats = next(item for item in stats if item["operation"] == "index")
+    chunk_summary_stats = next(item for item in stats if item["operation"] == "chunk_summary")
+    document_summary_stats = next(item for item in stats if item["operation"] == "document_summary")
+
+    assert index_stats["document_id"].endswith("alpha.txt")
+    assert index_stats["semantic_chunks"] == 1
+    assert index_stats["embedding_chunks"] == 1
+    assert index_stats["summary_spans"] == 0
+    assert chunk_summary_stats["document_id"].endswith("alpha.txt")
+    assert document_summary_stats["document_id"].endswith("alpha.txt")
 
 
 @pytest.mark.asyncio
@@ -156,6 +168,7 @@ async def test_indexer_logs_running_document_stats_and_stalled_monitor(tmp_path,
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
     monkeypatch.setattr(indexer_module, "MONITOR_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(indexer_module, "MONITOR_STALL_THRESHOLD_SECONDS", 0.02)
@@ -171,19 +184,17 @@ async def test_indexer_logs_running_document_stats_and_stalled_monitor(tmp_path,
     monkeypatch.setattr(indexer_module, "monitor_time", fake_monotonic)
     caplog.set_level(logging.INFO, logger="mcp_indexer.indexer")
 
-    indexer = Indexer(context, config_manager)
-    await indexer.index_all()
+    indexer = Indexer(context)
+    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
+    task = asyncio.create_task(indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False))
     await llm.started.wait()
     await asyncio.sleep(0.03)
     llm.release.set()
+    await task
     await indexer.wait_for_idle()
 
     messages = [record.message for record in caplog.records]
-    assert any("Still indexing document_id=" in message for message in messages)
-    assert any("semantic_chunks=1" in message for message in messages)
-    assert any("embedding_chunks=1" in message for message in messages)
-    assert any("summary_spans=1" in message for message in messages)
-    assert any("Indexing monitor woke after" in message for message in messages)
+    assert any("Still running chunk_summary document_id=" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -205,16 +216,19 @@ async def test_indexer_does_not_log_short_lived_document_on_first_monitor_cycle(
     )
     source = TextFileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
+    source.build_tables()
 
     monkeypatch.setattr(indexer_module, "MONITOR_INTERVAL_SECONDS", 0.05)
     monkeypatch.setattr(indexer_module, "MONITOR_STALL_THRESHOLD_SECONDS", 1.0)
     caplog.set_level(logging.INFO, logger="mcp_indexer.indexer")
 
-    indexer = Indexer(context, config_manager)
-    await indexer.index_all()
+    indexer = Indexer(context)
+    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
+    task = asyncio.create_task(indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False))
     await llm.started.wait()
     llm.release.set()
+    await task
     await indexer.wait_for_idle()
 
     messages = [record.message for record in caplog.records]
-    assert not any("Still indexing document_id=" in message for message in messages)
+    assert not any("Still running" in message for message in messages)
