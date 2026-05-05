@@ -128,40 +128,66 @@ class Indexer:
             )
 
     async def summarize_chunks_collection(self, source: DocumentSource):
-        try:
-            chunks = source.chunk_table.to_pandas()
-        except Exception as e:
-            logger.debug(f"Could not load chunks for {source.id}: {e}")
-            return
+        while True:
+            try:
+                chunks = source.chunk_table.to_pandas()
+            except Exception as e:
+                logger.debug(f"Could not load chunks for {source.id}: {e}")
+                return
 
-        if "summary_span" not in chunks.columns or chunks.empty:
-            return
+            if "summary_span" not in chunks.columns or chunks.empty:
+                if not self._running_documents:
+                    return
+                await self.wait_for_idle()
+                continue
 
-        unsummarized = chunks[chunks["summary_span"].isna()]
-        for document_id in sorted(unsummarized["document_id"].dropna().unique()):
-            stats = DocumentIndexingStats(document_id=document_id, operation="chunk_summary")
-            await self._schedule_document_task(
-                self.summarize_document_chunks(source, document_id),
-                stats,
-            )
+            unsummarized = chunks[chunks["summary_span"].isna()]
+            document_ids = sorted(unsummarized["document_id"].dropna().unique())
+            if not document_ids:
+                if not self._running_documents:
+                    return
+                await self.wait_for_idle()
+                continue
+
+            for document_id in document_ids:
+                stats = DocumentIndexingStats(document_id=document_id, operation="chunk_summary")
+                await self._schedule_document_task(
+                    self.summarize_document_chunks(source, document_id),
+                    stats,
+                )
+
+            await self.wait_for_idle()
 
     async def summarize_documents_collection(self, source: DocumentSource):
-        try:
-            documents = source.meta_table.to_pandas()
-        except Exception as e:
-            logger.debug(f"Could not load document metadata for {source.id}: {e}")
-            return
+        while True:
+            try:
+                documents = source.meta_table.to_pandas()
+            except Exception as e:
+                logger.debug(f"Could not load document metadata for {source.id}: {e}")
+                return
 
-        if "summary" not in documents.columns or documents.empty:
-            return
+            if "summary" not in documents.columns or documents.empty:
+                if not self._running_documents:
+                    return
+                await self.wait_for_idle()
+                continue
 
-        candidates = documents[documents["summary"].fillna("").astype(str) == ""]
-        for document_id in sorted(candidates["document_id"].dropna().unique()):
-            stats = DocumentIndexingStats(document_id=document_id, operation="document_summary")
-            await self._schedule_document_task(
-                self.summarize_document(source, document_id),
-                stats,
-            )
+            candidates = documents[documents["summary"].fillna("").astype(str) == ""]
+            document_ids = sorted(candidates["document_id"].dropna().unique())
+            if not document_ids:
+                if not self._running_documents:
+                    return
+                await self.wait_for_idle()
+                continue
+
+            for document_id in document_ids:
+                stats = DocumentIndexingStats(document_id=document_id, operation="document_summary")
+                await self._schedule_document_task(
+                    self.summarize_document(source, document_id),
+                    stats,
+                )
+
+            await self.wait_for_idle()
 
     async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> None:
         await self.sem.acquire()
@@ -258,7 +284,7 @@ class Indexer:
 
     async def index_document(self, pointer, stats: DocumentIndexingStats):
         source = pointer.source
-        plans = []
+        embedding_chunks: list[tuple[dict[str, Any], str]] = []
         async for meta, text_list in pointer.get_chunks(self.server_config.min_size, self.server_config.max_size):
             plan = self._build_semantic_chunk_plan(
                 meta,
@@ -266,29 +292,26 @@ class Indexer:
                 self.server_config.min_size,
                 self.server_config.max_size,
             )
-            plans.append(plan)
             stats.semantic_chunks += 1
             stats.embedding_chunks += len(plan.embedding_chunks)
+            embedding_chunks.extend(plan.embedding_chunks)
 
-        embedding_tasks = [
-            self._embed_batch([text for _, text in plan.embedding_chunks])
-            for plan in plans
-        ]
-        embeddings_batches = await asyncio.gather(*embedding_tasks) if embedding_tasks else []
+        batch_embeddings = await self._embed_batch([text for _, text in embedding_chunks]) if embedding_chunks else []
+        if len(batch_embeddings) != len(embedding_chunks):
+            raise ValueError(
+                f"Embedding batch returned {len(batch_embeddings)} vectors for {len(embedding_chunks)} chunks"
+            )
 
         all_chunks_to_upsert = []
-        for i, plan in enumerate(plans):
-            batch_embeddings = embeddings_batches[i]
-            for j, (e_meta, _e_text) in enumerate(plan.embedding_chunks):
-                order = len(all_chunks_to_upsert)
-                all_chunks_to_upsert.append(DocumentChunk(
-                    document_id=pointer.document_id,
-                    order=order,
-                    chunk_id=f"{pointer.document_id}?c={order}",
-                    embedding=batch_embeddings[j],
-                    summary_span=None,
-                    metadata=e_meta,
-                ))
+        for order, ((e_meta, _e_text), embedding) in enumerate(zip(embedding_chunks, batch_embeddings, strict=True)):
+            all_chunks_to_upsert.append(DocumentChunk(
+                document_id=pointer.document_id,
+                order=order,
+                chunk_id=f"{pointer.document_id}?c={order}",
+                embedding=embedding,
+                summary_span=None,
+                metadata=e_meta,
+            ))
 
         metadata_dict = await pointer.get_metadata()
         doc_record = Document(

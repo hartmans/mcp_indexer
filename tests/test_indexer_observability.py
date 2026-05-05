@@ -78,9 +78,7 @@ class FakeConfigManager:
 
 
 async def run_indexing_pipeline(indexer: Indexer):
-    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
-    await indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False)
-    await indexer.index_all(index=False, summarize_chunks=False, summarize_documents=True)
+    await indexer.index_all()
 
 
 def build_collection_config(docs_dir, summary_length: int = 65536) -> CollectionConfig:
@@ -185,8 +183,7 @@ async def test_indexer_logs_running_document_stats_and_stalled_monitor(tmp_path,
     caplog.set_level(logging.INFO, logger="mcp_indexer.indexer")
 
     indexer = Indexer(context)
-    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
-    task = asyncio.create_task(indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False))
+    task = asyncio.create_task(indexer.index_all())
     await llm.started.wait()
     await asyncio.sleep(0.03)
     llm.release.set()
@@ -223,8 +220,7 @@ async def test_indexer_does_not_log_short_lived_document_on_first_monitor_cycle(
     caplog.set_level(logging.INFO, logger="mcp_indexer.indexer")
 
     indexer = Indexer(context)
-    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
-    task = asyncio.create_task(indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False))
+    task = asyncio.create_task(indexer.index_all())
     await llm.started.wait()
     llm.release.set()
     await task

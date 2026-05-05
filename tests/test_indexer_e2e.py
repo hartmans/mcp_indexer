@@ -62,9 +62,7 @@ class FakeConfigManager:
 
 
 async def run_indexing_pipeline(indexer: Indexer):
-    await indexer.index_all(index=True, summarize_chunks=False, summarize_documents=False)
-    await indexer.index_all(index=False, summarize_chunks=True, summarize_documents=False)
-    await indexer.index_all(index=False, summarize_chunks=False, summarize_documents=True)
+    await indexer.index_all()
 
 
 @pytest.mark.asyncio
