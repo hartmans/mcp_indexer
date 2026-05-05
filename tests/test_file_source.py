@@ -11,7 +11,7 @@ class ConcreteFileSource(FileSource):
     embedding_boundary_regexps = (rb"\n\s*\n",)
 
     def fetch_document(self, document_id: str) -> FileSourcePointer:
-        relative_path_str = self.decode_document_path(self.strip_id_prefix(document_id))
+        relative_path_str = self.decode_document_path(document_id)
         absolute_path = self.source_config.directory / relative_path_str
         return FileSourcePointer(self, document_id, absolute_path)
 
@@ -76,7 +76,7 @@ async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
     source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
     source.source_config = FileSourceConfig(directory=temp_file_env)
 
-    pointer = source.fetch_document(f"{source.id_prefix}doc1.txt")
+    pointer = source.fetch_document("doc1.txt")
 
     chunks = []
     async for chunk_info in pointer.get_chunks(min_size=1, max_size=100):

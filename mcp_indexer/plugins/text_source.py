@@ -65,6 +65,6 @@ class TextFileSource(FileSource[TextFilePointer]):
 
     def fetch_document(self, document_id: str) -> TextFilePointer:
         """Resolves a document_id into a TextFilePointer."""
-        relative_path_str = self.decode_document_path(self.strip_id_prefix(document_id))
+        relative_path_str = self.decode_document_path(document_id)
         absolute_path = self.source_config.directory / relative_path_str
         return TextFilePointer(self, document_id, absolute_path)

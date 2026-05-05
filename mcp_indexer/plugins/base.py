@@ -158,20 +158,12 @@ class DocumentSource(Generic[p]):
         self.chunk_table = None
         self.meta_table = None
         self.summary_table = None
-        
-        prefix = getattr(self, 'source_prefix', self.__class__.__name__.lower())
-        self.id_prefix = f"{prefix}:{self.id}:"
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         prefix = getattr(cls, 'source_prefix', cls.__name__.lower())
         if prefix not in SOURCE_REGISTRY:
             SOURCE_REGISTRY[prefix] = cls
-
-    def strip_id_prefix(self, document_id: str) -> str:
-        if not document_id.startswith(self.id_prefix):
-            raise ValueError(f"document_id '{document_id}' does not start with expected prefix '{self.id_prefix}'")
-        return document_id[len(self.id_prefix):]
 
     def build_tables(self) -> None:
         self.chunk_table = self._get_or_create_table(self.id, DocumentChunk)

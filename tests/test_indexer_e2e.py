@@ -117,8 +117,8 @@ async def test_indexer_indexes_text_documents_end_to_end(tmp_path):
     assert len(chunk_rows) == 2
     assert len(meta_rows) == 2
     assert {row["document_id"] for row in chunk_rows} == {
-        f"{source.id_prefix}alpha.txt",
-        f"{source.id_prefix}beta.txt",
+        "alpha.txt",
+        "beta.txt",
     }
     assert {row["title"] for row in meta_rows} == {"alpha.txt", "beta.txt"}
     assert any("alpha" in row["summary"].lower() for row in meta_rows)

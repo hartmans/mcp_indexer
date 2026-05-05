@@ -13,7 +13,7 @@ import lancedb
 import pandas as pd
 
 from mcp_indexer.config import ConfigManager
-from mcp_indexer.plugins.base import ChunkSummary, DocumentChunk
+from mcp_indexer.plugins.base import ChunkSummary, DocumentChunk, Document
 
 
 CHUNK_ORDER_RE = re.compile(r"(?:^|[?&])c=(\d+)(?:&|$)")
@@ -33,7 +33,15 @@ def chunk_order(chunk_id: str) -> int:
     return int(match.group(1))
 
 
-def migrate_chunk_dataframe(chunks: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def strip_collection_prefix(val: str, collection_id: str) -> str:
+    """Remove the 'source_type:collection_id:' prefix from an identifier."""
+    marker = f":{collection_id}:"
+    if marker in val:
+        return val.split(marker, 1)[-1]
+    return val
+
+
+def migrate_chunk_dataframe(chunks: pd.DataFrame, collection_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return new chunk and summary dataframes from an old chunk dataframe."""
     required_columns = {"document_id", "chunk_id", "embedding", "metadata_str"}
     missing_columns = required_columns - set(chunks.columns)
@@ -43,6 +51,10 @@ def migrate_chunk_dataframe(chunks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
 
     if "summary" not in chunks.columns:
         raise ValueError("chunk table is missing required column: summary")
+
+    # Strip the source_type:collection_id: prefix from identifiers
+    chunks["document_id"] = chunks["document_id"].apply(lambda x: strip_collection_prefix(str(x), collection_id))
+    chunks["chunk_id"] = chunks["chunk_id"].apply(lambda x: strip_collection_prefix(str(x), collection_id))
 
     migrated = chunks.copy()
     migrated["order"] = migrated["chunk_id"].map(chunk_order)
@@ -85,11 +97,22 @@ def migrate_chunk_dataframe(chunks: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
 
 def migrate_collection(db, collection_id: str) -> MigrationStats:
     chunks = db.open_table(collection_id).to_pandas()
-    new_chunks, summaries = migrate_chunk_dataframe(chunks)
+    new_chunks, summaries = migrate_chunk_dataframe(chunks, collection_id)
 
     summary_table = f"{collection_id}_summary"
+    meta_table = f"{collection_id}_meta"
+    
+# Handle meta table
+    meta_df = db.open_table(meta_table).to_pandas()
+    meta_df['title_strength'] = 0
+    meta_df["document_id"] = meta_df["document_id"].apply(lambda x: strip_collection_prefix(str(x), collection_id))
+    db.drop_table(meta_table)
+    db.create_table(meta_table, data=meta_df, schema=Document)
+    
     db.drop_table(collection_id)
     db.drop_table(summary_table, ignore_missing=True)
+    
+    
     db.create_table(collection_id, data=new_chunks, schema=DocumentChunk)
     db.create_table(summary_table, data=summaries, schema=ChunkSummary)
 

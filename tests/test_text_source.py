@@ -95,7 +95,7 @@ async def test_text_file_pointer_retrieval(temp_text_env, mock_context):
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(temp_text_env))
     source.source_config = TextFileSourceConfig(directory=temp_text_env)
 
-    pointer = source.fetch_document(f"{source.id_prefix}test.md")
+    pointer = source.fetch_document("test.md")
     assert isinstance(pointer, TextFilePointer)
 
     meta = await pointer.get_metadata()
@@ -119,7 +119,7 @@ async def test_text_file_source_get_document_summary_summarizes_small_documents(
     context = Context(db=None, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=100))
 
-    pointer = source.fetch_document(f"{source.id_prefix}small.txt")
+    pointer = source.fetch_document("small.txt")
     meta = await pointer.get_metadata()
     summary = await source.get_document_summary(pointer.document_id)
 
@@ -138,7 +138,7 @@ async def test_text_file_pointer_get_metadata_skips_summary_for_large_documents(
     context = Context(db=None, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=10))
 
-    meta = await source.fetch_document(f"{source.id_prefix}large.txt").get_metadata()
+    meta = await source.fetch_document("large.txt").get_metadata()
 
     assert "summary" not in meta
     assert llm.calls == []

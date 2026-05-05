@@ -84,11 +84,11 @@ class FileSource(DocumentSource[P]):
                 if last_modified is None or mtime > last_modified:
                     relative_path = path.relative_to(root).as_posix()
                     encoded_path = self.encode_document_path(relative_path)
-                    full_doc_id = f"{self.id_prefix}{encoded_path}"
+                    full_doc_id = encoded_path
                     yield self.fetch_document(full_doc_id)
 
     async def split_text(self, metadata: dict[str, Any], text_bytes: bytes, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
-        if not text_bytes:
+        if not bytes(text_bytes):
             return
         semantic_chunks = []
         start = 0
@@ -140,6 +140,6 @@ class FileSource(DocumentSource[P]):
             current_semantic_start = current_semantic_end
 
     def fetch_document(self, document_id: str) -> P:
-        relative_path_str = self.decode_document_path(self.strip_id_prefix(document_id))
+        relative_path_str = self.decode_document_path(document_id)
         absolute_path = self.source_config.directory / relative_path_str
         return FileSourcePointer(self, document_id, absolute_path) # type: ignore
