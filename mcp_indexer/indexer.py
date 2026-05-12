@@ -16,7 +16,7 @@ from mcp_indexer.plugins.base import ChunkSummary, Document, DocumentChunk, Docu
 
 logger = logging.getLogger(__name__)
 
-INDEXING_WORKERS = 10
+INDEXING_WORKERS = 64
 MONITOR_INTERVAL_SECONDS = 30.0
 MONITOR_STALL_THRESHOLD_SECONDS = 40.0
 DEBUG_STATS_FILENAME = "indexer-stats.jsonl"
@@ -110,6 +110,9 @@ class Indexer:
 
     async def index_collection(self, source: DocumentSource):
         meta_table = source.meta_table
+        meta_table.optimize()
+        source.chunk_table.optimize()
+        source.summary_table.optimize()
 
         existing_docs = set()
         try:
@@ -157,6 +160,7 @@ class Indexer:
                 )
 
             await self.wait_for_idle()
+            return
 
     async def summarize_documents_collection(self, source: DocumentSource):
         while True:
@@ -325,16 +329,16 @@ class Indexer:
         )
 
         doc_filter = self._document_filter(pointer.document_id)
-        source.summary_table.delete(doc_filter)
-        source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
+        await asyncio.to_thread(source.summary_table.delete, doc_filter)
+        await asyncio.to_thread(lambda: source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
             .when_matched_update_all() \
             .when_not_matched_insert_all() \
             .when_not_matched_by_source_delete(doc_filter) \
-            .execute(all_chunks_to_upsert)
-        source.meta_table.merge_insert(["document_id"]) \
+            .execute(all_chunks_to_upsert))
+        await asyncio.to_thread(lambda: source.meta_table.merge_insert(["document_id"]) \
             .when_matched_update_all() \
             .when_not_matched_insert_all() \
-            .execute([doc_record])
+            .execute([doc_record]))
 
     async def summarize_document_chunks(self, source: DocumentSource, document_id: str) -> bool:
         semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
@@ -412,11 +416,8 @@ class Indexer:
         return True
 
     async def _reconstruct_semantic_chunks(self, source: DocumentSource, document_id: str) -> list[ReconstructedSemanticChunk]:
-        rows = source.chunk_table.to_pandas().to_dict("records")
-        document_rows = [
-            row for row in rows
-            if row["document_id"] == document_id
-        ]
+        document_rows = source.chunk_table.search().where(col('document_id')==lit(document_id)).to_pandas().to_dict("records")
+
         document_rows.sort(key=lambda row: int(row["order"]))
 
         grouped_rows: dict[str, list[dict[str, Any]]] = {}
