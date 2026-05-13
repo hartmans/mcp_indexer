@@ -71,6 +71,11 @@ class Indexer:
         self._running_documents: dict[asyncio.Task, DocumentIndexingStats] = {}
         self._monitor_task: Optional[asyncio.Task] = None
         self._debug_stats_path = Path(DEBUG_STATS_FILENAME)
+        self.document_upsirt: list[tuple[DocumentSource, Document]] = []
+        self.chunk_upsirt: list[tuple[DocumentSource, list[DocumentChunk]]] = []
+        self.summary_upsirt: list[tuple[DocumentSource, list[ChunkSummary]]] = []
+        self._upsirt_task: Optional[asyncio.Task] = None
+        self._upsirt_lock = asyncio.Lock()
 
     def _require_built_collections(self) -> None:
         if not self.context.collections:
@@ -106,6 +111,8 @@ class Indexer:
 
         if loops:
             await asyncio.gather(*loops)
+        if self._upsirt_task is not None:
+            await self._upsirt_task
         await self.wait_for_idle()
 
     async def index_collection(self, source: DocumentSource):
@@ -206,6 +213,7 @@ class Indexer:
             logger.error(f"Error in {stats.operation} for {stats.document_id}: {e}")
             raise
         finally:
+            await self.run_upsirts()
             self.sem.release()
 
     def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
@@ -281,10 +289,18 @@ class Indexer:
             handle.flush()
 
     async def wait_for_idle(self):
-        await self._idle.wait()
-        if self._monitor_task is not None:
-            with suppress(asyncio.CancelledError):
-                await self._monitor_task
+        while True:
+            await self._idle.wait()
+
+            if self._monitor_task is not None:
+                with suppress(asyncio.CancelledError):
+                    await self._monitor_task
+
+            if self._upsirt_task is not None:
+                await self._upsirt_task
+
+            if not self._running_documents and (self._upsirt_task is None or self._upsirt_task.done()):
+                return
 
     async def index_document(self, pointer, stats: DocumentIndexingStats):
         source = pointer.source
@@ -328,17 +344,8 @@ class Indexer:
             keywords=metadata_dict.get("keywords", []),
         )
 
-        doc_filter = self._document_filter(pointer.document_id)
-        await asyncio.to_thread(source.summary_table.delete, doc_filter)
-        await asyncio.to_thread(lambda: source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
-            .when_matched_update_all() \
-            .when_not_matched_insert_all() \
-            .when_not_matched_by_source_delete(doc_filter) \
-            .execute(all_chunks_to_upsert))
-        await asyncio.to_thread(lambda: source.meta_table.merge_insert(["document_id"]) \
-            .when_matched_update_all() \
-            .when_not_matched_insert_all() \
-            .execute([doc_record]))
+        self.chunk_upsirt.append((source, all_chunks_to_upsert))
+        self.document_upsirt.append((source, doc_record))
 
     async def summarize_document_chunks(self, source: DocumentSource, document_id: str) -> bool:
         semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
@@ -374,12 +381,9 @@ class Indexer:
 
             next_summary_span += len(spans)
 
-        doc_filter = self._document_filter(document_id)
-        source.summary_table.delete(doc_filter)
-        source.summary_table.add(summary_records)
-        source.chunk_table.merge_insert(["document_id", "chunk_id"]) \
-            .when_matched_update_all() \
-            .execute(updated_rows)
+        chunk_records = [DocumentChunk.model_validate(row) for row in updated_rows]
+        self.chunk_upsirt.append((source, chunk_records))
+        self.summary_upsirt.append((source, summary_records))
         return True
 
     async def summarize_document(self, source: DocumentSource, document_id: str) -> bool:
@@ -409,11 +413,110 @@ class Indexer:
             keywords=metadata_dict.get("keywords", []),
         )
 
-        source.meta_table.merge_insert(["document_id"]) \
-            .when_matched_update_all() \
-            .when_not_matched_insert_all() \
-            .execute([doc_record])
+        self.document_upsirt.append((source, doc_record))
         return True
+
+    async def run_upsirts(self) -> Optional[asyncio.Task]:
+        async with self._upsirt_lock:
+            if self._upsirt_task is None or self._upsirt_task.done():
+                if not (self.document_upsirt or self.chunk_upsirt or self.summary_upsirt):
+                    self._upsirt_task = None
+                    return None
+                self._upsirt_task = asyncio.create_task(self._run_upsirts())
+            return self._upsirt_task
+
+    async def _run_upsirts(self) -> None:
+        while True:
+            async with self._upsirt_lock:
+                document_work = self.document_upsirt[:]
+                chunk_work = self.chunk_upsirt[:]
+                summary_work = self.summary_upsirt[:]
+                self.document_upsirt = []
+                self.chunk_upsirt = []
+                self.summary_upsirt = []
+
+            if not document_work and not chunk_work and not summary_work:
+                async with self._upsirt_lock:
+                    if not self.document_upsirt and not self.chunk_upsirt and not self.summary_upsirt:
+                        self._upsirt_task = None
+                        return
+                continue
+
+            await self._execute_chunk_upsirts(chunk_work)
+            await self._execute_summary_upsirts(summary_work)
+            await self._execute_document_upsirts(document_work)
+
+    async def _execute_chunk_upsirts(
+        self,
+        work: list[tuple[DocumentSource, list[DocumentChunk]]],
+    ) -> None:
+        grouped_chunks: dict[int, tuple[DocumentSource, list[DocumentChunk]]] = {}
+        summary_deletes: dict[int, tuple[DocumentSource, set[str]]] = {}
+
+        for source, chunks in work:
+            if not chunks:
+                continue
+
+            source_key = id(source)
+            grouped_chunks.setdefault(source_key, (source, []))[1].extend(chunks)
+            summary_deletes.setdefault(source_key, (source, set()))[1].add(
+                self._document_id_for_chunk_upsirt(chunks)
+            )
+
+        for source, document_ids in summary_deletes.values():
+            for document_id in sorted(document_ids):
+                await asyncio.to_thread(source.summary_table.delete, self._document_filter(document_id))
+
+        for source, chunks in grouped_chunks.values():
+            if not chunks:
+                continue
+
+            document_filters = [
+                self._document_filter(document_id)
+                for document_id in sorted({chunk.document_id for chunk in chunks})
+            ]
+            delete_filter = " OR ".join(f"({doc_filter})" for doc_filter in document_filters)
+
+            await asyncio.to_thread(
+                lambda source=source, chunks=chunks, delete_filter=delete_filter: source.chunk_table.merge_insert(
+                    ["document_id", "chunk_id"]
+                )
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .when_not_matched_by_source_delete(delete_filter)
+                .execute(chunks)
+            )
+
+    async def _execute_summary_upsirts(
+        self,
+        work: list[tuple[DocumentSource, list[ChunkSummary]]],
+    ) -> None:
+        grouped_summaries: dict[int, tuple[DocumentSource, list[ChunkSummary]]] = {}
+
+        for source, summaries in work:
+            if not summaries:
+                continue
+            grouped_summaries.setdefault(id(source), (source, []))[1].extend(summaries)
+
+        for source, summaries in grouped_summaries.values():
+            await asyncio.to_thread(source.summary_table.add, summaries)
+
+    async def _execute_document_upsirts(
+        self,
+        work: list[tuple[DocumentSource, Document]],
+    ) -> None:
+        grouped_documents: dict[int, tuple[DocumentSource, list[Document]]] = {}
+
+        for source, document in work:
+            grouped_documents.setdefault(id(source), (source, []))[1].append(document)
+
+        for source, documents in grouped_documents.values():
+            await asyncio.to_thread(
+                lambda source=source, documents=documents: source.meta_table.merge_insert(["document_id"])
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(documents)
+            )
 
     async def _reconstruct_semantic_chunks(self, source: DocumentSource, document_id: str) -> list[ReconstructedSemanticChunk]:
         document_rows = source.chunk_table.search().where(col('document_id')==lit(document_id)).to_pandas().to_dict("records")
@@ -507,6 +610,11 @@ class Indexer:
 
     def _document_filter(self, document_id: str) -> str:
         return (col("document_id") == lit(document_id)).to_sql()
+
+    def _document_id_for_chunk_upsirt(self, chunks: list[DocumentChunk]) -> str:
+        # Each queued chunk upsert unit is assumed to belong to a single document.
+        # The caller is responsible for preserving that invariant.
+        return chunks[0].document_id
 
     def _metadata_identity(self, metadata: dict[str, Any]) -> str:
         return json.dumps(metadata, sort_keys=True, separators=(",", ":"))

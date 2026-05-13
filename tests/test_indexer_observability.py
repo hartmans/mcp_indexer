@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 
 import lancedb
 import pytest
@@ -10,6 +11,7 @@ from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.context import Context
 from mcp_indexer.indexer import DEBUG_STATS_FILENAME, Indexer
 from mcp_indexer.llm import VECTOR_DIMENSIONS
+from mcp_indexer.plugins.base import ChunkSummary, Document, DocumentChunk
 from mcp_indexer.plugins.text_source import TextFileSource
 
 
@@ -79,6 +81,51 @@ class FakeConfigManager:
 
 async def run_indexing_pipeline(indexer: Indexer):
     await indexer.index_all()
+
+
+class CountingMergeInsert:
+    def __init__(self, builder, counter):
+        self._builder = builder
+        self._counter = counter
+
+    def when_matched_update_all(self):
+        self._builder = self._builder.when_matched_update_all()
+        return self
+
+    def when_not_matched_insert_all(self):
+        self._builder = self._builder.when_not_matched_insert_all()
+        return self
+
+    def when_not_matched_by_source_delete(self, condition):
+        self._builder = self._builder.when_not_matched_by_source_delete(condition)
+        return self
+
+    def execute(self, rows):
+        self._counter["execute_calls"] += 1
+        self._counter["row_counts"].append(len(rows))
+        return self._builder.execute(rows)
+
+
+class CountingTable:
+    def __init__(self, table):
+        self._table = table
+        self.merge_insert_counter = {"execute_calls": 0, "row_counts": []}
+        self.add_calls: list[int] = []
+        self.delete_calls: list[str] = []
+
+    def merge_insert(self, keys):
+        return CountingMergeInsert(self._table.merge_insert(keys), self.merge_insert_counter)
+
+    def add(self, rows):
+        self.add_calls.append(len(rows))
+        return self._table.add(rows)
+
+    def delete(self, condition):
+        self.delete_calls.append(condition)
+        return self._table.delete(condition)
+
+    def __getattr__(self, name):
+        return getattr(self._table, name)
 
 
 def build_collection_config(docs_dir, summary_length: int = 65536) -> CollectionConfig:
@@ -228,3 +275,158 @@ async def test_indexer_does_not_log_short_lived_document_on_first_monitor_cycle(
 
     messages = [record.message for record in caplog.records]
     assert not any("Still running" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_run_upsirts_batches_units_by_table(tmp_path):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.txt").write_text("Alpha project notes live here.", encoding="utf-8")
+
+    collection_config = build_collection_config(docs_dir, summary_length=10)
+    server_config = build_server_config(tmp_path)
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+
+    context = Context(
+        db=lancedb.connect(str(tmp_path / "db")),
+        embedding=FakeEmbedding(),
+        llm=FastLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+    source.build_tables()
+
+    source.chunk_table = CountingTable(source.chunk_table)
+    source.meta_table = CountingTable(source.meta_table)
+    source.summary_table = CountingTable(source.summary_table)
+
+    indexer = Indexer(context)
+    now = datetime.now()
+    source_ref = context.collections["notes"]
+
+    indexer.chunk_upsirt.extend([
+        (source_ref, [
+            DocumentChunk(
+                document_id="alpha.txt",
+                order=0,
+                chunk_id="alpha.txt?c=0",
+                embedding=[1.0] * VECTOR_DIMENSIONS,
+                summary_span=0,
+                metadata={"b": 0, "e": 5},
+            ),
+        ]),
+        (source_ref, [
+            DocumentChunk(
+                document_id="beta.txt",
+                order=0,
+                chunk_id="beta.txt?c=0",
+                embedding=[2.0] * VECTOR_DIMENSIONS,
+                summary_span=0,
+                metadata={"b": 0, "e": 4},
+            ),
+        ]),
+    ])
+    indexer.summary_upsirt.extend([
+        (source_ref, [ChunkSummary(document_id="alpha.txt", summary_span=0, summary="alpha")]),
+        (source_ref, [ChunkSummary(document_id="beta.txt", summary_span=0, summary="beta")]),
+    ])
+    indexer.document_upsirt.extend([
+        (source_ref, Document(
+            document_id="alpha.txt",
+            title="alpha",
+            title_strength=0,
+            last_modified=now,
+            summary="alpha summary",
+            embedding=[3.0] * VECTOR_DIMENSIONS,
+            keywords=[],
+        )),
+        (source_ref, Document(
+            document_id="beta.txt",
+            title="beta",
+            title_strength=0,
+            last_modified=now,
+            summary="beta summary",
+            embedding=[4.0] * VECTOR_DIMENSIONS,
+            keywords=[],
+        )),
+    ])
+
+    task = await indexer.run_upsirts()
+    assert task is not None
+    await task
+
+    assert source.chunk_table.merge_insert_counter["execute_calls"] == 1
+    assert source.chunk_table.merge_insert_counter["row_counts"] == [2]
+    assert len(source.summary_table.delete_calls) == 2
+    assert source.summary_table.add_calls == [2]
+    assert source.meta_table.merge_insert_counter["execute_calls"] == 1
+    assert source.meta_table.merge_insert_counter["row_counts"] == [2]
+    assert indexer.chunk_upsirt == []
+    assert indexer.summary_upsirt == []
+    assert indexer.document_upsirt == []
+
+
+@pytest.mark.asyncio
+async def test_run_upsirts_reuses_single_running_task(tmp_path, monkeypatch):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.txt").write_text("Alpha project notes live here.", encoding="utf-8")
+
+    collection_config = build_collection_config(docs_dir, summary_length=10)
+    server_config = build_server_config(tmp_path)
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+
+    context = Context(
+        db=lancedb.connect(str(tmp_path / "db")),
+        embedding=FakeEmbedding(),
+        llm=FastLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+    source.build_tables()
+
+    indexer = Indexer(context)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    original_execute_chunks = indexer._execute_chunk_upsirts
+
+    async def blocking_execute_chunks(work):
+        started.set()
+        await release.wait()
+        await original_execute_chunks(work)
+
+    monkeypatch.setattr(indexer, "_execute_chunk_upsirts", blocking_execute_chunks)
+
+    indexer.chunk_upsirt.append((source, [
+        DocumentChunk(
+            document_id="alpha.txt",
+            order=0,
+            chunk_id="alpha.txt?c=0",
+            embedding=[1.0] * VECTOR_DIMENSIONS,
+            summary_span=None,
+            metadata={"b": 0, "e": 5},
+        ),
+    ]))
+
+    first_task = await indexer.run_upsirts()
+    assert first_task is not None
+    await started.wait()
+
+    indexer.document_upsirt.append((source, Document(
+        document_id="alpha.txt",
+        title="alpha",
+        title_strength=0,
+        last_modified=datetime.now(),
+        summary="alpha summary",
+        embedding=[1.0] * VECTOR_DIMENSIONS,
+        keywords=[],
+    )))
+
+    second_task = await indexer.run_upsirts()
+    assert second_task is first_task
+
+    release.set()
+    await first_task
+    assert indexer._upsirt_task is None
