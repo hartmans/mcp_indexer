@@ -116,7 +116,6 @@ class Context:
                 context=self,
                 collection_config=col_config,
             )
-            await self.collections[collection_id].build_tables()
 
     @asynccontextmanager
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
