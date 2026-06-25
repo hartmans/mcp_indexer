@@ -30,8 +30,8 @@ class DocumentChunk(Base):
     """
     __tablename__ = "document_chunk"
 
-    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
-    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    collection_id: Mapped[str] = mapped_column(String, index=True)
+    document_id: Mapped[str] = mapped_column(String, index=True)
     order: Mapped[int]
     chunk_id: Mapped[str] = mapped_column(String, primary_key=True)
     text: Mapped[str | None]
@@ -67,7 +67,7 @@ class Document(Base):
     """
     __tablename__ = "document"
 
-    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    collection_id: Mapped[str] = mapped_column(String, index=True)
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str]
     title_strength: Mapped[int]
@@ -94,16 +94,14 @@ class ChunkSummary(Base):
     """
     __tablename__ = "chunk_summary"
 
-    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
-    document_id: Mapped[str] = mapped_column(String, primary_key=True)
-    summary_span: Mapped[int] = mapped_column(Integer, primary_key=True)
+    collection_id: Mapped[str] = mapped_column(String, index=True)
+    document_id: Mapped[str] = mapped_column(String, index=True)
+    summary_span: Mapped[int]
     summary: Mapped[str]
-
-    # Relationships
-    chunks: Mapped[List[DocumentChunk]] = relationship(back_populates="summary")
 
     __table_args__ = (
         Index("ix_chunk_summary_document_id", "document_id"),
+        Index("ix_chunk_summary_document_span", "document_id", "summary_span", unique=True),
     )
 
 
