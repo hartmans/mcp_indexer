@@ -30,7 +30,8 @@ class DocumentChunk(Base):
     """
     __tablename__ = "document_chunk"
 
-    document_id: Mapped[str]
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
     order: Mapped[int]
     chunk_id: Mapped[str] = mapped_column(String, primary_key=True)
     text: Mapped[str | None]
@@ -66,6 +67,7 @@ class Document(Base):
     """
     __tablename__ = "document"
 
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str]
     title_strength: Mapped[int]
@@ -92,6 +94,7 @@ class ChunkSummary(Base):
     """
     __tablename__ = "chunk_summary"
 
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
     summary_span: Mapped[int] = mapped_column(Integer, primary_key=True)
     summary: Mapped[str]

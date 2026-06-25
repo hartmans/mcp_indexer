@@ -86,14 +86,6 @@ class DocumentSource(Generic[p]):
         if prefix not in SOURCE_REGISTRY:
             SOURCE_REGISTRY[prefix] = cls
 
-    async def build_tables(self) -> None:
-        """Initialize the database schema."""
-        async with self.context.engine.begin() as conn:
-            # Enable pgvector extension
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            # Create all tables defined in models
-            await conn.run_sync(Base.metadata.create_all)
-
     async def get_documents(self, last_modified: datetime | None = None) -> AsyncGenerator[p, None]:
         ...
 
