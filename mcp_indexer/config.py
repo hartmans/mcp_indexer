@@ -7,7 +7,7 @@ T = TypeVar("T", bound=BaseModel)
 class ServerConfig(BaseModel):
     """Truly global server settings."""
     model_config = ConfigDict(extra="ignore")
-    db_uri: str = "~/.lancedb"
+    db_uri: str = "postgresql://postgres@:5432/indexer?host=/var/run/postgresql"
     log_level: str = "INFO"
     llm: Dict[str, Any] = Field(default_factory=dict)
     embedding: Dict[str, Any] = Field(default_factory=dict)
