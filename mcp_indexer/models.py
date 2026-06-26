@@ -11,7 +11,9 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy import JSON, DateTime, Float, Index, String, Text
+from sqlalchemy import Integer, JSON, DateTime, Float, Index, String, Text
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from pgvector.sqlalchemy import Vector
@@ -41,21 +43,29 @@ class DocumentChunk(Base):
     metadata_str: Mapped[str]
 
     # Relationships
-    document: Mapped[Document] = relationship(back_populates="chunks")
-    summary: Mapped[ChunkSummary | None] = relationship(back_populates="chunks")
+    document: Mapped[Document] = relationship(back_populates="chunks", overlaps="summary")
+    summary: Mapped[ChunkSummary | None] = relationship(back_populates="chunks", overlaps="document")
 
     __table_args__ = (
         Index("ix_document_chunk_document_id", "document_id"),
         Index("ix_document_chunk_order", "order"),
+        ForeignKeyConstraint(
+            ["collection_id", "document_id"],
+            ["document.collection_id", "document.document_id"],
+        ),
+        ForeignKeyConstraint(
+            ["collection_id", "document_id", "summary_span"],
+            ["chunk_summary.collection_id", "chunk_summary.document_id", "chunk_summary.summary_span"],
+        ),
     )
 
     @property
-    def metadata(self) -> Mapping[str, Any]:
+    def metadata_dict(self) -> Mapping[str, Any]:
         """Return metadata as a read-only mapping."""
         return MappingProxyType(deserialize_metadata(self.metadata_str))
 
-    @metadata.setter
-    def metadata(self, value: Mapping[str, Any]) -> None:
+    @metadata_dict.setter
+    def metadata_dict(self, value: Mapping[str, Any]) -> None:
         """Set metadata from a mapping."""
         self.metadata_str = serialize_metadata(value)
 
@@ -73,13 +83,13 @@ class Document(Base):
     title: Mapped[str]
     title_strength: Mapped[int]
     embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
-    keywords: Mapped[List[str]]
+    keywords: Mapped[List[str]] = mapped_column(ARRAY(String))
     summary: Mapped[str]
     last_modified: Mapped[datetime]
 
     # Relationships - cascade merge to handle upsert of chunks atomically
     chunks: Mapped[List[DocumentChunk]] = relationship(
-        back_populates="document", cascade="all, delete-orphan"
+        back_populates="document", cascade="all, delete-orphan", overlaps="summary"
     )
 
     __table_args__ = (
@@ -103,7 +113,7 @@ class ChunkSummary(Base):
     summary: Mapped[str]
 
     # Relationships
-    chunks: Mapped[List[DocumentChunk]] = relationship(back_populates="summary")
+    chunks: Mapped[List[DocumentChunk]] = relationship(back_populates="summary", overlaps="document,chunks")
 
     __table_args__ = (
         Index("ix_chunk_summary_document_id", "document_id"),

@@ -11,7 +11,7 @@ from ..context import Context
 from ..config import CollectionConfig
 from ..llm import VECTOR_DIMENSIONS
 from ..context import SOURCE_REGISTRY
-from .models import Base, DocumentChunk, Document, ChunkSummary, serialize_metadata, deserialize_metadata
+from ..models import Base, DocumentChunk, Document, ChunkSummary, serialize_metadata, deserialize_metadata
 
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
