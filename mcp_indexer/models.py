@@ -76,8 +76,10 @@ class Document(Base):
     summary: Mapped[str]
     last_modified: Mapped[datetime]
 
-    # Relationships
-    chunks: Mapped[List[DocumentChunk]] = relationship(back_populates="document")
+    # Relationships - cascade merge to handle upsert of chunks atomically
+    chunks: Mapped[List[DocumentChunk]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_document_title", "title"),
