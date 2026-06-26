@@ -11,9 +11,10 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy import ARRAY, JSON, DateTime, Float, Index, String, Text
+from sqlalchemy import JSON, DateTime, Float, Index, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from pgvector.sqlalchemy import Vector
 from .llm import VECTOR_DIMENSIONS
 
 
@@ -35,7 +36,7 @@ class DocumentChunk(Base):
     order: Mapped[int]
     chunk_id: Mapped[str] = mapped_column(String, primary_key=True)
     text: Mapped[str | None]
-    embedding: Mapped[List[float]]
+    embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
     summary_span: Mapped[int | None]
     metadata_str: Mapped[str]
 
@@ -71,7 +72,7 @@ class Document(Base):
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str]
     title_strength: Mapped[int]
-    embedding: Mapped[List[float]]
+    embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
     keywords: Mapped[List[str]]
     summary: Mapped[str]
     last_modified: Mapped[datetime]
