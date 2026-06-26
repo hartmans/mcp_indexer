@@ -52,8 +52,31 @@ class DocumentChunk(Base):
 
 print("DocumentChunk defined successfully")
 
-# Check if we can create a table
-from sqlalchemy import create_engine
-engine = create_engine("sqlite:///:memory:")
-Base.metadata.create_all(engine)
-print("Tables created successfully")
+
+class Document(Base):
+    __tablename__ = "document"
+
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    title: Mapped[str]
+    title_strength: Mapped[int]
+    embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
+    keywords: Mapped[List[str]] = mapped_column(ARRAY(String))
+    summary: Mapped[str]
+    last_modified: Mapped[datetime]
+
+
+print("Document defined successfully")
+
+
+class ChunkSummary(Base):
+    __tablename__ = "chunk_summary"
+
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    summary_span: Mapped[int] = mapped_column(Integer, primary_key=True)
+    summary: Mapped[str]
+
+
+print("ChunkSummary defined successfully")
+print("All models imported successfully")

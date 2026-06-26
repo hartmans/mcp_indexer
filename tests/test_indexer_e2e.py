@@ -63,8 +63,15 @@ class FakeConfigManager:
         return self.server_config
 
 
-async def run_indexing_pipeline(indexer):
-    await indexer.index_all()
+async def run_indexing_pipeline(indexer, passes: int = 1):
+    """Run indexing pipeline for specified number of passes.
+    
+    Multiple passes are needed because chunk creation and chunk summarization
+    run in parallel within a single pass, so summaries won't be created until
+    chunks are committed in a previous pass.
+    """
+    for _ in range(passes):
+        await indexer.index_all()
 
 
 @pytest.mark.asyncio
@@ -155,7 +162,8 @@ async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(test_co
     context.collections["notes"] = source
 
     indexer = Indexer(context)
-    await run_indexing_pipeline(indexer)
+    # First pass creates chunks, second pass summarizes them
+    await run_indexing_pipeline(indexer, passes=2)
 
     from mcp_indexer.models import ChunkSummary
 
