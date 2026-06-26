@@ -89,7 +89,7 @@ class DocumentSource(Generic[p]):
     async def get_documents(self, last_modified: datetime | None = None) -> AsyncGenerator[p, None]:
         ...
 
-    async def fetch_document(document_id: str) -> p:
+    def fetch_document(document_id: str) -> p:
         ...
 
     async def get_document_summary(self, document_id: str) -> str:

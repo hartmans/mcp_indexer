@@ -46,8 +46,8 @@ def temp_text_env(tmp_path):
 
 
 @pytest.fixture
-def mock_context():
-    return Context(db=None, embedding=None, llm=None, config=None)
+def mock_context(test_context):
+    return Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=None, config=None)
 
 
 @pytest.mark.asyncio
@@ -111,12 +111,12 @@ async def test_text_file_pointer_retrieval(temp_text_env, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_text_file_source_get_document_summary_summarizes_small_documents(tmp_path):
+async def test_text_file_source_get_document_summary_summarizes_small_documents(tmp_path, test_context):
     path = tmp_path / "small.txt"
     path.write_text("Short document body", encoding="utf-8")
 
     llm = FakeLlm()
-    context = Context(db=None, embedding=None, llm=llm, config=None)
+    context = Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=100))
 
     pointer = source.fetch_document("small.txt")
@@ -130,12 +130,12 @@ async def test_text_file_source_get_document_summary_summarizes_small_documents(
 
 
 @pytest.mark.asyncio
-async def test_text_file_pointer_get_metadata_skips_summary_for_large_documents(tmp_path):
+async def test_text_file_pointer_get_metadata_skips_summary_for_large_documents(tmp_path, test_context):
     path = tmp_path / "large.txt"
     path.write_text("X" * 20, encoding="utf-8")
 
     llm = FakeLlm()
-    context = Context(db=None, embedding=None, llm=llm, config=None)
+    context = Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=10))
 
     meta = await source.fetch_document("large.txt").get_metadata()

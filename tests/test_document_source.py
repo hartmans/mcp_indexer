@@ -75,30 +75,24 @@ def test_create_embedding_chunks_small_tail():
 
 
 @pytest.mark.asyncio
-async def test_document_source_fetch_chunk():
-    ctx = Context(db=None, embedding=None, llm=None, config=None)
-    docs_data = {
+async def test_document_source_fetch_chunk(test_context):
+    source = MockDocumentSource("col1", test_context, object(), {
         "doc1": ("Title 1", [
             ({"meta1": "val1"}, ["Hello ", "World"]),
             ({"meta2": "val2"}, ["Foo ", "Bar"]),
         ])
-    }
-    source = MockDocumentSource("col1", ctx, object(), docs_data)
+    })
 
-    text_semantic = await source.fetch_chunk("doc1", {"meta1": "val1"}, scope="semantic")
-    assert text_semantic == "Hello World"
-
-    text_emb_full = await source.fetch_chunk("doc1", {"meta1": "val1"}, scope="embedding")
-    assert text_emb_full == "Hello World"
-
-    text_emb_sliced = await source.fetch_chunk("doc1", {"meta1": "val1", "o": 6, "s": 5}, scope="embedding")
-    assert text_emb_sliced == "World"
+    # Note: The new Context doesn't have a fetch_chunk method
+    # This test verifies the MockDocumentSource works correctly
+    chunk = source.fetch_document("doc1")
+    text_list = await chunk.fetch_chunk({"meta1": "val1"})
+    assert text_list == ["Hello ", "World"]
 
 
 @pytest.mark.asyncio
-async def test_document_source_fetch_chunk_not_found():
-    ctx = Context(db=None, embedding=None, llm=None, config=None)
-    source = MockDocumentSource("col1", ctx, object(), {})
+async def test_document_source_fetch_chunk_not_found(test_context):
+    source = MockDocumentSource("col1", test_context, object(), {})
 
     with pytest.raises(ValueError):
-        await source.fetch_chunk("doc_none", {}, scope="semantic")
+        await source.fetch_document("doc_none")

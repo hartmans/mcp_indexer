@@ -32,8 +32,8 @@ def temp_file_env(tmp_path):
 
 
 @pytest.fixture
-def mock_context():
-    return Context(db=None, embedding=None, llm=None, config=None)
+def mock_context(test_context):
+    return Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=None, config=None)
 
 
 @pytest.mark.asyncio
@@ -83,7 +83,6 @@ async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
         chunks.append(chunk_info)
 
     assert len(chunks) == 1
-
     meta, _ = chunks[0]
     text_list = await pointer.fetch_chunk(meta)
     assert "Semantic 1" in "".join(text_list)
