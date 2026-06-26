@@ -208,7 +208,7 @@ class Indexer:
             logger.error(f"Error in {stats.operation} for {stats.document_id}: {e}")
             raise
         finally:
-            await self.sem.release()
+            self.sem.release()
 
     def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
         self._running_documents[task] = stats
@@ -449,7 +449,7 @@ class Indexer:
         self, source: DocumentSource, doc: Document
     ) -> None:
         async with self.context.get_session() as session:
-            session.merge(doc)
+            await session.merge(doc)
             await session.commit()
 
     async def _insert_summaries(
@@ -459,7 +459,7 @@ class Indexer:
             return
         async with self.context.get_session() as session:
             for summary in summaries:
-                session.merge(summary)
+                await session.merge(summary)
             await session.commit()
 
     async def _update_chunks(
@@ -484,7 +484,7 @@ class Indexer:
         self, source: DocumentSource, doc: Document
     ) -> None:
         async with self.context.get_session() as session:
-            session.merge(doc)
+            await session.merge(doc)
             await session.commit()
 
     async def _reconstruct_semantic_chunks(
