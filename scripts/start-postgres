@@ -1,0 +1,26 @@
+#!/bin/bash
+# start-postgres: Launch PostgreSQL 18 with pgvector extension via Unix socket
+
+set -e
+
+# Configuration - adjust these paths as needed
+SOCKET_DIR="/srv/datasets/asstr.db/sockets"
+DATA_DIR="/srv/datasets/asstr.db/postgres"
+CONTAINER_NAME="indexer-postgres"
+
+# Create directories if they don't exist
+mkdir -p "$SOCKET_DIR"
+mkdir -p "$DATA_DIR"
+
+
+# Run PostgreSQL container with Unix socket only (no TCP ports)
+podman create  \
+    --name "$CONTAINER_NAME" \
+    -v "$DATA_DIR:/var/lib/postgresql/:Z" \
+    -v "$SOCKET_DIR:/var/run/postgresql:Z" \
+    -e POSTGRES_DB=indexer \
+    -e POSTGRES_USER=indexer \
+    -e POSTGRES_PASSWORD=indexer \
+    docker.io/pgvector/pgvector:pg18
+
+

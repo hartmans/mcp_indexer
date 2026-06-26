@@ -1,0 +1,31 @@
+[server]
+db_uri = "~/.lancedb"
+log_level = "INFO"
+llm_batch_size = 10
+embedding_batch_size = 100
+llm_request_timeout = 400.0
+embedding_request_timeout = 400.0
+llm_timeout_retries = 20
+embedding_timeout_retries = 20
+
+[server.llm]
+model = "google/gemma-4-31B-it"
+model_provider = "openai" # Assuming vLLM uses OpenAI-compatible API
+base_url = "http://localhost:8000/v1"
+api_key = "empty"
+
+[server.embedding]
+model = "Qwen/Qwen3-Embedding-4B"
+model_provider = "openai" # Assuming vLLM uses OpenAI-compatible API
+base_url = "http://localhost:8001/v1"
+api_key = "empty"
+
+[defaults]
+doc_summary_prompt = "Summarize the following document concisely..."
+chunk_summary_prompt = "Summarize the following text chunk concisely..."
+embedding_model = "Qwen/Qwen3-Embedding-4B"
+
+[collections.my_docs]
+tool_prefix = "docs"
+description = "My documents collection"
+source_config = { type = "file", directory = "/home/hartmans/documents" }

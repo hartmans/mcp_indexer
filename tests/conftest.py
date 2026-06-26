@@ -1,9 +1,10 @@
 import pytest
+import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
+from sqlalchemy import text, select
 
-from mcp_indexer.config import ServerConfig
+from mcp_indexer.config import ServerConfig, CollectionConfig
 from mcp_indexer.models import Base
 
 

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from mcp_indexer.context import Context
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.models import ChunkSummary, Document, DocumentChunk
+from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, deserialize_metadata
 from mcp_indexer.plugins.base import DocumentSource, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
@@ -333,9 +334,10 @@ class Indexer:
                     document_id=pointer.document_id,
                     order=order,
                     chunk_id=f"{pointer.document_id}?c={order}",
+                    text=_e_text,
                     embedding=embedding,
                     summary_span=None,
-                    metadata=e_meta,
+                    metadata_str=json.dumps(e_meta),
                 )
             )
 
@@ -391,17 +393,21 @@ class Indexer:
                 )
 
             for row in semantic_chunk.embedding_rows:
-                metadata = self._deserialize_metadata(row["metadata_str"])
+                metadata = self._deserialize_metadata(row.metadata_str)
                 local_index = self._summary_span_for_embedding_chunk(metadata, spans)
-                updated = dict(row)
-                updated["summary_span"] = next_summary_span + local_index
+                updated = {
+                    "collection_id": row.collection_id,
+                    "document_id": row.document_id,
+                    "chunk_id": row.chunk_id,
+                    "summary_span": next_summary_span + local_index,
+                }
                 updated_rows.append(updated)
 
             next_summary_span += len(spans)
 
-        # Update chunks and insert summaries
-        await self._update_chunks(source, updated_rows)
+        # Insert summaries first (chunks reference summaries via foreign key)
         await self._insert_summaries(source, summary_records)
+        await self._update_chunks(source, updated_rows)
         return True
 
     async def summarize_document(
@@ -613,7 +619,7 @@ class Indexer:
             return {}
         if isinstance(metadata_str, dict):
             return metadata_str
-        return DocumentChunk._deserialize_metadata(metadata_str)
+        return deserialize_metadata(metadata_str)
 
     async def search(
         self, collection_id: str, query: str, limit: int = 5
