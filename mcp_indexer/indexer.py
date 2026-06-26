@@ -137,64 +137,55 @@ class Indexer:
             )
 
     async def summarize_chunks_collection(self, source: DocumentSource):
-        while True:
-            async with self.context.get_session() as session:
-                result = await session.execute(
-                    select(DocumentChunk).where(
-                        DocumentChunk.collection_id == source.id,
-                        DocumentChunk.summary_span.is_(None),
-                    )
+        async with self.context.get_session() as session:
+            result = await session.execute(
+                select(DocumentChunk).where(
+                    DocumentChunk.collection_id == source.id,
+                    DocumentChunk.summary_span.is_(None),
                 )
-                chunks = result.scalars().all()
+            )
+            chunks = result.scalars().all()
 
-            if not chunks:
-                if not self._running_documents:
-                    return
-                await self.wait_for_idle()
-                continue
-
-            # Group by document_id
-            document_ids = sorted(set(c.document_id for c in chunks))
-            for document_id in document_ids:
-                stats = DocumentIndexingStats(
-                    document_id=document_id, operation="chunk_summary"
-                )
-                await self._schedule_document_task(
-                    self.summarize_document_chunks(source, document_id),
-                    stats,
-                )
-
-            await self.wait_for_idle()
+        if not chunks:
             return
 
+        # Group by document_id
+        document_ids = sorted(set(c.document_id for c in chunks))
+        for document_id in document_ids:
+            stats = DocumentIndexingStats(
+                document_id=document_id, operation="chunk_summary"
+            )
+            await self._schedule_document_task(
+                self.summarize_document_chunks(source, document_id),
+                stats,
+            )
+
+        await self.wait_for_idle()
+
     async def summarize_documents_collection(self, source: DocumentSource):
-        while True:
-            async with self.context.get_session() as session:
-                result = await session.execute(
-                    select(Document).where(
-                        Document.collection_id == source.id,
-                        Document.summary == "",
-                    )
+        async with self.context.get_session() as session:
+            result = await session.execute(
+                select(Document).where(
+                    Document.collection_id == source.id,
+                    Document.summary == "",
                 )
-                documents = result.scalars().all()
+            )
+            documents = result.scalars().all()
 
-            if not documents:
-                if not self._running_documents:
-                    return
-                await self.wait_for_idle()
-                continue
+        if not documents:
+            return
 
-            document_ids = sorted(d.document_id for d in documents)
-            for document_id in document_ids:
-                stats = DocumentIndexingStats(
-                    document_id=document_id, operation="document_summary"
-                )
-                await self._schedule_document_task(
-                    self.summarize_document(source, document_id),
-                    stats,
-                )
+        document_ids = sorted(d.document_id for d in documents)
+        for document_id in document_ids:
+            stats = DocumentIndexingStats(
+                document_id=document_id, operation="document_summary"
+            )
+            await self._schedule_document_task(
+                self.summarize_document(source, document_id),
+                stats,
+            )
 
-            await self.wait_for_idle()
+        await self.wait_for_idle()
 
     async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> None:
         await self.sem.acquire()
@@ -266,6 +257,9 @@ class Indexer:
         finally:
             if self._monitor_task is asyncio.current_task():
                 self._monitor_task = None
+            # Set idle if monitor task completes and there are no running documents
+            if not self._running_documents:
+                self._idle.set()
 
     def _on_task_done(self, fut: asyncio.Task) -> None:
         stats = self._running_documents.pop(fut, None)
