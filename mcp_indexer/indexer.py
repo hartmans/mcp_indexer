@@ -227,6 +227,9 @@ class Indexer:
         previous_tasks: set[asyncio.Task] = set()
         try:
             while True:
+                running_items = list(self._running_documents.items())
+                if not running_items:
+                    return
                 await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
                 now = monitor_time()
                 elapsed = now - last_run
