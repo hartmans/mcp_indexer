@@ -86,7 +86,6 @@ class Context:
             config=config_manager,
         )
 
-        ctx.build_collections()
         return ctx
 
     async def build_collections(self) -> None:
