@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 from mcp_indexer.config import CollectionConfig, ServerConfig
@@ -222,3 +223,95 @@ async def test_indexer_uses_escaped_file_paths_in_document_ids(test_context, tmp
     doc_id = meta_rows[0].document_id
     assert "alpha" in doc_id
     assert "team" in doc_id
+
+
+@pytest.mark.asyncio
+async def test_failed_document_tracking(test_context, tmp_path):
+    """Test that failed documents are tracked and skipped in subsequent passes."""
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.txt").write_text("Alpha document content", encoding="utf-8")
+    (docs_dir / "beta.txt").write_text("Beta document content", encoding="utf-8")
+
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "text", "directory": str(docs_dir)},
+    })
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 10,
+        "max_size": 1000,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+
+    from mcp_indexer.context import Context
+    from mcp_indexer.models import FailedDocument, Document
+
+    class FailingEmbedding(FakeEmbedding):
+        """Embedding that fails on specific documents."""
+        def __init__(self, fail_on: list[str]):
+            super().__init__()
+            self.fail_on = fail_on
+
+        async def __call__(self, texts):
+            # Check if any text contains a failing document
+            for text in texts:
+                for fail_doc in self.fail_on:
+                    if fail_doc in text.lower():
+                        raise ValueError(f"Simulated failure for document containing: {fail_doc}")
+            return await super().__call__(texts)
+
+    # First pass: simulate failure for beta.txt during indexing
+    failing_embedding = FailingEmbedding(fail_on=["beta"])
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=failing_embedding,
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    # First pass will log failure for beta.txt but not raise (failures are recorded)
+    # Wait a bit for async failure recording to complete
+    await run_indexing_pipeline(indexer, passes=1)
+    await asyncio.sleep(0.1)
+
+    # Verify beta.txt is in FailedDocument
+    async with test_context.session_factory() as session:
+        failed_rows = (await session.execute(select(FailedDocument))).scalars().all()
+        failed_ids = {row.document_id for row in failed_rows}
+
+    assert "beta.txt" in failed_ids
+
+    # Second pass: create new context with working embedding
+    # beta.txt should be skipped due to failure record
+    working_context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    working_source = TextFileSource("notes", context=working_context, collection_config=collection_config)
+    working_context.collections["notes"] = working_source
+
+    working_indexer = Indexer(working_context)
+    await run_indexing_pipeline(working_indexer, passes=2)
+
+    # Verify alpha.txt was processed but beta.txt was skipped
+    async with test_context.session_factory() as session:
+        documents = (await session.execute(select(Document))).scalars().all()
+        failed_after = (await session.execute(select(FailedDocument))).scalars().all()
+
+    # Only alpha.txt should be in documents
+    assert len(documents) == 1
+    assert documents[0].document_id == "alpha.txt"
+    # beta.txt should still be in FailedDocument (failure records are not cleared)
+    assert any(f.document_id == "beta.txt" for f in failed_after)
