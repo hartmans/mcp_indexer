@@ -120,6 +120,26 @@ class ChunkSummary(Base):
     )
 
 
+class FailedDocument(Base):
+    """Records a document that failed to process.
+
+    Stores the document_id and reason for failure. The document_id is a primary
+    key (not a foreign key to Document) so we can track failures for documents
+    that don't exist yet or have been deleted.
+    """
+    __tablename__ = "failed_document"
+
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    failure_reason: Mapped[str]
+    failed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_failed_document_collection", "collection_id"),
+        Index("ix_failed_document_document_id", "document_id"),
+    )
+
+
 def serialize_metadata(value: Mapping[str, Any] | str | None) -> str:
     """Serialize metadata dict to JSON string."""
     if value is None:
