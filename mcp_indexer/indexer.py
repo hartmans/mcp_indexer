@@ -82,7 +82,6 @@ class Indexer:
 
     def __init__(self, context: Context, debug: bool = False):
         self.context = context
-        self._require_built_collections()
         self.server_config = context.config.get_server_config()
         self.debug = debug
         self.sem = asyncio.Semaphore(INDEXING_WORKERS)
@@ -126,6 +125,7 @@ class Indexer:
         summarize_chunks: bool = True,
         summarize_documents: bool = True,
     ):
+        await self.context.build_collections()
         loops = []
         for source in self.context.collections.values():
             if index:
@@ -174,19 +174,23 @@ class Indexer:
         failed_docs = await self._get_failed_documents(source)
         
         async with self.context.get_session() as session:
-            result = await session.execute(
-                select(DocumentChunk).where(
+            stmt = (
+                select(DocumentChunk.document_id)
+                .where(
                     DocumentChunk.collection_id == source.id,
                     DocumentChunk.summary_span.is_(None),
                 )
+                .distinct()
+                .order_by(DocumentChunk.document_id)
             )
-            chunks = result.scalars().all()
+            if failed_docs:
+                stmt = stmt.where(DocumentChunk.document_id.not_in(failed_docs))
+            result = await session.execute(stmt)
+            document_ids = result.scalars().all()
 
-        if not chunks:
+        if not document_ids:
             return
 
-        # Group by document_id, skipping failed documents
-        document_ids = sorted(set(c.document_id for c in chunks if c.document_id not in failed_docs))
         for document_id in document_ids:
             stats = DocumentIndexingStats(
                 document_id=document_id, operation="chunk_summary", source=source
@@ -386,7 +390,6 @@ class Indexer:
                     document_id=pointer.document_id,
                     order=order,
                     chunk_id=f"{pointer.document_id}?c={order}",
-                    text=_e_text,
                     embedding=embedding,
                     summary_span=None,
                     metadata_str=json.dumps(e_meta),
