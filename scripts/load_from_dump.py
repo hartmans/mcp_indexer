@@ -13,14 +13,17 @@ from pathlib import Path
 
 from mcp_indexer.context import Context
 from mcp_indexer.models import ChunkSummary, Document, DocumentChunk
+from mcp_indexer.config import ConfigManager, ServerConfig
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Load dump files into PostgreSQL")
+    parser = argparse.ArgumentParser(
+        description="Load dump files into PostgreSQL"
+    )
     parser.add_argument(
-        "--db-uri",
+        "--config",
         required=True,
-        help="Database URI (e.g., postgresql://user:pass@localhost/db)",
+        help="Path to config.toml file",
     )
     parser.add_argument(
         "--input-dir",
@@ -30,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--collection-id",
         required=True,
-        help="Collection ID to use for all loaded documents",
+        help="Collection ID to load",
     )
     parser.add_argument(
         "--dry-run",
@@ -70,7 +73,6 @@ def convert_record(record: dict, collection_id: str) -> dict:
     if "last_modified" in converted and isinstance(converted["last_modified"], str):
         converted["last_modified"] = datetime.fromisoformat(converted["last_modified"])
     
-    # Remove any columns not in the model
     return converted
 
 
@@ -125,8 +127,46 @@ def load_summaries(records: list, collection_id: str, session, dry_run: bool = F
     return count
 
 
+def validate_database(engine):
+    """Validate that the database is properly set up for vector operations."""
+    from sqlalchemy import text
+    
+    with engine.connect() as conn:
+        # Check pgvector extension is enabled
+        result = conn.execute(text(
+            "SELECT extname FROM pg_extension WHERE extname = 'vector'"
+        )).fetchone()
+        if not result:
+            raise RuntimeError(
+                "pgvector extension not enabled. Run: CREATE EXTENSION vector;"
+            )
+    
+    print("Database validation passed: pgvector extension is enabled")
+
+
 def main():
     args = parse_args()
+    
+    # Load config
+    config_manager = ConfigManager(args.config)
+    server_config = config_manager.get_server_config()
+    
+    # Get the collection config for embedding configuration
+    collection_config = config_manager.get_collection_config(args.collection_id)
+    
+    # Validate database BEFORE loading files
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from mcp_indexer.models import Base
+    
+    engine = create_engine(server_config.db_uri)
+    validate_database(engine)
+    
+    # Create tables
+    print("Creating tables...")
+    Base.metadata.create_all(engine)
+    
+    Session = sessionmaker(bind=engine)
     
     input_dir = Path(args.input_dir)
     
@@ -151,6 +191,9 @@ def main():
     
     if args.dry_run:
         print("\nDry run - no changes will be made")
+        print(f"Collection: {args.collection_id}")
+        print(f"Server DB URI: {server_config.db_uri}")
+        
         print("\nDocuments to load:")
         for doc in documents[:5]:
             print(f"  {doc.get('document_id')}")
@@ -171,21 +214,6 @@ def main():
         
         print(f"\nTotal: {len(documents)} docs, {len(chunks)} chunks, {len(summaries)} summaries")
         return 0
-    
-    # Create context with the database
-    from mcp_indexer.config import ServerConfig
-    from mcp_indexer.context import Context
-    from mcp_indexer.llm import FakeEmbedding
-    from mcp_indexer.models import Base
-    
-    # Create engine and tables
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-    
-    engine = create_engine(args.db_uri)
-    Base.metadata.create_all(engine)
-    
-    Session = sessionmaker(bind=engine)
     
     # Load data in correct order (documents first, then chunks, then summaries)
     total_docs = 0
