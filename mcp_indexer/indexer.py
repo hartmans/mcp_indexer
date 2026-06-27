@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from mcp_indexer.context import Context
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, deserialize_metadata
+from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, FailedDocument, deserialize_metadata
 from mcp_indexer.plugins.base import DocumentSource, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
@@ -56,12 +56,14 @@ class DocumentIndexingStats:
         semantic_chunks: int = 0,
         embedding_chunks: int = 0,
         summary_spans: int = 0,
+        source: Any = None,
     ):
         self.document_id = document_id
         self.operation = operation
         self.semantic_chunks = semantic_chunks
         self.embedding_chunks = embedding_chunks
         self.summary_spans = summary_spans
+        self.source = source
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,27 @@ class Indexer:
                 "Context has no collections; call Context.build_collections() before creating an Indexer."
             )
 
+    async def _get_failed_documents(self, source: DocumentSource) -> set[str]:
+        """Get set of document_ids that failed to process for this collection."""
+        async with self.context.get_session() as session:
+            result = await session.execute(
+                select(FailedDocument.document_id).where(
+                    FailedDocument.collection_id == source.id
+                )
+            )
+            return set(result.scalars().all())
+
+    async def _record_failure(self, source: DocumentSource, document_id: str, reason: str) -> None:
+        """Record a failure for a document."""
+        async with self.context.get_session() as session:
+            failed = FailedDocument(
+                collection_id=source.id,
+                document_id=document_id,
+                failure_reason=reason,
+            )
+            await session.merge(failed)
+            await session.commit()
+
     async def index_all(
         self,
         *,
@@ -117,6 +140,9 @@ class Indexer:
         await self.wait_for_idle()
 
     async def index_collection(self, source: DocumentSource):
+        # Get set of failed document_ids to skip
+        failed_docs = await self._get_failed_documents(source)
+        
         async with self.context.get_session() as session:
             # Get existing document IDs for this collection
             result = await session.execute(
@@ -127,9 +153,16 @@ class Indexer:
         async for pointer in source.get_documents(last_modified=None):
             if pointer.document_id in existing_docs:
                 continue
+            if pointer.document_id in failed_docs:
+                logger.info(
+                    "Skipping failed document %s in collection %s",
+                    pointer.document_id,
+                    source.id,
+                )
+                continue
 
             stats = DocumentIndexingStats(
-                document_id=pointer.document_id, operation="index"
+                document_id=pointer.document_id, operation="index", source=source
             )
             await self._schedule_document_task(
                 self.index_document(pointer, stats),
@@ -137,6 +170,9 @@ class Indexer:
             )
 
     async def summarize_chunks_collection(self, source: DocumentSource):
+        # Get set of failed document_ids to skip
+        failed_docs = await self._get_failed_documents(source)
+        
         async with self.context.get_session() as session:
             result = await session.execute(
                 select(DocumentChunk).where(
@@ -149,11 +185,11 @@ class Indexer:
         if not chunks:
             return
 
-        # Group by document_id
-        document_ids = sorted(set(c.document_id for c in chunks))
+        # Group by document_id, skipping failed documents
+        document_ids = sorted(set(c.document_id for c in chunks if c.document_id not in failed_docs))
         for document_id in document_ids:
             stats = DocumentIndexingStats(
-                document_id=document_id, operation="chunk_summary"
+                document_id=document_id, operation="chunk_summary", source=source
             )
             await self._schedule_document_task(
                 self.summarize_document_chunks(source, document_id),
@@ -163,6 +199,9 @@ class Indexer:
         await self.wait_for_idle()
 
     async def summarize_documents_collection(self, source: DocumentSource):
+        # Get set of failed document_ids to skip
+        failed_docs = await self._get_failed_documents(source)
+        
         async with self.context.get_session() as session:
             result = await session.execute(
                 select(Document).where(
@@ -175,10 +214,11 @@ class Indexer:
         if not documents:
             return
 
-        document_ids = sorted(d.document_id for d in documents)
+        # Filter out failed documents
+        document_ids = sorted(d.document_id for d in documents if d.document_id not in failed_docs)
         for document_id in document_ids:
             stats = DocumentIndexingStats(
-                document_id=document_id, operation="document_summary"
+                document_id=document_id, operation="document_summary", source=source
             )
             await self._schedule_document_task(
                 self.summarize_document(source, document_id),
@@ -275,6 +315,21 @@ class Indexer:
             fut.result()
         except Exception as e:
             logger.exception(f"Task failed: {e}")
+            # Record failure if we have stats and a document_id
+            if stats is not None and hasattr(stats, "document_id") and stats.document_id:
+                import traceback
+                tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                # Truncate long tracebacks
+                if len(tb_str) > 1000:
+                    tb_str = tb_str[:997] + "..."
+                # Get source from stats.source if available, otherwise try to infer
+                source = getattr(stats, "source", None)
+                if source is not None:
+                    asyncio.create_task(
+                        self._record_failure(source, stats.document_id, f"{type(e).__name__}: {str(e)}\n{tb_str}")
+                    )
+                else:
+                    logger.warning(f"Cannot record failure for {stats.document_id}: no source available")
 
     def _append_debug_stats(self, stats: DocumentIndexingStats) -> None:
         import json
