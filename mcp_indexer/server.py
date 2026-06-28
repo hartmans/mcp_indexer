@@ -1,58 +1,44 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
 from mcp.server.fastmcp import FastMCP
-from .indexer import Indexer
-from .plugins.text_plugin import TextPlugin
+
+from .models import Document, DocumentChunk
 
 # Initialize the MCP server
 mcp = FastMCP("LanceDB Indexer")
 
 # Initialize the Indexer and add the example plugin
-indexer = Indexer()
-indexer.add_plugin(TextPlugin())
 
-@mcp.tool()
-def index_directory(path: str) -> str:
-    """
-    Indexes all supported files in the given directory.
-    """
-    try:
-        indexer.index_directory(path)
-        return f"Successfully indexed directory: {path}"
-    except Exception as e:
-        return f"Error indexing directory: {str(e)}"
 
-@mcp.tool()
-def search_documents(query: str, limit: int = 5) -> str:
-    """
-    Search for relevant document chunks using a natural language query.
-    """
-    try:
-        results = indexer.search(query, limit)
-        if not results:
-            return "No results found."
-        
-        output = []
-        for res in results:
-            output.append(f"Title: {res['title']}\nDoc ID: {res['doc_id']}\nText: {res['text']}\n---")
-        return "\n".join(output)
-    except Exception as e:
-        return f"Error searching documents: {str(e)}"
+def result_info(
+    results: Iterable[tuple[Document, list[DocumentChunk]]],
+) -> list[dict[str, Any]]:
+    formatted_results: list[dict[str, Any]] = []
+    for document, relevant_chunks in results:
+        formatted_results.append(
+            {
+                "title": document.title,
+                "keywords": list(document.keywords),
+                "document_id": f"{document.collection_id}:{document.document_id}",
+                "summary": document.summary,
+                "relevant_chunks": [
+                    {
+                        "chunk_id": (
+                            f"{document.collection_id}:"
+                            f"{document.document_id}:"
+                            f"{chunk.chunk_id}"
+                        ),
+                        "summary": chunk.summary.summary if chunk.summary else None,
+                    }
+                    for chunk in relevant_chunks
+                ],
+            }
+        )
+    return formatted_results
 
-@mcp.tool()
-def fetch_document(doc_id: str) -> str:
-    """
-    Fetch all chunks of a document by its ID.
-    """
-    try:
-        results = indexer.fetch(doc_id)
-        if not results:
-            return "Document not found."
-        
-        output = []
-        for res in results:
-            output.append(res['text'])
-        return "\n\n".join(output)
-    except Exception as e:
-        return f"Error fetching document: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()

@@ -5,10 +5,11 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import String, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from mcp_indexer.context import Context
 from mcp_indexer.llm import VECTOR_DIMENSIONS
@@ -202,6 +203,49 @@ class Indexer:
 
         await self.wait_for_idle()
 
+    async def summarize_results(
+        self, collection_id: str, document_ids: Iterable[str]
+    ) -> None:
+        document_ids = set(document_ids)
+        if not document_ids:
+            return
+
+        source = self.context.collections[collection_id]
+        failed_docs = await self._get_failed_documents(source)
+
+        async with self.context.get_session() as session:
+            stmt = (
+                select(DocumentChunk.document_id)
+                .where(
+                    DocumentChunk.collection_id == collection_id,
+                    DocumentChunk.document_id.in_(document_ids),
+                    DocumentChunk.summary_span.is_(None),
+                )
+                .distinct()
+                .order_by(DocumentChunk.document_id)
+            )
+            if failed_docs:
+                stmt = stmt.where(DocumentChunk.document_id.not_in(failed_docs))
+            result = await session.execute(stmt)
+            pending_document_ids = result.scalars().all()
+
+        if not pending_document_ids:
+            return
+
+        tasks = []
+        for document_id in pending_document_ids:
+            stats = DocumentIndexingStats(
+                document_id=document_id, operation="chunk_summary", source=source
+            )
+            tasks.append(
+                self._schedule_unbounded_document_task(
+                    self.summarize_document_chunks(source, document_id),
+                    stats,
+                )
+            )
+
+        await asyncio.gather(*tasks)
+
     async def summarize_documents_collection(self, source: DocumentSource):
         # Get set of failed document_ids to skip
         failed_docs = await self._get_failed_documents(source)
@@ -236,6 +280,14 @@ class Indexer:
         task = asyncio.create_task(self._run_with_semaphore(coro, stats))
         self._track_task(task, stats)
         task.add_done_callback(self._on_task_done)
+
+    def _schedule_unbounded_document_task(
+        self, coro, stats: DocumentIndexingStats
+    ) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._track_task(task, stats)
+        task.add_done_callback(self._on_task_done)
+        return task
 
     async def _run_with_semaphore(self, coro, stats: DocumentIndexingStats):
         try:
@@ -677,20 +729,170 @@ class Indexer:
         return deserialize_metadata(metadata_str)
 
     async def search(
-        self, collection_id: str, query: str, limit: int = 5
+        self,
+        collection_id: str,
+        query: str,
+        limit: int = 5,
+        document_candidate_limit: int | None = None,
+        chunk_candidate_limit: int | None = None,
     ):
         query_vector = await self.context.embedding.query(query)
-        source = self.context.collections[collection_id]
+        document_candidate_limit = document_candidate_limit or limit
+        chunk_candidate_limit = chunk_candidate_limit or limit
+
+        document_distance = Document.embedding.cosine_distance(query_vector)
+        chunk_distance = DocumentChunk.embedding.cosine_distance(query_vector)
+
+        document_candidates = (
+            select(
+                Document.collection_id.label("collection_id"),
+                Document.document_id.label("document_id"),
+                func.cast(None, String).label("chunk_id"),
+                document_distance.label("distance"),
+            )
+            .where(Document.collection_id == collection_id)
+            .order_by(document_distance, Document.document_id)
+            .limit(document_candidate_limit)
+            .cte("document_candidates")
+        )
+        chunk_candidates = (
+            select(
+                DocumentChunk.collection_id.label("collection_id"),
+                DocumentChunk.document_id.label("document_id"),
+                DocumentChunk.chunk_id.label("chunk_id"),
+                chunk_distance.label("distance"),
+            )
+            .where(DocumentChunk.collection_id == collection_id)
+            .order_by(chunk_distance, DocumentChunk.document_id, DocumentChunk.chunk_id)
+            .limit(chunk_candidate_limit)
+            .cte("chunk_candidates")
+        )
+        candidate_hits = (
+            select(
+                document_candidates.c.collection_id,
+                document_candidates.c.document_id,
+                document_candidates.c.chunk_id,
+                document_candidates.c.distance,
+            )
+            .union_all(
+                select(
+                    chunk_candidates.c.collection_id,
+                    chunk_candidates.c.document_id,
+                    chunk_candidates.c.chunk_id,
+                    chunk_candidates.c.distance,
+                )
+            )
+            .cte("candidate_hits")
+        )
+        ranked_hits = (
+            select(
+                candidate_hits.c.collection_id,
+                candidate_hits.c.document_id,
+                candidate_hits.c.chunk_id,
+                candidate_hits.c.distance,
+                func.row_number()
+                .over(
+                    order_by=(
+                        candidate_hits.c.distance,
+                        candidate_hits.c.document_id,
+                        candidate_hits.c.chunk_id.asc().nullsfirst(),
+                    )
+                )
+                .label("hit_rank"),
+            )
+            .cte("ranked_hits")
+        )
+        top_hits = (
+            select(
+                ranked_hits.c.collection_id,
+                ranked_hits.c.document_id,
+                ranked_hits.c.chunk_id,
+                ranked_hits.c.distance,
+                ranked_hits.c.hit_rank,
+            )
+            .where(ranked_hits.c.hit_rank <= limit)
+            .cte("top_hits")
+        )
+        grouped_hits = (
+            select(
+                top_hits.c.collection_id,
+                top_hits.c.document_id,
+                top_hits.c.chunk_id,
+                top_hits.c.distance,
+                top_hits.c.hit_rank,
+                func.min(top_hits.c.hit_rank)
+                .over(
+                    partition_by=(
+                        top_hits.c.collection_id,
+                        top_hits.c.document_id,
+                    )
+                )
+                .label("document_group_rank"),
+            )
+            .cte("grouped_hits")
+        )
+
         async with self.context.get_session() as session:
             result = await session.execute(
-                select(DocumentChunk)
-                .where(DocumentChunk.collection_id == collection_id)
-                .order_by(
-                    DocumentChunk.embedding.cosine_distance(query_vector)
+                select(
+                    grouped_hits.c.collection_id,
+                    grouped_hits.c.document_id,
+                    grouped_hits.c.chunk_id,
                 )
-                .limit(limit)
+                .order_by(
+                    grouped_hits.c.document_group_rank,
+                    grouped_hits.c.hit_rank,
+                )
             )
-            return result.scalars().all()
+            ranked_hits = result.mappings().all()
+            if not ranked_hits:
+                return []
+
+            document_ids = {row["document_id"] for row in ranked_hits}
+            await self.summarize_results(collection_id, document_ids)
+            document_result = await session.execute(
+                select(Document)
+                .where(
+                    Document.collection_id == collection_id,
+                    Document.document_id.in_(document_ids),
+                )
+                .options(
+                    selectinload(Document.chunks).selectinload(DocumentChunk.summary)
+                )
+            )
+            documents = {
+                document.document_id: document
+                for document in document_result.scalars().unique().all()
+            }
+
+            grouped_documents: list[tuple[str, list[DocumentChunk]]] = []
+            document_chunks: dict[str, list[DocumentChunk]] = {}
+            for row in ranked_hits:
+                document_id = row["document_id"]
+                chunks = document_chunks.get(document_id)
+                if chunks is None:
+                    chunks = []
+                    document_chunks[document_id] = chunks
+                    grouped_documents.append((document_id, chunks))
+
+                chunk_id = row["chunk_id"]
+                if chunk_id is None:
+                    continue
+
+                document = documents[document_id]
+                for chunk in document.chunks:
+                    if chunk.chunk_id == chunk_id:
+                        chunks.append(chunk)
+                        break
+                else:
+                    raise LookupError(
+                        f"Missing hydrated chunk {chunk_id!r} for document {document_id!r}"
+                    )
+
+            return [
+                (documents[document_id], chunks)
+                for document_id, chunks in grouped_documents
+            ]
 
 
 async def main():
