@@ -18,7 +18,7 @@ from mcp_indexer.plugins.base import DocumentSource, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
 
-INDEXING_WORKERS = 64
+INDEXING_WORKERS = 8
 MONITOR_INTERVAL_SECONDS = 30.0
 MONITOR_STALL_THRESHOLD_SECONDS = 40.0
 DEBUG_STATS_FILENAME = "indexer-stats.jsonl"
@@ -469,6 +469,7 @@ class Indexer:
         self, source: DocumentSource, document_id: str
     ) -> bool:
         semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
+
         if not semantic_chunks:
             return False
 
@@ -530,7 +531,7 @@ class Indexer:
                 return False
             doc_summary_text = "\n\n".join(span_summaries)
             doc_summary_list = await self.context.llm(
-                [
+                [[
                     (
                         "system",
                         source.config.doc_summary_prompt,
@@ -539,7 +540,7 @@ class Indexer:
                         "user",
                         f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}",
                     ),
-                ]
+                ]]
             )
             doc_summary = doc_summary_list[0]
 
@@ -643,10 +644,10 @@ class Indexer:
 
     async def _summarize_text(self, text: str, prompt: str) -> str:
         res = await self.context.llm(
-            [
+            [[
                 ("system", prompt),
                 ("user", f"Write no more than three sentences to summarize this chunk:\n\n{text}"),
-            ]
+            ]]
         )
         return res[0]
 

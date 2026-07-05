@@ -70,7 +70,7 @@ class BatchCall:
                 batch_size = min(len(self.buffer), self.batch_size)
                 batch_to_send = self.buffer[:batch_size]
                 self.buffer = self.buffer[batch_size:]
-                await self._dispatch_batch(batch_to_send, pending_requests)
+                asyncio.ensure_future(self._dispatch_batch(batch_to_send, pending_requests))
                 
                 if batch_size < self.batch_size:
                     should_dispatch_partial = False
@@ -132,6 +132,7 @@ class LlmCall(BatchCall):
         super().__init__(llm, batch_size=batch_size, batch_timeout=batch_timeout)
 
     async def _execute_batch(self, prompts: List[str|list[dict]]) -> List[Any]:
+        print('sending request: '+str(len(prompts)))
         return await self.model.abatch(prompts)
 
     def _process_item(self, item: Any) -> str:
