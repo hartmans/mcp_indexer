@@ -56,6 +56,7 @@ class DocumentChunk(Base):
         ForeignKeyConstraint(
             ["collection_id", "document_id", "summary_span"],
             ["chunk_summary.collection_id", "chunk_summary.document_id", "chunk_summary.summary_span"],
+            ondelete='set null(summary_span)'
         ),
     )
 
