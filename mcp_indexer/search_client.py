@@ -65,7 +65,7 @@ async def run_repl(args: argparse.Namespace) -> None:
         )
         print(
             yaml.dump(
-                result_info(results),
+                result_info(results, context.collections),
                 default_flow_style=False,
                 sort_keys=False,
             )
