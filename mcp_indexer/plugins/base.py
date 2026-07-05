@@ -1,17 +1,12 @@
 import dataclasses
-import json
 from datetime import datetime
-from types import MappingProxyType
-from typing import List, AsyncGenerator, Generic, TypeVar, Any, AsyncIterator, Literal, Dict, Type, Mapping
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Generic, List, Literal, TypeVar
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from ..context import Context
-from ..config import CollectionConfig
-from ..llm import VECTOR_DIMENSIONS
 from ..context import SOURCE_REGISTRY
-from ..models import Base, DocumentChunk, Document, ChunkSummary, serialize_metadata, deserialize_metadata
+
+if TYPE_CHECKING:
+    from ..config import CollectionConfig
+    from ..context import Context
 
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
@@ -74,7 +69,7 @@ class DocumentSource(Generic[p]):
     """An abstract plugin representing a source of documents."""
 
     def __init__(
-        self, collection_id: str, *, context: Context, collection_config: CollectionConfig
+        self, collection_id: str, *, context: "Context", collection_config: "CollectionConfig"
     ):
         self.context = context
         self.config = collection_config
@@ -94,6 +89,28 @@ class DocumentSource(Generic[p]):
 
     async def get_document_summary(self, document_id: str) -> str:
         return ""
+
+    def chunk_lengths(
+        self, chunk_metadata: dict[str, Any]
+    ) -> tuple[int | None, int | None]:
+        semantic_length: int | None = None
+        if "e" in chunk_metadata:
+            # XXX refactoring needed: b/e is currently a FileSource-specific
+            # semantic-span convention, not a DocumentSource abstraction.
+            # A truly generic semantic_length likely requires fetching the
+            # semantic chunk text (or storing/memoizing the length in schema).
+            semantic_start = int(chunk_metadata.get("b", 0))
+            semantic_end = int(chunk_metadata["e"])
+            semantic_length = semantic_end - semantic_start
+
+        embedding_length = (
+            int(chunk_metadata["s"]) if "s" in chunk_metadata else None
+        )
+
+        if semantic_length is None:
+            semantic_length = embedding_length
+
+        return semantic_length, embedding_length
 
     async def fetch_chunk(
         self, document_id: str, chunk_metadata: dict[str, Any], scope: Literal["semantic", "embedding"]
