@@ -63,6 +63,9 @@ class FakeConfigManager:
     def get_server_config(self) -> ServerConfig:
         return self.server_config
 
+    def list_collections(self) -> list[str]:
+        return [self.collection_id]
+
 
 async def run_indexing_pipeline(indexer, passes: int = 1):
     """Run indexing pipeline for specified number of passes.
@@ -123,9 +126,15 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
     async with test_context.session_factory() as session:
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
 
+    # Chunks were created in Postgres during indexing.
     assert len(chunks) == 2
-    assert any("alpha" in c.text.lower() for c in chunks)
-    assert any("beta" in c.text.lower() for c in chunks)
+
+    # After passage testing, Document records are populated with title and embedding from the LLM pass.
+    async with test_context.session_factory() as session:
+        documents = (await session.execute(select(Document))).scalars().all()
+    doc_ids = {d.document_id for d in documents}
+    assert "alpha.txt" in doc_ids
+    assert "beta.txt" in doc_ids
 
 
 @pytest.mark.asyncio

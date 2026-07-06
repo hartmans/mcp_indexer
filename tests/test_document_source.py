@@ -111,7 +111,7 @@ def test_result_info_includes_chunk_lengths():
         collection_id="col1",
         document_id="doc1",
         order=0,
-        chunk_id="chunk1",
+        chunk_id="doc1?c=0",
         text="hello world",
         embedding=[0.0] * VECTOR_DIMENSIONS,
         summary_span=None,
@@ -128,7 +128,7 @@ def test_result_info_includes_chunk_lengths():
             "summary": "Document summary",
             "relevant_chunks": [
                 {
-                    "chunk_id": "col1:doc1:chunk1",
+                    "chunk_id": "col1:doc1?c=0",
                     "summary": None,
                     "semantic_length": 32,
                     "embedding_length": 11,

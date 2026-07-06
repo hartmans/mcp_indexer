@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,11 +19,36 @@ from mcp_indexer.plugins.base import DocumentSource, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
 
+def normalize_keywords(keywords: str | list[str]) -> list[str]:
+    """
+    Maps a string or list of keywords to a sorted list of normalized keywords.
+    Ignores whitespace in strings, splits on commas, lowercases,
+    replaces '_' with '-', and validates against /[-a-z0-9.]+/ .
+    """
+    if isinstance(keywords, str):
+        # Ignore whitespace and split on comma
+        raw_list = keywords.replace(" ", "").split(",") if keywords else []
+    elif isinstance(keywords, list):
+        raw_list = keywords
+    else:
+        return []
+
+    normalized = set()
+    for k in raw_list:
+        k = k.strip().lower().replace("_", "-")
+        if not k:
+            continue
+        # Confirm it matches /[-a-z0-9.]+/
+        if re.fullmatch(r"[-a-z0-9.]+", k):
+            normalized.add(k)
+
+    return sorted(list(normalized))
+
+
 INDEXING_WORKERS = 8
 MONITOR_INTERVAL_SECONDS = 30.0
 MONITOR_STALL_THRESHOLD_SECONDS = 40.0
 DEBUG_STATS_FILENAME = "indexer-stats.jsonl"
-
 
 def monitor_time() -> float:
     import time
@@ -232,6 +258,22 @@ class Indexer:
         if not pending_document_ids:
             return
 
+        # Check which of these documents have an empty summary.
+        needs_doc_summary: set[str] = set()
+        async with self.context.get_session() as session:
+            doc_stmt = (
+                select(Document.document_id)
+                .where(
+                    Document.collection_id == collection_id,
+                    Document.document_id.in_(pending_document_ids),
+                    Document.summary == "",
+                )
+            )
+            if failed_docs:
+                doc_stmt = doc_stmt.where(Document.document_id.not_in(failed_docs))
+            result = await session.execute(doc_stmt)
+            needs_doc_summary = set(result.scalars().all())
+
         tasks = []
         for document_id in pending_document_ids:
             stats = DocumentIndexingStats(
@@ -245,6 +287,16 @@ class Indexer:
             )
 
         await asyncio.gather(*tasks)
+
+        # After chunk-level summaries are done, summarize the document itself.
+        for document_id in needs_doc_summary:
+            stats = DocumentIndexingStats(
+                document_id=document_id, operation="document_summary", source=source
+            )
+            await self._schedule_unbounded_document_task(
+                self.summarize_document(source, document_id),
+                stats,
+            )
 
     async def summarize_documents_collection(self, source: DocumentSource):
         # Get set of failed document_ids to skip
@@ -559,9 +611,10 @@ class Indexer:
                     extracted_title = title_part
                     # Don't include this line in the stored summary
                     continue
-            # Keywords line is currently discarded (reorganization pending)
+            # Extract keywords line
             if stripped.lower().startswith("keywords:"):
-                # Discard this line for now
+                kw_part = stripped[9:].strip() # After "keywords:"
+                extracted_keywords = normalize_keywords(kw_part)
                 continue
             filtered_lines.append(line)
 
