@@ -14,7 +14,8 @@ from .server import result_info
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive search client")
-    parser.add_argument("--config", required=True, help="Path to the config TOML file")
+    parser.add_argument("--config", required=True, nargs="+", metavar="PATH",
+                        help="One or more config TOML files (merged in order; last wins)")
     parser.add_argument("collection_id", help="Collection to search")
     parser.add_argument("--limit", type=int, default=5, help="Maximum number of results")
     parser.add_argument(
