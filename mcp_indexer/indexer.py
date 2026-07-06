@@ -982,7 +982,8 @@ async def main():
     parser = argparse.ArgumentParser(
         description="SQLAlchemy PostgreSQL Indexer CLI"
     )
-    parser.add_argument("--config", required=True, help="Path to the config TOML file")
+    parser.add_argument("-c", "--config", action="append", default=[],
+                        metavar="PATH", help="Config TOML file (repeatable; last wins)")
     parser.add_argument(
         "--debug",
         action="store_true",
