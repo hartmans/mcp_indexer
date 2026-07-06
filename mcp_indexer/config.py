@@ -52,12 +52,35 @@ class CollectionConfig(CollectionInfraConfig):
 
 class ConfigManager:
     """
-    Handles loading and resolving configuration from a TOML file.
+    Handles loading and resolving configuration from one or more TOML files.
+    Files are deep-merged in order (later files win on leaf-level collisions).
+    The merged result is stored as _raw_config before any semantic layer begins.
     """
 
-    def __init__(self, config_path: str):
-        with open(config_path, "rb") as f:
-            self._raw_config = tomllib.load(f)
+    def __init__(self, config_paths: str | list[str]):
+        if isinstance(config_paths, str):
+            config_paths = [config_paths]
+        merged: dict = {}
+        for path in config_paths:
+            with open(path, "rb") as f:
+                loaded = tomllib.load(f)
+            merged = ConfigManager._deep_merge(merged, loaded)
+        self._raw_config = merged
+
+    @staticmethod
+    def _deep_merge(base: dict, override: dict) -> dict:
+        """Recursively merge *override* into *base*, returning a new dict.
+
+        When both base and override have the same key with dict values, recurse.
+        Otherwise override wins.
+        """
+        result = base.copy()
+        for k, v in override.items():
+            if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = ConfigManager._deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
 
     def get_server_config(self) -> ServerConfig:
         """Returns the [server] section as a validated ServerConfig."""

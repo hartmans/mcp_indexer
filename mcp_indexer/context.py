@@ -31,7 +31,7 @@ class Context:
     collections: dict[str, "DocumentSource"] = field(default_factory=dict)
 
     @staticmethod
-    def build_context(config_path: str) -> "Context":
+    def build_context(config_path: str | list[str]) -> "Context":
         """
         Builds a Context object from a configuration file.
         """
