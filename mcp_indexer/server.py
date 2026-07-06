@@ -381,8 +381,8 @@ async def _build_server(config_path: str):
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the MCP document indexer server")
-    parser.add_argument("--config", required=True, nargs="+", metavar="PATH",
-                        help="One or more config TOML files (merged in order; last wins)")
+    parser.add_argument("-c", "--config", action="append", default=[],
+                        metavar="PATH", help="Config TOML file (repeatable; last wins)")
     return parser
 
 

@@ -60,6 +60,8 @@ class ConfigManager:
     def __init__(self, config_paths: str | list[str]):
         if isinstance(config_paths, str):
             config_paths = [config_paths]
+        if not config_paths:
+            raise ValueError("At least one config file path is required")
         merged: dict = {}
         for path in config_paths:
             with open(path, "rb") as f:
