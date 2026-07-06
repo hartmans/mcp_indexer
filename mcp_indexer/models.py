@@ -89,8 +89,12 @@ class Document(Base):
     last_modified: Mapped[datetime]
 
     # Relationships - cascade merge to handle upsert of chunks atomically
+    # The chunks relationship is ordered by `order` so queries return chunks sorted.
     chunks: Mapped[List[DocumentChunk]] = relationship(
-        back_populates="document", cascade="all, delete-orphan", overlaps="summary"
+        back_populates="document",
+        cascade="all, delete-orphan",
+        overlaps="summary",
+        order_by="DocumentChunk.order",
     )
 
     __table_args__ = (

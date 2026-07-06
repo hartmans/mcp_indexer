@@ -544,16 +544,45 @@ class Indexer:
             )
             doc_summary = doc_summary_list[0]
 
-        doc_vector = (await self.context.embedding([doc_summary]))[0]
+        # Extract title and keywords from the summary if present.
+        summary_lines = doc_summary.splitlines()
+        extracted_title: str | None = None
+        extracted_keywords: list[str] = []
+        filtered_lines: list[str] = []
+
+        for line in summary_lines:
+            stripped = line.strip()
+            # Check for "title:" line (case-insensitive)
+            if stripped.lower().startswith("title:") and extracted_title is None:
+                title_part = stripped[6:].strip()  # After "title:"
+                if title_part:
+                    extracted_title = title_part
+                    # Don't include this line in the stored summary
+                    continue
+            # Keywords line is currently discarded (reorganization pending)
+            if stripped.lower().startswith("keywords:"):
+                # Discard this line for now
+                continue
+            filtered_lines.append(line)
+
+        # Rebuild the summary without the extracted lines
+        final_summary = "\n".join(filtered_lines).strip()
+
+        doc_vector = (await self.context.embedding([final_summary]))[0]
+
+        # Use extracted title if found, otherwise fall back to metadata
+        title = extracted_title if extracted_title else metadata_dict.get("title", "Untitled")
+        title_strength = 9 if extracted_title else int(metadata_dict.get("title_strength", 0))
+
         doc_record = Document(
             collection_id=source.id,
             document_id=document_id,
-            title=metadata_dict.get("title", "Untitled"),
-            title_strength=int(metadata_dict.get("title_strength", 0)),
+            title=title,
+            title_strength=title_strength,
             last_modified=pointer.last_modified,
-            summary=doc_summary,
+            summary=final_summary,
             embedding=doc_vector,
-            keywords=metadata_dict.get("keywords", []),
+            keywords=extracted_keywords if extracted_keywords else metadata_dict.get("keywords", []),
         )
 
         await self._update_document(source, doc_record)

@@ -18,6 +18,7 @@ podman create  \
     --name "$CONTAINER_NAME" \
     -v "$DATA_DIR:/var/lib/postgresql/:Z" \
     -v "$SOCKET_DIR:/var/run/postgresql:Z" \
+    --shm-size=10G \
     -e POSTGRES_DB=indexer \
     -e POSTGRES_USER=indexer \
     -e POSTGRES_PASSWORD=indexer \

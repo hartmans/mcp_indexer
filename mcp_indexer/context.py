@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, AsyncIterator
+from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
@@ -12,6 +12,9 @@ from mcp_indexer.models import Base
 
 # Global registry for DocumentSource plugins
 SOURCE_REGISTRY: dict[str, type] = {}
+
+if TYPE_CHECKING:
+    from .plugins.base import DocumentSource
 
 
 @dataclass
@@ -136,4 +139,3 @@ class Context:
             await conn.run_sync(Base.metadata.create_all)
 
 
-from .plugins.base import DocumentSource

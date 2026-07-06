@@ -1,10 +1,13 @@
 from datetime import datetime
+import json
 from typing import Any, AsyncGenerator
 
 import pytest
 
-from mcp_indexer.context import Context
+from mcp_indexer.models import Document, DocumentChunk
+from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.plugins.base import ChunkInfo, DocumentPointer, DocumentSource, create_embedding_chunks
+from mcp_indexer.server import result_info
 
 
 class MockDocumentPointer(DocumentPointer):
@@ -72,6 +75,67 @@ def test_create_embedding_chunks_small_tail():
     results = create_embedding_chunks({"id": "1"}, ["Short"], 10, 20)
     assert len(results) == 1
     assert results[0] == ({"id": "1", "o": 0, "s": 5}, "Short")
+
+
+def test_document_source_chunk_lengths_for_semantic_chunk():
+    source = MockDocumentSource("col1", object(), object(), {})
+
+    semantic_length, embedding_length = source.chunk_lengths({"b": 10, "e": 42})
+
+    assert semantic_length == 32
+    assert embedding_length is None
+
+
+def test_document_source_chunk_lengths_for_embedding_chunk():
+    source = MockDocumentSource("col1", object(), object(), {})
+
+    semantic_length, embedding_length = source.chunk_lengths({"b": 10, "e": 42, "o": 5, "s": 11})
+
+    assert semantic_length == 32
+    assert embedding_length == 11
+
+
+def test_result_info_includes_chunk_lengths():
+    source = MockDocumentSource("col1", object(), object(), {})
+    document = Document(
+        collection_id="col1",
+        document_id="doc1",
+        title="Title 1",
+        title_strength=0,
+        embedding=[0.0] * VECTOR_DIMENSIONS,
+        keywords=["alpha"],
+        summary="Document summary",
+        last_modified=datetime.now(),
+    )
+    chunk = DocumentChunk(
+        collection_id="col1",
+        document_id="doc1",
+        order=0,
+        chunk_id="chunk1",
+        text="hello world",
+        embedding=[0.0] * VECTOR_DIMENSIONS,
+        summary_span=None,
+        metadata_str=json.dumps({"b": 10, "e": 42, "o": 5, "s": 11}),
+    )
+
+    formatted = result_info([(document, [chunk])], {"col1": source})
+
+    assert formatted == [
+        {
+            "title": "Title 1",
+            "keywords": ["alpha"],
+            "document_id": "col1:doc1",
+            "summary": "Document summary",
+            "relevant_chunks": [
+                {
+                    "chunk_id": "col1:doc1:chunk1",
+                    "summary": None,
+                    "semantic_length": 32,
+                    "embedding_length": 11,
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.asyncio
