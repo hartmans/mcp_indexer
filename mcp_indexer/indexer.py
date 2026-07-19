@@ -255,17 +255,14 @@ class Indexer:
             result = await session.execute(stmt)
             pending_document_ids = result.scalars().all()
 
-        if not pending_document_ids:
-            return
 
-        # Check which of these documents have an empty summary.
-        needs_doc_summary: set[str] = set()
-        async with self.context.get_session() as session:
+            # Check which documents have an empty summary.
+            needs_doc_summary: set[str] = set()
             doc_stmt = (
                 select(Document.document_id)
                 .where(
                     Document.collection_id == collection_id,
-                    Document.document_id.in_(pending_document_ids),
+                    Document.document_id.in_(document_ids),
                     Document.summary == "",
                 )
             )
@@ -287,16 +284,20 @@ class Indexer:
             )
 
         await asyncio.gather(*tasks)
+        tasks = []
 
         # After chunk-level summaries are done, summarize the document itself.
         for document_id in needs_doc_summary:
             stats = DocumentIndexingStats(
                 document_id=document_id, operation="document_summary", source=source
             )
-            await self._schedule_unbounded_document_task(
+            tasks.append(
+                self._schedule_unbounded_document_task(
                 self.summarize_document(source, document_id),
                 stats,
-            )
+            ))
+
+        await asyncio.gather(*tasks)
 
     async def summarize_documents_collection(self, source: DocumentSource):
         # Get set of failed document_ids to skip

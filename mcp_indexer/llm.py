@@ -26,13 +26,18 @@ class BatchCall:
         self.batch_timeout = batch_timeout
         self.queue: asyncio.Queue = asyncio.Queue()
         self.buffer: List[Tuple[int, str, int]] = []
-        self._worker_task = asyncio.create_task(self._queue_worker())
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def _ensure_worker_task(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._queue_worker())
 
     async def __call__(self, prompts: List[str]) -> List[Any]:
         if not prompts:
             return []
 
-        future = asyncio.get_event_loop().create_future()
+        self._ensure_worker_task()
+        future = asyncio.get_running_loop().create_future()
         await self.queue.put((future, prompts))
         
         try:

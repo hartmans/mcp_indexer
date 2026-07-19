@@ -21,7 +21,12 @@ logger = logging.getLogger(__name__)
 FULL_DOCUMENT_LENGTH = 10_000
 
 
-mcp = FastMCP("LanceDB Indexer")
+def _create_server(*, host: str = "localhost", port: int | None = None) -> FastMCP:
+    server_kwargs: dict[str, Any] = {}
+    if port is not None:
+        server_kwargs["host"] = host
+        server_kwargs["port"] = port
+    return FastMCP("LanceDB Indexer", **server_kwargs)
 
 
 def result_info(
@@ -373,24 +378,49 @@ def build_all_tools(server: FastMCP, *, context: Context) -> None:
         )
 
 
-async def _build_server(config_path: str):
+async def _build_server(
+    config_path: str | list[str], *, host: str = "localhost", port: int | None = None
+) -> FastMCP:
     context = Context.build_context(config_path)
     await context.build_collections()
+    mcp = _create_server(host=host, port=port)
     build_all_tools(mcp, context=context)
+    return mcp
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the MCP document indexer server")
-    parser.add_argument("-c", "--config", action="append", default=[],
-                        metavar="PATH", help="Config TOML file (repeatable; last wins)")
+    parser.add_argument(
+        "-c",
+        "--config",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Config TOML file (repeatable; last wins)",
+    )
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Host to bind the HTTP MCP server to (default: localhost)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Run as a streamable HTTP MCP server on this port instead of stdio",
+    )
     return parser
+
+
+def _transport_for_args(args: argparse.Namespace) -> Literal["stdio", "streamable-http"]:
+    return "streamable-http" if args.port is not None else "stdio"
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = _build_parser().parse_args()
-    asyncio.run(_build_server(args.config))
-    mcp.run()
+    mcp = asyncio.run(_build_server(args.config, host=args.host, port=args.port))
+    mcp.run(transport=_transport_for_args(args))
 
 
 if __name__ == "__main__":

@@ -107,6 +107,31 @@ async def test_llm_single_request(mock_llm_factory):
     assert mock_llm_factory.calls[0] == ["Hello"]
 
 @pytest.mark.asyncio
+async def test_llm_worker_starts_lazily(mock_llm_factory):
+    caller = LlmCall(model="test", batch_timeout=0.05)
+
+    assert caller._worker_task is None
+
+    res = await caller(["Hello"])
+
+    assert res == ["Response to Hello"]
+    assert caller._worker_task is not None
+    assert not caller._worker_task.done()
+
+@pytest.mark.asyncio
+async def test_embedding_worker_starts_lazily(mock_emb_factory):
+    caller = EmbeddingCall(model="test", batch_timeout=0.05)
+
+    assert caller._worker_task is None
+
+    res = await caller(["Hello"])
+
+    assert len(res) == 1
+    assert res[0] == [0.1] * VECTOR_DIMENSIONS
+    assert caller._worker_task is not None
+    assert not caller._worker_task.done()
+
+@pytest.mark.asyncio
 async def test_llm_batch_split(mock_llm_factory):
     caller = LlmCall(model="test", batch_timeout=0.05)
     # Request 15 prompts -> should split into 10 and 5
