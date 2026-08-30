@@ -86,6 +86,21 @@ def test_document_source_chunk_lengths_for_semantic_chunk():
     assert embedding_length is None
 
 
+def test_document_source_reranker_defaults_to_none_and_can_be_supplied():
+    reranker = object()
+
+    default_source = DocumentSource("default", context=object(), collection_config=object())
+    reranked_source = DocumentSource(
+        "reranked",
+        context=object(),
+        collection_config=object(),
+        reranker=reranker,
+    )
+
+    assert default_source.reranker is None
+    assert reranked_source.reranker is reranker
+
+
 def test_document_source_chunk_lengths_for_embedding_chunk():
     source = MockDocumentSource("col1", object(), object(), {})
 

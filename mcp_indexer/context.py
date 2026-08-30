@@ -100,6 +100,8 @@ class Context:
         """
         import mcp_indexer.plugins  # noqa: F401
 
+        reranker = None
+
         for collection_id in self.config.list_collections():
             col_config = self.config.get_collection_config(collection_id)
 
@@ -115,11 +117,19 @@ class Context:
                     f"No DocumentSource plugin registered for prefix '{prefix}' (collection '{collection_id}')."
                 )
 
-            self.collections[collection_id] = cls(
+            if col_config.rerank:
+                if reranker is None:
+                    from mcp_indexer.rerank import QwenReranker
+
+                    reranker = QwenReranker()
+                    await reranker.setup()
+            source = cls(
                 collection_id=collection_id,
                 context=self,
                 collection_config=col_config,
+                reranker=reranker if col_config.rerank else None,
             )
+            self.collections[collection_id] = source
 
     @asynccontextmanager
     async def get_session(self) -> AsyncGenerator[AsyncSession, None]:
@@ -139,4 +149,3 @@ class Context:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             # Create all tables
             await conn.run_sync(Base.metadata.create_all)
-

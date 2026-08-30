@@ -26,6 +26,7 @@ api_key = "empty"
 doc_summary_prompt = "Summarize the following document concisely..."
 chunk_summary_prompt = "Summarize the following text chunk concisely..."
 embedding_model = "Qwen/Qwen3-Embedding-4B"
+rerank = false
 
 [collections.my_docs]
 tool_prefix = "docs"

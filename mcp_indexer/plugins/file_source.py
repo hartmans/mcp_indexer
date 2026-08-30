@@ -58,8 +58,13 @@ class FileSource(DocumentSource[P]):
     semantic_boundary_regexps: tuple[bytes, ...] = ()
     embedding_boundary_regexps: tuple[bytes, ...] = (rb"\n\s*\n",)
 
-    def __init__(self, collection_id: str, *, context, collection_config):
-        super().__init__(collection_id, context=context, collection_config=collection_config)
+    def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
+        super().__init__(
+            collection_id,
+            context=context,
+            collection_config=collection_config,
+            reranker=reranker,
+        )
         self.source_config = collection_config.resolve_source_config(FileSourceConfig)
 
     def _is_included(self, path: Path) -> bool:

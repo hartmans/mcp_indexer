@@ -44,8 +44,13 @@ class TextFileSource(FileSource[TextFilePointer]):
         rb"\n\s*-{3,}\s*\n",     # MD/RST Horizontal rules
     )
 
-    def __init__(self, collection_id: str, *, context, collection_config):
-        super().__init__(collection_id, context=context, collection_config=collection_config)
+    def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
+        super().__init__(
+            collection_id,
+            context=context,
+            collection_config=collection_config,
+            reranker=reranker,
+        )
         # Resolve the specific TextFileSourceConfig
         self.source_config = collection_config.resolve_source_config(TextFileSourceConfig)
 

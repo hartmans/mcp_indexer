@@ -31,6 +31,7 @@ class CollectionInfraConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
     doc_summary_prompt: str = "Summarize the following document concisely..."
     chunk_summary_prompt: str = ""
+    rerank: bool = False
     
 class CollectionConfig(CollectionInfraConfig):
     """

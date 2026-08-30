@@ -821,8 +821,10 @@ class Indexer:
         chunk_candidate_limit: int | None = None,
     ):
         query_vector = await self.context.embedding.query(query)
-        document_candidate_limit = document_candidate_limit or limit
-        chunk_candidate_limit = chunk_candidate_limit or limit
+        source = self.context.collections[collection_id]
+        reranker = getattr(source, "reranker", None)
+        document_candidate_limit = document_candidate_limit or limit * 4
+        chunk_candidate_limit = chunk_candidate_limit or limit * 4
 
         document_distance = Document.embedding.cosine_distance(query_vector)
         chunk_distance = DocumentChunk.embedding.cosine_distance(query_vector)
@@ -917,18 +919,79 @@ class Indexer:
         )
 
         async with self.context.get_session() as session:
-            result = await session.execute(
-                select(
-                    grouped_hits.c.collection_id,
-                    grouped_hits.c.document_id,
-                    grouped_hits.c.chunk_id,
+            if reranker is None:
+                result = await session.execute(
+                    select(
+                        grouped_hits.c.collection_id,
+                        grouped_hits.c.document_id,
+                        grouped_hits.c.chunk_id,
+                    )
+                    .order_by(
+                        grouped_hits.c.document_group_rank,
+                        grouped_hits.c.hit_rank,
+                    )
                 )
-                .order_by(
-                    grouped_hits.c.document_group_rank,
-                    grouped_hits.c.hit_rank,
+                ranked_hits = result.mappings().all()
+            else:
+                candidate_result = await session.execute(
+                    select(
+                        candidate_hits.c.collection_id,
+                        candidate_hits.c.document_id,
+                        candidate_hits.c.chunk_id,
+                        candidate_hits.c.distance,
+                    ).order_by(
+                        candidate_hits.c.distance,
+                        candidate_hits.c.document_id,
+                        candidate_hits.c.chunk_id.asc().nullsfirst(),
+                    )
                 )
-            )
-            ranked_hits = result.mappings().all()
+                candidate_rows = candidate_result.mappings().all()
+                if not candidate_rows:
+                    return []
+
+                candidate_document_ids = {
+                    row["document_id"] for row in candidate_rows
+                }
+                candidate_document_result = await session.execute(
+                    select(Document)
+                    .where(
+                        Document.collection_id == collection_id,
+                        Document.document_id.in_(candidate_document_ids),
+                    )
+                    .options(selectinload(Document.chunks))
+                )
+                candidate_documents = {
+                    document.document_id: document
+                    for document in candidate_document_result.scalars().unique().all()
+                }
+                candidate_chunks = {
+                    chunk.chunk_id: chunk
+                    for document in candidate_documents.values()
+                    for chunk in document.chunks
+                }
+
+                rerank_documents = []
+                for row in candidate_rows:
+                    document = candidate_documents[row["document_id"]]
+                    chunk_id = row["chunk_id"]
+                    if chunk_id is None:
+                        text = document.summary
+                    else:
+                        chunk = candidate_chunks[chunk_id]
+                        text = await source.fetch_chunk(
+                            document_id=document.document_id,
+                            chunk_metadata=dict(chunk.metadata_dict),
+                            scope="embedding",
+                        )
+                    rerank_documents.append(f"Title: {document.title}\n\n{text}")
+
+                reranked = await reranker.score(
+                    query,
+                    rerank_documents,
+                    top_n=limit,
+                )
+                ranked_hits = [candidate_rows[index] for index, _score in reranked]
+
             if not ranked_hits:
                 return []
 

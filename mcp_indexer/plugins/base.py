@@ -7,6 +7,7 @@ from ..context import SOURCE_REGISTRY
 if TYPE_CHECKING:
     from ..config import CollectionConfig
     from ..context import Context
+    from ..rerank import AbstractReranker
 
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
@@ -68,12 +69,20 @@ p = TypeVar("p", bound=DocumentPointer)
 class DocumentSource(Generic[p]):
     """An abstract plugin representing a source of documents."""
 
+    reranker: "AbstractReranker | None"
+
     def __init__(
-        self, collection_id: str, *, context: "Context", collection_config: "CollectionConfig"
+        self,
+        collection_id: str,
+        *,
+        context: "Context",
+        collection_config: "CollectionConfig",
+        reranker: "AbstractReranker | None" = None,
     ):
         self.context = context
         self.config = collection_config
         self.id = collection_id
+        self.reranker = reranker
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

@@ -14,6 +14,31 @@ def test_batch_concurrency_defaults(tmp_path):
     assert server.embedding_max_batch_size == 64
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("false", False),
+        ("yes", True),
+        ("no", False),
+    ],
+)
+def test_collection_rerank_boolean_values(configured, expected):
+    from mcp_indexer.config import CollectionConfig
+
+    config = CollectionConfig.model_validate(
+        {
+            "collection_id": "docs",
+            "tool_prefix": "docs",
+            "rerank": configured,
+        }
+    )
+
+    assert config.rerank is expected
+
+
 class TestDeepMerge:
     def test_deep_merge_dicts(self):
         base = {"a": 1, "b": {"x": 10, "y": 20}, "c": [1, 2]}
