@@ -40,6 +40,7 @@ class Context:
 
         llm_call = LlmCall(
             batch_size=server_config.llm_batch_size,
+            max_batch_size=server_config.llm_max_batch_size,
             request_timeout=server_config.llm_request_timeout,
             timeout_retries=server_config.llm_timeout_retries,
             **server_config.llm,
@@ -49,6 +50,7 @@ class Context:
             embedding_config["provider"] = embedding_config.pop("model_provider")
         embedding_call = EmbeddingCall(
             batch_size=server_config.embedding_batch_size,
+            max_batch_size=server_config.embedding_max_batch_size,
             request_timeout=server_config.embedding_request_timeout,
             timeout_retries=server_config.embedding_timeout_retries,
             **embedding_config,
@@ -137,5 +139,4 @@ class Context:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             # Create all tables
             await conn.run_sync(Base.metadata.create_all)
-
 

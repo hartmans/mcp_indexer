@@ -45,7 +45,7 @@ def normalize_keywords(keywords: str | list[str]) -> list[str]:
     return sorted(list(normalized))
 
 
-INDEXING_WORKERS = 8
+INDEXING_WORKERS = 64
 MONITOR_INTERVAL_SECONDS = 30.0
 MONITOR_STALL_THRESHOLD_SECONDS = 40.0
 DEBUG_STATS_FILENAME = "indexer-stats.jsonl"

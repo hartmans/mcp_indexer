@@ -229,6 +229,37 @@ async def test_openai_embedding_disables_langchain_token_id_path(mock_emb_factor
     EmbeddingCall(model="test", provider="openai")
     assert mock_emb_factory.factory_calls[-1]["check_embedding_ctx_length"] is False
 
+
+@pytest.mark.asyncio
+async def test_batch_call_limits_outstanding_calls(mock_llm_factory, monkeypatch):
+    caller = LlmCall(model="test", batch_timeout=0.01, max_batch_size=1)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    call_count = 0
+
+    async def execute(prompts):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            first_started.set()
+            await release_first.wait()
+        return [MockMessage(content=f"Response to {prompt}") for prompt in prompts]
+
+    monkeypatch.setattr(caller, "_execute_batch", execute)
+    first = asyncio.create_task(caller(["first"]))
+    await first_started.wait()
+    second = asyncio.create_task(caller(["second"]))
+    await asyncio.sleep(0.02)
+
+    assert caller.queue.empty()
+    assert not second.done()
+
+    release_first.set()
+    assert await asyncio.gather(first, second) == [
+        ["Response to first"],
+        ["Response to second"],
+    ]
+
 @pytest.mark.asyncio
 async def test_openai_embedding_prefix_disables_langchain_token_id_path(mock_emb_factory):
     EmbeddingCall(model="openai:test")

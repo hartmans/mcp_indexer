@@ -4,6 +4,16 @@ from pathlib import Path
 from mcp_indexer.config import ConfigManager
 
 
+def test_batch_concurrency_defaults(tmp_path):
+    conf_file = Path(tmp_path) / "empty.toml"
+    conf_file.write_text("")
+
+    server = ConfigManager(str(conf_file)).get_server_config()
+
+    assert server.llm_max_batch_size == 8
+    assert server.embedding_max_batch_size == 64
+
+
 class TestDeepMerge:
     def test_deep_merge_dicts(self):
         base = {"a": 1, "b": {"x": 10, "y": 20}, "c": [1, 2]}

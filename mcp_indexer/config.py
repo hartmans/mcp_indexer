@@ -16,6 +16,8 @@ class ServerConfig(BaseModel):
     max_to_summarize: int = 65536
     llm_batch_size: int = 10
     embedding_batch_size: int = 10
+    llm_max_batch_size: int = 8
+    embedding_max_batch_size: int = 64
     llm_request_timeout: float | None = 400.0
     embedding_request_timeout: float | None = 400.0
     llm_timeout_retries: int = 20

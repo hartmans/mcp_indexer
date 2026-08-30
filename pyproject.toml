@@ -1,2 +1,41 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-indexer"
+version = "0.1.0"
+description = "An MCP server for indexing and retrieving document collections"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+dependencies = [
+    "lancedb",
+    "pydantic",
+    "mcp",
+    "openai",
+    "langchain",
+    "langgraph",
+    "pgvector",
+    "sqlalchemy",
+    "psycopg[binary]",
+    "langchain-openai",
+    "langchain-ollama",
+]
+
+[project.optional-dependencies]
+rerank = [
+    "accelerate",
+    "bitsandbytes",
+    "torch",
+    "transformers>=4.51",
+]
+test = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+include = ["mcp_indexer*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

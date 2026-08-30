@@ -20,10 +20,12 @@ class BatchCall:
         model: Any,
         batch_size: int = 10,
         batch_timeout: float = 3.0,
+        max_batch_size: int = 8,
     ):
         self.model = model
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
+        self.semaphore = asyncio.Semaphore(max_batch_size)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.buffer: List[Tuple[int, str, int]] = []
         self._worker_task: Optional[asyncio.Task] = None
@@ -33,17 +35,18 @@ class BatchCall:
             self._worker_task = asyncio.create_task(self._queue_worker())
 
     async def __call__(self, prompts: List[str]) -> List[Any]:
-        if not prompts:
-            return []
+        async with self.semaphore:
+            if not prompts:
+                return []
 
-        self._ensure_worker_task()
-        future = asyncio.get_running_loop().create_future()
-        await self.queue.put((future, prompts))
-        
-        try:
-            return await future
-        except asyncio.CancelledError:
-            raise
+            self._ensure_worker_task()
+            future = asyncio.get_running_loop().create_future()
+            await self.queue.put((future, prompts))
+
+            try:
+                return await future
+            except asyncio.CancelledError:
+                raise
 
     async def _queue_worker(self):
         pending_requests: Dict[int, Dict[str, Any]] = {}
@@ -127,6 +130,7 @@ class LlmCall(BatchCall):
         self,
         batch_size: int = 10,
         batch_timeout: float = 0.25,
+        max_batch_size: int = 8,
         request_timeout: Optional[float] = 400.0,
         timeout_retries: int = 20,
         **kwargs,
@@ -134,7 +138,12 @@ class LlmCall(BatchCall):
         kwargs.setdefault("timeout", request_timeout)
         kwargs.setdefault("max_retries", timeout_retries)
         llm = init_chat_model(**kwargs).with_retry(stop_after_attempt=3)
-        super().__init__(llm, batch_size=batch_size, batch_timeout=batch_timeout)
+        super().__init__(
+            llm,
+            batch_size=batch_size,
+            batch_timeout=batch_timeout,
+            max_batch_size=max_batch_size,
+        )
 
     async def _execute_batch(self, prompts: List[str|list[dict]]) -> List[Any]:
         print('sending request: '+str(len(prompts)))
@@ -153,6 +162,7 @@ class EmbeddingCall(BatchCall):
         dimensions: int = VECTOR_DIMENSIONS,
         batch_size: int = 10,
         batch_timeout: float = 0.25,
+        max_batch_size: int = 64,
         request_timeout: Optional[float] = 400.0,
         timeout_retries: int = 20,
         **kwargs,
@@ -170,7 +180,12 @@ class EmbeddingCall(BatchCall):
             # such as vLLM need raw strings unless their tokenizer is identical.
             kwargs["check_embedding_ctx_length"] = False
         embeddings = init_embeddings(**kwargs)
-        super().__init__(embeddings, batch_size=batch_size, batch_timeout=batch_timeout)
+        super().__init__(
+            embeddings,
+            batch_size=batch_size,
+            batch_timeout=batch_timeout,
+            max_batch_size=max_batch_size,
+        )
 
     async def query(self, text: str, dimensions: Optional[int] = None) -> List[float]:
         dims = dimensions if dimensions is not None else self.dimensions
