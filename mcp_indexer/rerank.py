@@ -11,11 +11,21 @@ RerankResult: TypeAlias = tuple[int, float]
 
 
 class AbstractReranker(ABC):
-    """Interface for allocating and invoking a reranker."""
+    """Interface for allocating and invoking a reranker.
+
+    Enabled collections share one instance so its scoring semaphore limits
+    concurrent calls across collections. Construction must not load the model;
+    search calls setup on first use and awaits it before scoring.
+    """
 
     @abstractmethod
     async def setup(self) -> None:
-        """Download the model, allocate its resources, and make it ready."""
+        """Download the model, allocate its resources, and make it ready.
+
+        Must be idempotent and coordinate concurrent callers: simultaneous
+        first searches must initialize the shared model only once. Subsequent
+        calls after successful initialization must reuse the allocated model.
+        """
 
     @abstractmethod
     async def score(
