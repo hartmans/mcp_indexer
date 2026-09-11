@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from ..config import CollectionConfig
     from ..context import Context
     from ..rerank import AbstractReranker
+    from ..search import SearchHit
 
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
@@ -98,6 +99,17 @@ class DocumentSource(Generic[p]):
 
     async def get_document_summary(self, document_id: str) -> str:
         return ""
+
+    async def native_search(
+        self, query: str, *, document_limit: int, chunk_limit: int
+    ) -> list["SearchHit"]:
+        """Return ranked document and embedding-chunk hits, documents first.
+
+        Limits apply separately to each hit type. Chunk metadata uses the same
+        retrieval convention as get_chunks/fetch_chunk, even before indexing.
+        Scores are meaningful within each ranked list only.
+        """
+        return []
 
     def chunk_lengths(
         self, chunk_metadata: dict[str, Any]

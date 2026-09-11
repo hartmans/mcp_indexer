@@ -9,6 +9,7 @@ import yaml
 
 from .context import Context
 from .indexer import Indexer
+from .search import search
 from .server import result_info
 
 
@@ -57,7 +58,8 @@ async def run_repl(args: argparse.Namespace) -> None:
         if query in {"quit", "exit"}:
             break
 
-        results = await indexer.search(
+        results = await search(
+            indexer,
             args.collection_id,
             query,
             limit=args.limit,

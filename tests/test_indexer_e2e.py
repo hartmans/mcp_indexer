@@ -3,6 +3,7 @@ import pytest
 
 from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.indexer import Indexer
+from mcp_indexer.search import search
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.plugins.text_source import TextFileSource
 from sqlalchemy import select
@@ -135,6 +136,15 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
     doc_ids = {d.document_id for d in documents}
     assert "alpha.txt" in doc_ids
     assert "beta.txt" in doc_ids
+
+    # Search must prepare summaries before hydrating its response, including
+    # when indexing left documents without summaries.
+    results = await search(indexer, "notes", "alpha", limit=2)
+    assert results
+    assert any(chunks for _, chunks in results)
+    for document, chunks in results:
+        assert document.summary
+        assert all(chunk.summary and chunk.summary.summary for chunk in chunks)
 
 
 @pytest.mark.asyncio

@@ -1,208 +1,95 @@
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from contextlib import asynccontextmanager
 
-from mcp_indexer.indexer import Indexer
-from mcp_indexer.models import Document, DocumentChunk
+import pytest
 
-
-class FakeMappingsResult:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def mappings(self):
-        return self
-
-    def all(self):
-        return self.rows
+from mcp_indexer import search as searching
+from mcp_indexer.search import DocumentHit, ChunkHit
 
 
-class FakeScalarsResult:
-    def __init__(self, rows):
-        self.rows = rows
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_search_selection_with_and_without_reranking(monkeypatch, enabled):
+    hits = [DocumentHit("first", 0.9, "First summary"),
+            ChunkHit("second", {"o": 0, "s": 10}, 0.8, "second?c=0")]
+    events = []
 
-    def scalars(self):
-        return self
+    class Reranker:
+        async def setup(self):
+            events.append("setup")
 
-    def unique(self):
-        return self
+        async def score(self, query, documents, top_n):
+            assert query == "rerank question"
+            assert documents == ["First summary", "Second passage"]
+            assert top_n == 1
+            events.append("score")
+            return [(1, 0.95)]
 
-    def all(self):
-        return self.rows
+    async def fetch(document_id, metadata, scope):
+        assert scope == "embedding"
+        return "Second passage"
 
+    async def native(*args, **kwargs):
+        return []
 
-class FakeSession:
-    def __init__(self, results):
-        self.results = iter(results)
+    source = SimpleNamespace(id="test", reranker=Reranker() if enabled else None,
+                             fetch_chunk=fetch, native_search=native)
+    indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": source}))
 
-    async def execute(self, statement):
-        del statement
-        return next(self.results)
+    async def vector(*args):
+        return hits
 
+    async def assemble(indexer, collection, selected):
+        return selected
 
-class FakeEmbedding:
-    async def query(self, query):
-        assert query == "find relevant text"
-        return [0.0] * 768
-
-
-class FakeReranker:
-    def __init__(self):
-        self.calls = []
-
-    async def score(self, query, documents, top_n=None):
-        self.calls.append((query, documents, top_n))
-        return [(2, 0.9), (1, 0.8)]
-
-
-class FakeSource:
-    def __init__(self, reranker):
-        self.reranker = reranker
-        self.fetches = []
-
-    async def fetch_chunk(self, document_id, chunk_metadata, scope):
-        self.fetches.append((document_id, chunk_metadata, scope))
-        return {
-            "one?c=0": "raw first chunk",
-            "two?c=0": "raw second chunk",
-        }[f"{document_id}?c=0"]
+    monkeypatch.setattr(searching, "vector_search_hits", vector)
+    monkeypatch.setattr(searching, "assemble_hits", assemble)
+    result = await searching.search(indexer, "test", "question", 1,
+                                    rerank_query="rerank question")
+    assert [hit.document_id for hit in result] == (["second"] if enabled else ["first", "second"])
+    assert events == (["setup", "score"] if enabled else [])
 
 
-def make_document(document_id, title, summary):
-    document = Document(
-        collection_id="collection",
-        document_id=document_id,
-        title=title,
-        title_strength=0,
-        embedding=[0.0] * 768,
-        keywords=[],
-        summary=summary,
-    )
-    chunk = DocumentChunk(
-        collection_id="collection",
-        document_id=document_id,
-        order=0,
-        chunk_id=f"{document_id}?c=0",
-        embedding=[0.0] * 768,
-        metadata_str='{"o":0,"s":20}',
-    )
-    document.chunks = [chunk]
-    return document
+async def test_reranker_failure_retains_prepared_hits(caplog):
+    async def fail():
+        raise RuntimeError("model unavailable")
+
+    source = SimpleNamespace(id="test", reranker=SimpleNamespace(setup=fail))
+    hits = [DocumentHit("first", 1, "summary")]
+    assert await searching.rerank(None, source, hits, "query", 1) == hits
+    assert "model unavailable" in caplog.text
 
 
-async def test_search_reranks_candidates_before_python_grouping(monkeypatch):
-    document_one = make_document("one", "One", "summary one")
-    document_two = make_document("two", "Two", "summary two")
-    candidate_rows = [
-        {
-            "collection_id": "collection",
-            "document_id": "one",
-            "chunk_id": None,
-            "distance": 0.1,
-        },
-        {
-            "collection_id": "collection",
-            "document_id": "one",
-            "chunk_id": "one?c=0",
-            "distance": 0.2,
-        },
-        {
-            "collection_id": "collection",
-            "document_id": "two",
-            "chunk_id": "two?c=0",
-            "distance": 0.3,
-        },
-    ]
-    session = FakeSession(
-        [
-            FakeMappingsResult(candidate_rows),
-            FakeScalarsResult([document_one, document_two]),
-            FakeScalarsResult([document_one, document_two]),
-        ]
-    )
-    reranker = FakeReranker()
-    source = FakeSource(reranker)
+async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):
+    events = []
+    chunk = SimpleNamespace(chunk_id="doc?c=0", summary=SimpleNamespace(summary="chunk summary"))
+    document = SimpleNamespace(summary="", chunks=[chunk])
+
+    async def ensure(*args):
+        events.append("index")
+
+    async def summary(*args):
+        events.append("summary")
+        document.summary = "fresh summary"
+        return document.summary
+
+    async def summarize_results(*args):
+        events.append("chunks")
+
+    class Session:
+        async def execute(self, statement):
+            assert events == ["index", "summary", "chunks"]
+            return SimpleNamespace(scalar_one=lambda: document)
 
     @asynccontextmanager
-    async def get_session():
-        yield session
+    async def session():
+        yield Session()
 
-    context = SimpleNamespace(
-        embedding=FakeEmbedding(),
-        collections={"collection": source},
-        get_session=get_session,
-        config=SimpleNamespace(get_server_config=lambda: SimpleNamespace()),
-    )
-    indexer = Indexer(context)
-    summarized = []
-
-    async def summarize_results(collection_id, document_ids):
-        summarized.append((collection_id, set(document_ids)))
-
-    monkeypatch.setattr(indexer, "summarize_results", summarize_results)
-
-    results = await indexer.search(
-        "collection",
-        "find relevant text",
-        limit=2,
-    )
-
-    assert reranker.calls == [
-        (
-            "find relevant text",
-            [
-                "Title: One\n\nsummary one",
-                "Title: One\n\nraw first chunk",
-                "Title: Two\n\nraw second chunk",
-            ],
-            2,
-        )
-    ]
-    assert source.fetches == [
-        ("one", {"o": 0, "s": 20}, "embedding"),
-        ("two", {"o": 0, "s": 20}, "embedding"),
-    ]
-    assert summarized == [("collection", {"one", "two"})]
-    assert [(document.document_id, [chunk.chunk_id for chunk in chunks]) for document, chunks in results] == [
-        ("two", ["two?c=0"]),
-        ("one", ["one?c=0"]),
-    ]
-
-
-async def test_search_without_reranker_keeps_sql_ranked_hits(monkeypatch):
-    document = make_document("one", "One", "summary one")
-    ranked_rows = [
-        {
-            "collection_id": "collection",
-            "document_id": "one",
-            "chunk_id": "one?c=0",
-        }
-    ]
-    session = FakeSession(
-        [
-            FakeMappingsResult(ranked_rows),
-            FakeScalarsResult([document]),
-        ]
-    )
-
-    @asynccontextmanager
-    async def get_session():
-        yield session
-
-    context = SimpleNamespace(
-        embedding=FakeEmbedding(),
-        collections={"collection": SimpleNamespace()},
-        get_session=get_session,
-        config=SimpleNamespace(get_server_config=lambda: SimpleNamespace()),
-    )
-    indexer = Indexer(context)
-    monkeypatch.setattr(indexer, "summarize_results", _do_nothing)
-
-    results = await indexer.search("collection", "find relevant text", limit=1)
-
-    assert [(item.document_id, [chunk.chunk_id for chunk in chunks]) for item, chunks in results] == [
-        ("one", ["one?c=0"]),
-    ]
-
-
-async def _do_nothing(*args, **kwargs):
-    del args, kwargs
+    indexer = SimpleNamespace(context=SimpleNamespace(get_session=session),
+                              summarize_results=summarize_results)
+    monkeypatch.setattr(searching, "_ensure_indexed", ensure)
+    monkeypatch.setattr(searching, "_document_summary", summary)
+    hit = ChunkHit("doc", {}, 1, "doc?c=0")
+    result = await searching.assemble_hits(indexer, SimpleNamespace(id="test"),
+                                           [DocumentHit("doc", 1), hit, hit])
+    assert result == [(document, [chunk])]
+    assert result[0][0].summary == "fresh summary"

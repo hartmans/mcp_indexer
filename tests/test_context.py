@@ -92,7 +92,7 @@ async def test_build_collections_assigns_configured_reranker(monkeypatch):
 
     assert len(FakeReranker.instances) == 1
     reranker = FakeReranker.instances[0]
-    assert reranker.setup_calls == 1
+    assert reranker.setup_calls == 0
     assert context.collections["enabled-one"].reranker is reranker
     assert context.collections["enabled-two"].reranker is reranker
     assert context.collections["disabled"].reranker is None

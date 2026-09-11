@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import String, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -574,6 +574,13 @@ class Indexer:
     async def summarize_document(
         self, source: DocumentSource, document_id: str
     ) -> bool:
+        async with self.context.get_session() as session:
+            existing = (await session.execute(select(Document.summary).where(
+                Document.collection_id == source.id,
+                Document.document_id == document_id,
+            ))).scalar_one_or_none()
+        if existing:
+            return True
         pointer = source.fetch_document(document_id)
         metadata_dict = await pointer.get_metadata()
 
@@ -811,236 +818,6 @@ class Indexer:
         if isinstance(metadata_str, dict):
             return metadata_str
         return deserialize_metadata(metadata_str)
-
-    async def search(
-        self,
-        collection_id: str,
-        query: str,
-        limit: int = 5,
-        document_candidate_limit: int | None = None,
-        chunk_candidate_limit: int | None = None,
-    ):
-        query_vector = await self.context.embedding.query(query)
-        source = self.context.collections[collection_id]
-        reranker = getattr(source, "reranker", None)
-        document_candidate_limit = document_candidate_limit or limit * 4
-        chunk_candidate_limit = chunk_candidate_limit or limit * 4
-
-        document_distance = Document.embedding.cosine_distance(query_vector)
-        chunk_distance = DocumentChunk.embedding.cosine_distance(query_vector)
-
-        document_candidates = (
-            select(
-                Document.collection_id.label("collection_id"),
-                Document.document_id.label("document_id"),
-                func.cast(None, String).label("chunk_id"),
-                document_distance.label("distance"),
-            )
-            .where(Document.collection_id == collection_id)
-            .order_by(document_distance, Document.document_id)
-            .limit(document_candidate_limit)
-            .cte("document_candidates")
-        )
-        chunk_candidates = (
-            select(
-                DocumentChunk.collection_id.label("collection_id"),
-                DocumentChunk.document_id.label("document_id"),
-                DocumentChunk.chunk_id.label("chunk_id"),
-                chunk_distance.label("distance"),
-            )
-            .where(DocumentChunk.collection_id == collection_id)
-            .order_by(chunk_distance, DocumentChunk.document_id, DocumentChunk.chunk_id)
-            .limit(chunk_candidate_limit)
-            .cte("chunk_candidates")
-        )
-        candidate_hits = (
-            select(
-                document_candidates.c.collection_id,
-                document_candidates.c.document_id,
-                document_candidates.c.chunk_id,
-                document_candidates.c.distance,
-            )
-            .union_all(
-                select(
-                    chunk_candidates.c.collection_id,
-                    chunk_candidates.c.document_id,
-                    chunk_candidates.c.chunk_id,
-                    chunk_candidates.c.distance,
-                )
-            )
-            .cte("candidate_hits")
-        )
-        ranked_hits = (
-            select(
-                candidate_hits.c.collection_id,
-                candidate_hits.c.document_id,
-                candidate_hits.c.chunk_id,
-                candidate_hits.c.distance,
-                func.row_number()
-                .over(
-                    order_by=(
-                        candidate_hits.c.distance,
-                        candidate_hits.c.document_id,
-                        candidate_hits.c.chunk_id.asc().nullsfirst(),
-                    )
-                )
-                .label("hit_rank"),
-            )
-            .cte("ranked_hits")
-        )
-        top_hits = (
-            select(
-                ranked_hits.c.collection_id,
-                ranked_hits.c.document_id,
-                ranked_hits.c.chunk_id,
-                ranked_hits.c.distance,
-                ranked_hits.c.hit_rank,
-            )
-            .where(ranked_hits.c.hit_rank <= limit)
-            .cte("top_hits")
-        )
-        grouped_hits = (
-            select(
-                top_hits.c.collection_id,
-                top_hits.c.document_id,
-                top_hits.c.chunk_id,
-                top_hits.c.distance,
-                top_hits.c.hit_rank,
-                func.min(top_hits.c.hit_rank)
-                .over(
-                    partition_by=(
-                        top_hits.c.collection_id,
-                        top_hits.c.document_id,
-                    )
-                )
-                .label("document_group_rank"),
-            )
-            .cte("grouped_hits")
-        )
-
-        async with self.context.get_session() as session:
-            if reranker is None:
-                result = await session.execute(
-                    select(
-                        grouped_hits.c.collection_id,
-                        grouped_hits.c.document_id,
-                        grouped_hits.c.chunk_id,
-                    )
-                    .order_by(
-                        grouped_hits.c.document_group_rank,
-                        grouped_hits.c.hit_rank,
-                    )
-                )
-                ranked_hits = result.mappings().all()
-            else:
-                candidate_result = await session.execute(
-                    select(
-                        candidate_hits.c.collection_id,
-                        candidate_hits.c.document_id,
-                        candidate_hits.c.chunk_id,
-                        candidate_hits.c.distance,
-                    ).order_by(
-                        candidate_hits.c.distance,
-                        candidate_hits.c.document_id,
-                        candidate_hits.c.chunk_id.asc().nullsfirst(),
-                    )
-                )
-                candidate_rows = candidate_result.mappings().all()
-                if not candidate_rows:
-                    return []
-
-                candidate_document_ids = {
-                    row["document_id"] for row in candidate_rows
-                }
-                candidate_document_result = await session.execute(
-                    select(Document)
-                    .where(
-                        Document.collection_id == collection_id,
-                        Document.document_id.in_(candidate_document_ids),
-                    )
-                    .options(selectinload(Document.chunks))
-                )
-                candidate_documents = {
-                    document.document_id: document
-                    for document in candidate_document_result.scalars().unique().all()
-                }
-                candidate_chunks = {
-                    chunk.chunk_id: chunk
-                    for document in candidate_documents.values()
-                    for chunk in document.chunks
-                }
-
-                rerank_documents = []
-                for row in candidate_rows:
-                    document = candidate_documents[row["document_id"]]
-                    chunk_id = row["chunk_id"]
-                    if chunk_id is None:
-                        text = document.summary
-                    else:
-                        chunk = candidate_chunks[chunk_id]
-                        text = await source.fetch_chunk(
-                            document_id=document.document_id,
-                            chunk_metadata=dict(chunk.metadata_dict),
-                            scope="embedding",
-                        )
-                    rerank_documents.append(f"Title: {document.title}\n\n{text}")
-
-                reranked = await reranker.score(
-                    query,
-                    rerank_documents,
-                    top_n=limit,
-                )
-                ranked_hits = [candidate_rows[index] for index, _score in reranked]
-
-            if not ranked_hits:
-                return []
-
-            document_ids = {row["document_id"] for row in ranked_hits}
-            await self.summarize_results(collection_id, document_ids)
-            document_result = await session.execute(
-                select(Document)
-                .where(
-                    Document.collection_id == collection_id,
-                    Document.document_id.in_(document_ids),
-                )
-                .options(
-                    selectinload(Document.chunks).selectinload(DocumentChunk.summary)
-                )
-            )
-            documents = {
-                document.document_id: document
-                for document in document_result.scalars().unique().all()
-            }
-
-            grouped_documents: list[tuple[str, list[DocumentChunk]]] = []
-            document_chunks: dict[str, list[DocumentChunk]] = {}
-            for row in ranked_hits:
-                document_id = row["document_id"]
-                chunks = document_chunks.get(document_id)
-                if chunks is None:
-                    chunks = []
-                    document_chunks[document_id] = chunks
-                    grouped_documents.append((document_id, chunks))
-
-                chunk_id = row["chunk_id"]
-                if chunk_id is None:
-                    continue
-
-                document = documents[document_id]
-                for chunk in document.chunks:
-                    if chunk.chunk_id == chunk_id:
-                        chunks.append(chunk)
-                        break
-                else:
-                    raise LookupError(
-                        f"Missing hydrated chunk {chunk_id!r} for document {document_id!r}"
-                    )
-
-            return [
-                (documents[document_id], chunks)
-                for document_id, chunks in grouped_documents
-            ]
-
 
 async def main():
     parser = argparse.ArgumentParser(

@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from .context import Context
 from .indexer import Indexer
+from .search import search
 from .models import Document, DocumentChunk
 from .plugins.base import DocumentSource
 
@@ -144,7 +145,8 @@ async def core_search(
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     _get_collection_source(context, collection_id)
-    results = await indexer.search(
+    results = await search(
+        indexer,
         collection_id,
         query,
         limit=limit,

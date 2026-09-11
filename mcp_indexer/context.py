@@ -122,7 +122,6 @@ class Context:
                     from mcp_indexer.rerank import QwenReranker
 
                     reranker = QwenReranker()
-                    await reranker.setup()
             source = cls(
                 collection_id=collection_id,
                 context=self,
