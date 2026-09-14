@@ -1,0 +1,13 @@
+# Overlay this on your server/model configuration with a second -c argument.
+[collections.wikipedia]
+tool_prefix = "wiki"
+description = "Local English Wikipedia. Supports title: and cat: fields and Boolean operators."
+doc_summary_prompt = "Summarize the article in plain language, interpreting MediaWiki markup."
+# Defaults to indexed for this source; set to full to enumerate all articles.
+# indexing_mode = "full"
+
+[collections.wikipedia.source_config]
+type = "wikipedia"
+directory = "/srv/wikipedia/pages"
+xapian_directory = "/srv/wikipedia/wikipedia-xapian"
+include = ["*.mediawiki"]

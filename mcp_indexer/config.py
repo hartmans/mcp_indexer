@@ -1,5 +1,5 @@
 import tomllib
-from typing import Any, Dict, Type, TypeVar
+from typing import Any, Dict, Literal, Type, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T", bound=BaseModel)
@@ -32,6 +32,7 @@ class CollectionInfraConfig(BaseModel):
     doc_summary_prompt: str = "Summarize the following document concisely..."
     chunk_summary_prompt: str = ""
     rerank: bool = False
+    indexing_mode: Literal["full", "indexed"] | None = None
     
 class CollectionConfig(CollectionInfraConfig):
     """

@@ -1,4 +1,6 @@
 import asyncio
+import os
+from pathlib import Path
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -7,6 +9,29 @@ from sqlalchemy import text, select
 
 from mcp_indexer.config import ConfigManager, ServerConfig, CollectionConfig
 from mcp_indexer.models import Base
+
+
+def _load_test_env() -> None:
+    """Load simple KEY=VALUE entries from the repository's .env without overriding CI."""
+    env_path = Path(__file__).parents[1] / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        if not separator or not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key.strip(), value)
+
+
+_load_test_env()
 
 
 class FakeConfigManager(ConfigManager):
@@ -21,8 +46,8 @@ class FakeConfigManager(ConfigManager):
 
 @pytest.fixture(scope="session")
 def pg_url():
-    """Get the PostgreSQL connection URL for tests."""
-    return "postgresql+psycopg://indexer:***@/test?host=/srv/datasets/asstr.db/sockets"
+    """Get the PostgreSQL connection URL for tests from .env or the environment."""
+    return os.environ["MCP_INDEXER_TEST_DB_URL"]
 
 
 @pytest.fixture

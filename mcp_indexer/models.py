@@ -52,11 +52,14 @@ class DocumentChunk(Base):
         ForeignKeyConstraint(
             ["collection_id", "document_id"],
             ["document.collection_id", "document.document_id"],
+            name="fk_document_chunk_document",
+            ondelete="CASCADE", deferrable=True, initially="IMMEDIATE",
         ),
         ForeignKeyConstraint(
             ["collection_id", "document_id", "summary_span"],
             ["chunk_summary.collection_id", "chunk_summary.document_id", "chunk_summary.summary_span"],
-            ondelete='set null(summary_span)'
+            name="fk_document_chunk_summary",
+            ondelete='set null(summary_span)', deferrable=True, initially="IMMEDIATE",
         ),
     )
 
@@ -93,8 +96,14 @@ class Document(Base):
     chunks: Mapped[List[DocumentChunk]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
+        passive_deletes=True,
         overlaps="summary",
         order_by="DocumentChunk.order",
+    )
+
+    summaries: Mapped[List[ChunkSummary]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True,
+        overlaps="chunks,summary",
     )
 
     __table_args__ = (
@@ -118,10 +127,21 @@ class ChunkSummary(Base):
     summary: Mapped[str]
 
     # Relationships
-    chunks: Mapped[List[DocumentChunk]] = relationship(back_populates="summary", overlaps="document,chunks")
+    chunks: Mapped[List[DocumentChunk]] = relationship(
+        back_populates="summary", overlaps="document,chunks,summaries", passive_deletes=True,
+    )
+    document: Mapped[Document] = relationship(
+        back_populates="summaries", overlaps="chunks,summary",
+    )
 
     __table_args__ = (
         Index("ix_chunk_summary_document_id", "document_id"),
+        ForeignKeyConstraint(
+            ["collection_id", "document_id"],
+            ["document.collection_id", "document.document_id"],
+            name="fk_chunk_summary_document",
+            ondelete="CASCADE", deferrable=True, initially="IMMEDIATE",
+        ),
     )
 
 

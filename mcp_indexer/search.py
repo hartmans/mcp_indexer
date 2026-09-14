@@ -84,17 +84,7 @@ async def vector_search_hits(
 
 
 async def _ensure_indexed(indexer: Indexer, source: DocumentSource, document_id: str) -> None:
-    async with indexer.context.get_session() as session:
-        exists = (await session.execute(select(Document.document_id).where(
-            Document.collection_id == source.id, Document.document_id == document_id,
-        ))).scalar_one_or_none()
-    if exists is None:
-        from .indexer import DocumentIndexingStats
-
-        await indexer.index_document(
-            source.fetch_document(document_id),
-            DocumentIndexingStats(document_id, "index", source=source),
-        )
+    await indexer.ensure_document_indexed(source, document_id)
 
 
 async def _document_summary(indexer: Indexer, source: DocumentSource, document_id: str) -> str:
@@ -203,10 +193,11 @@ async def search(
         return []
     collection = indexer.context.collections[collection_id]
     use_reranker = collection.reranker is not None
+    natural_query = rerank_query if rerank_query and rerank_query.strip() else query
     document_limit = document_candidate_limit if document_candidate_limit is not None else limit * 4
     chunk_limit = chunk_candidate_limit if chunk_candidate_limit is not None else limit * 4
     try:
-        vector_hits = await vector_search_hits(collection, query, document_limit, chunk_limit)
+        vector_hits = await vector_search_hits(collection, natural_query, document_limit, chunk_limit)
     except Exception:
         logger.exception("Vector discovery failed for %s", collection_id)
         vector_hits = []
@@ -219,7 +210,7 @@ async def search(
         native_hits = []
     if use_reranker:
         hits = await rerank(indexer, collection, vector_hits + native_hits,
-                            query if rerank_query is None else rerank_query, limit)
+                            natural_query, limit)
     else:
         hits = []
         for candidates in (vector_hits, native_hits):

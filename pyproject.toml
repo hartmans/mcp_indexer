@@ -11,7 +11,7 @@ license = "GPL-3.0-only"
 dependencies = [
     "lancedb",
     "pydantic",
-    "mcp",
+    "mcp>=2.2.0,<3",
     "openai",
     "langchain",
     "langgraph",
@@ -39,3 +39,4 @@ include = ["mcp_indexer*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]

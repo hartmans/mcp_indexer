@@ -14,14 +14,14 @@ DocumentSources need to subclass this type.
 
 ### Document and Chunk Identifiers
 
-A document_id is a hierarchical identifier: *source*:*collection_id*:collection_specific/path/and/other/info.
+A collection-local document_id is whatever the source needs to find a document.
+Sources, indexer methods taking a source, and database rows use local IDs; SQL
+stores collection_id separately. Local chunk IDs add `?c=0` and so on.
 
-* The *source* identifies which *DocumentSource* implementation is used.
-
-* The *collection_id* is a collection from the config.
-* The remainder is whatever the source needs to find a document.
-
-Chunk IDs are formed by adding `?c=0` and so on to a document id.
+Tools and external references use global IDs: *collection_id*:local_document_id
+or *collection_id*:local_chunk_id. There is no source-type prefix. The tool
+boundary adds/removes the collection prefix. Renaming a collection updates
+collection_id in each table and configuration without changing local IDs.
 ### Chunking
 
 Chunking happens at multiple levels.
@@ -99,6 +99,47 @@ Assembly groups by first occurrence of each document, merges relevant chunks,
 and removes duplicate chunk references. Failures are logged and other usable
 results are returned; reranker failure falls back to initial candidate order.
 Search does not add concurrency coordination for indexing or summarization.
+
+Sources with structured native syntax set `separate_rerank = True`. Their MCP
+search tools expose an optional natural-language `rerank_query`, used for vector
+discovery and reranking, while `query` goes to native discovery. An omitted or
+blank natural-language query falls back to `query`. Other sources retain their
+existing tool signature. Native search is always called; its base implementation
+returns no hits.
+
+## Indexing coverage and maintenance
+
+`DocumentSource.indexing_mode` resolves collection configuration, then global
+configuration defaults, then the source's `default_indexing_mode` (`full` on the
+base source, `indexed` on Wikipedia). Overrides use additional config fragments.
+Full mode discovers unindexed documents through source enumeration; indexed mode
+only adds documents requested through search or explicit indexing. Neither mode
+refreshes persisted documents during search.
+
+`Indexer.ensure_document_indexed(source, document_id)` accepts a local ID, reuses
+stored documents without source probes, and fully indexes missing database rows.
+
+Maintenance is an independent opt-in operation (`--maintenance` or
+`index_all(maintenance=True)`). It pages over stored IDs in either indexing mode,
+fetches current pointers, and compares modification times. Changed documents are
+fully prepared before atomic replacement; missing documents are deleted promptly
+after `DocumentNotFoundError`. Other access failures retain stored documents.
+Source pointers expose current modification times and distinguish missing
+documents from unavailable source roots. No presence checks are added to search.
+
+The database owns chunk and summary deletion through cascading document foreign
+keys. Refresh discards previous summaries and resets the document summary vector;
+concurrent summary writes guard against changed/deleted documents. Indexing and
+summary passes remain concurrent. The manual migration in
+`scripts/migrate_native_sources.sql` is required for existing databases.
+
+Wikipedia uses a TextFileSource subclass, MediaWiki section boundaries, and direct
+read-only Xapian queries over the existing index. It keeps raw MediaWiki, including
+template names/arguments, and initially returns native article hits. After a new
+dump is extracted into the same collection, maintenance refreshes the stored
+subset. Extraction must replace changed files with changed mtimes, remove absent
+files, and update Xapian; the historical extraction/index scripts skip existing
+entries and are not reused by this source.
 
 ## Configuration
 

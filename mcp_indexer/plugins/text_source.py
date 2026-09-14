@@ -1,4 +1,5 @@
 from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSourcePointer
+from mcp_indexer.plugins.base import DocumentNotFoundError
 
 class TextFileSourceConfig(FileSourceConfig):
     """Configuration for the TextFileSource plugin."""
@@ -56,10 +57,14 @@ class TextFileSource(FileSource[TextFilePointer]):
 
     async def get_document_summary(self, document_id: str) -> str:
         pointer = self.fetch_document(document_id)
-        text = pointer.path.read_text(
-            encoding=self.source_config.encoding,
-            errors="replace",
-        )
+        try:
+            text = pointer.path.read_text(
+                encoding=self.source_config.encoding,
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            self._check_root()
+            raise DocumentNotFoundError(document_id) from exc
         if len(text) <= self.source_config.summary_length and self.context.llm is not None:
             prompt = [
                     ('system',self.config.doc_summary_prompt),
@@ -70,6 +75,5 @@ class TextFileSource(FileSource[TextFilePointer]):
 
     def fetch_document(self, document_id: str) -> TextFilePointer:
         """Resolves a document_id into a TextFilePointer."""
-        relative_path_str = self.decode_document_path(document_id)
-        absolute_path = self.source_config.directory / relative_path_str
+        absolute_path = self._document_path(document_id)
         return TextFilePointer(self, document_id, absolute_path)

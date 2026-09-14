@@ -1,6 +1,36 @@
 import argparse
+import inspect
+from types import SimpleNamespace
+
+import pytest
 
 from mcp_indexer.server import _build_parser, _create_server, _transport_for_args
+
+
+@pytest.mark.parametrize("separate", [False, True])
+async def test_search_tool_only_exposes_rerank_query_when_requested(monkeypatch, separate):
+    from mcp_indexer import server as module
+    registered = {}
+    class Server:
+        def tool(self, *, name, **kwargs):
+            def register(function):
+                registered[name] = function
+                return function
+            return register
+    source = SimpleNamespace(separate_rerank=separate, config=SimpleNamespace(description="wiki"))
+    context = SimpleNamespace(collections={"wiki": source})
+    calls = []
+    async def core(**kwargs):
+        calls.append(kwargs)
+        return []
+    monkeypatch.setattr(module, "core_search", core)
+    module.build_tools(Server(), context=context, indexer=object(), collection_id="wiki")
+    tool = registered["wiki_search"]
+    assert ("rerank_query" in inspect.signature(tool).parameters) == separate
+    kwargs = {"rerank_query": "natural language"} if separate else {}
+    await tool("cat:Physics", **kwargs)
+    assert calls[0]["query"] == "cat:Physics"
+    assert calls[0].get("rerank_query") == ("natural language" if separate else None)
 
 
 def test_build_parser_defaults_host_to_localhost_and_stdio():
@@ -20,14 +50,35 @@ def test_build_parser_accepts_host_and_port():
     assert args.port == 8123
 
 
-def test_create_server_uses_http_settings_only_when_port_is_specified():
-    stdio_server = _create_server()
-    http_server = _create_server(host="localhost", port=8123)
+async def test_registered_search_tool_smoke(monkeypatch):
+    from mcp_indexer import server as module
 
-    assert stdio_server.settings.host == "127.0.0.1"
-    assert stdio_server.settings.port == 8000
-    assert http_server.settings.host == "localhost"
-    assert http_server.settings.port == 8123
+    source = SimpleNamespace(separate_rerank=True, config=SimpleNamespace(description="Wiki"))
+    context = SimpleNamespace(collections={"wiki": source})
+    indexer = object()
+    document = SimpleNamespace(
+        collection_id="wiki", document_id="article", title="Article",
+        keywords=["physics"], summary="An article",
+    )
+
+    async def search(actual_indexer, collection_id, query, *, limit, rerank_query):
+        assert actual_indexer is indexer
+        assert (collection_id, query, limit, rerank_query) == (
+            "wiki", "cat:Physics", 2, "Explain physics",
+        )
+        return [(document, [])]
+
+    monkeypatch.setattr(module, "search", search)
+    server = _create_server()
+    module.build_tools(server, context=context, indexer=indexer, collection_id="wiki")
+    result = await server.call_tool("wiki_search", {
+        "query": "cat:Physics", "limit": 2, "rerank_query": "Explain physics",
+    })
+    assert not result.is_error
+    assert result.structured_content == {"result": [{
+        "title": "Article", "keywords": ["physics"],
+        "document_id": "wiki:article", "summary": "An article", "relevant_chunks": [],
+    }]}
 
 
 def test_transport_switches_to_streamable_http_when_port_is_specified():

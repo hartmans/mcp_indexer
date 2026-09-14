@@ -6,7 +6,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -22,12 +22,8 @@ logger = logging.getLogger(__name__)
 FULL_DOCUMENT_LENGTH = 10_000
 
 
-def _create_server(*, host: str = "localhost", port: int | None = None) -> FastMCP:
-    server_kwargs: dict[str, Any] = {}
-    if port is not None:
-        server_kwargs["host"] = host
-        server_kwargs["port"] = port
-    return FastMCP("LanceDB Indexer", **server_kwargs)
+def _create_server() -> MCPServer:
+    return MCPServer("LanceDB Indexer")
 
 
 def result_info(
@@ -143,6 +139,7 @@ async def core_search(
     collection_id: str,
     query: str,
     limit: int = 5,
+    rerank_query: str | None = None,
 ) -> list[dict[str, Any]]:
     _get_collection_source(context, collection_id)
     results = await search(
@@ -150,6 +147,7 @@ async def core_search(
         collection_id,
         query,
         limit=limit,
+        rerank_query=rerank_query,
     )
     return result_info(results, context.collections)
 
@@ -261,7 +259,7 @@ async def core_fetch_chunk(
 
 
 def build_tools(
-    server: FastMCP,
+    server: MCPServer,
     *,
     context: Context,
     collection_id: str,
@@ -270,16 +268,6 @@ def build_tools(
     source = _get_collection_source(context, collection_id)
     collection_description = source.config.description
 
-    @server.tool(
-        name=_tool_name(collection_id, "search"),
-        title=f"Search {collection_id}",
-        description=(
-            f"Search the {collection_id!r} collection ({collection_description}). "
-            "Returns ranked documents with summaries and relevant chunks. "
-            "Each result includes stable collection-prefixed identifiers that can be "
-            "passed directly to the companion fetch_document and fetch_chunk tools for deeper inspection."
-        ),
-    )
     async def collection_search(
         query: str,
         limit: int = 5,
@@ -300,6 +288,34 @@ def build_tools(
             query=query,
             limit=limit,
         )
+
+    async def structured_collection_search(
+        query: str, limit: int = 5, rerank_query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search with native syntax and an optional natural-language query.
+
+        Args:
+            query: Source-native expression, including supported fields and operators.
+            limit: Number of matching documents to return.
+            rerank_query: Natural-language information need for vector search and reranking.
+                If omitted, query is used for both.
+        """
+        return await core_search(
+            context=context, indexer=indexer, collection_id=collection_id,
+            query=query, limit=limit, rerank_query=rerank_query,
+        )
+
+    server.tool(
+        name=_tool_name(collection_id, "search"),
+        title=f"Search {collection_id}",
+        description=(
+            f"Search the {collection_id!r} collection ({collection_description}). "
+            "Returns ranked documents with summaries and relevant chunks. "
+            "Each result includes collection-prefixed identifiers for the companion fetch tools."
+            + (" Use query for native search syntax and rerank_query for the natural-language "
+               "information need used by vector search and reranking." if source.separate_rerank else "")
+        ),
+    )(structured_collection_search if source.separate_rerank else collection_search)
 
     @server.tool(
         name=_tool_name(collection_id, "fetch_document"),
@@ -369,7 +385,7 @@ def build_tools(
         )
 
 
-def build_all_tools(server: FastMCP, *, context: Context) -> None:
+def build_all_tools(server: MCPServer, *, context: Context) -> None:
     indexer = Indexer(context)
     for collection_id in sorted(context.collections):
         build_tools(
@@ -381,11 +397,11 @@ def build_all_tools(server: FastMCP, *, context: Context) -> None:
 
 
 async def _build_server(
-    config_path: str | list[str], *, host: str = "localhost", port: int | None = None
-) -> FastMCP:
+    config_path: str | list[str],
+) -> MCPServer:
     context = Context.build_context(config_path)
     await context.build_collections()
-    mcp = _create_server(host=host, port=port)
+    mcp = _create_server()
     build_all_tools(mcp, context=context)
     return mcp
 
@@ -421,8 +437,12 @@ def _transport_for_args(args: argparse.Namespace) -> Literal["stdio", "streamabl
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = _build_parser().parse_args()
-    mcp = asyncio.run(_build_server(args.config, host=args.host, port=args.port))
-    mcp.run(transport=_transport_for_args(args))
+    mcp = asyncio.run(_build_server(args.config))
+    transport = _transport_for_args(args)
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

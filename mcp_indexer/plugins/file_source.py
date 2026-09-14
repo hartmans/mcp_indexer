@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import AsyncGenerator, List, Optional, Generic, TypeVar, Any
 from urllib.parse import quote, unquote
 from pydantic import BaseModel, Field
-from mcp_indexer.plugins.base import DocumentSource, DocumentPointer, ChunkInfo
+from mcp_indexer.plugins.base import DocumentSource, DocumentPointer, ChunkInfo, DocumentNotFoundError
 
 class FileSourceConfig(BaseModel):
     """Base configuration for directory-based sources."""
@@ -18,7 +18,11 @@ class FileSourcePointer(DocumentPointer):
     A DocumentPointer for a file on disk.
     """
     def __init__(self, source: "FileSource", document_id: str, path: Path):
-        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        except FileNotFoundError as exc:
+            source._check_root()
+            raise DocumentNotFoundError(document_id) from exc
         super().__init__(source, document_id, last_modified=mtime)
         self.path = path
 
@@ -34,14 +38,21 @@ class FileSourcePointer(DocumentPointer):
         if e is None:
             raise ValueError("Chunk metadata must contain 'e' (end) byte offset")
 
-        with open(self.path, 'rb') as f:
-            f.seek(b)
-            chunk_bytes = f.read(e - b)
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(b)
+                chunk_bytes = f.read(e - b)
+        except FileNotFoundError as exc:
+            self.source._check_root()
+            raise DocumentNotFoundError(self.document_id) from exc
         return [chunk_bytes.decode('utf-8', errors='replace')]
 
     async def get_chunks(self, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
-        with open(self.path, 'rb') as f:
-            text_bytes = f.read()
+        try:
+            text_bytes = self.path.read_bytes()
+        except FileNotFoundError as exc:
+            self.source._check_root()
+            raise DocumentNotFoundError(self.document_id) from exc
         async for chunk_info in self.source.split_text({}, text_bytes, min_size, max_size):
             yield chunk_info
 
@@ -81,8 +92,24 @@ class FileSource(DocumentSource[P]):
     def decode_document_path(self, encoded_path: str) -> str:
         return unquote(encoded_path)
 
+    def _check_root(self) -> None:
+        if not self.source_config.directory.is_dir():
+            raise OSError(f"Source directory unavailable: {self.source_config.directory}")
+
+    def _document_path(self, document_id: str) -> Path:
+        relative = Path(self.decode_document_path(document_id))
+        root = self.source_config.directory.resolve()
+        path = root / relative
+        if relative.is_absolute() or not path.resolve().is_relative_to(root):
+            raise ValueError(f"Document path outside source: {document_id}")
+        if not self._is_included(relative):
+            self._check_root()
+            raise DocumentNotFoundError(document_id, "Document excluded from collection")
+        return path
+
     async def get_documents(self, last_modified: Optional[datetime] = None) -> AsyncGenerator[P, None]:
         root = self.source_config.directory
+        self._check_root()
         for path in root.rglob("*"):
             if path.is_file() and self._is_included(path):
                 mtime = datetime.fromtimestamp(path.stat().st_mtime)
@@ -145,6 +172,5 @@ class FileSource(DocumentSource[P]):
             current_semantic_start = current_semantic_end
 
     def fetch_document(self, document_id: str) -> P:
-        relative_path_str = self.decode_document_path(document_id)
-        absolute_path = self.source_config.directory / relative_path_str
+        absolute_path = self._document_path(document_id)
         return FileSourcePointer(self, document_id, absolute_path) # type: ignore

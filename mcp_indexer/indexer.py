@@ -8,14 +8,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from mcp_indexer.context import Context
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, FailedDocument, deserialize_metadata
-from mcp_indexer.plugins.base import DocumentSource, create_embedding_chunks
+from mcp_indexer.plugins.base import DocumentSource, DocumentNotFoundError, create_embedding_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +152,13 @@ class Indexer:
         index: bool = True,
         summarize_chunks: bool = True,
         summarize_documents: bool = True,
+        maintenance: bool = False,
     ):
         await self.context.build_collections()
         loops = []
         for source in self.context.collections.values():
+            if maintenance:
+                loops.append(self.maintain_collection(source))
             if index:
                 loops.append(self.index_collection(source))
             if summarize_chunks:
@@ -167,17 +171,29 @@ class Indexer:
         await self.wait_for_idle()
 
     async def index_collection(self, source: DocumentSource):
-        # Get set of failed document_ids to skip
-        failed_docs = await self._get_failed_documents(source)
-        
-        async with self.context.get_session() as session:
-            # Get existing document IDs for this collection
-            result = await session.execute(
-                select(Document.document_id).where(Document.collection_id == source.id)
-            )
-            existing_docs = set(result.scalars().all())
-
+        if source.indexing_mode != "full":
+            return
+        pointers = []
         async for pointer in source.get_documents(last_modified=None):
+            pointers.append(pointer)
+            if len(pointers) == 256:
+                await self._index_discovered_documents(source, pointers)
+                pointers = []
+        if pointers:
+            await self._index_discovered_documents(source, pointers)
+
+    async def _index_discovered_documents(self, source: DocumentSource, pointers) -> None:
+        document_ids = [pointer.document_id for pointer in pointers]
+        async with self.context.get_session() as session:
+            existing_docs = set((await session.execute(select(Document.document_id).where(
+                Document.collection_id == source.id,
+                Document.document_id.in_(document_ids),
+            ))).scalars().all())
+            failed_docs = set((await session.execute(select(FailedDocument.document_id).where(
+                FailedDocument.collection_id == source.id,
+                FailedDocument.document_id.in_(document_ids),
+            ))).scalars().all())
+        for pointer in pointers:
             if pointer.document_id in existing_docs:
                 continue
             if pointer.document_id in failed_docs:
@@ -195,6 +211,64 @@ class Indexer:
                 self.index_document(pointer, stats),
                 stats,
             )
+
+    async def maintain_collection(self, source: DocumentSource) -> None:
+        """Refresh/remove stored local IDs, without enumerating the source corpus."""
+        after = None
+        while True:
+            statement = select(Document.document_id, Document.last_modified).where(
+                Document.collection_id == source.id,
+            ).order_by(Document.document_id).limit(256)
+            if after is not None:
+                statement = statement.where(Document.document_id > after)
+            async with self.context.get_session() as session:
+                rows = (await session.execute(statement)).all()
+            if not rows:
+                return
+            for document_id, last_modified in rows:
+                try:
+                    pointer = source.fetch_document(document_id)
+                except DocumentNotFoundError:
+                    async with self.context.get_session() as session:
+                        await session.execute(delete(Document).where(
+                            Document.collection_id == source.id,
+                            Document.document_id == document_id,
+                        ))
+                        await session.execute(delete(FailedDocument).where(
+                            FailedDocument.collection_id == source.id,
+                            FailedDocument.document_id == document_id,
+                        ))
+                        await session.commit()
+                    logger.info("Removed %s:%s", source.id, document_id)
+                    continue
+                except Exception:
+                    logger.exception("Could not maintain %s:%s", source.id, document_id)
+                    continue
+                if pointer.last_modified != last_modified:
+                    stats = DocumentIndexingStats(document_id, "refresh", source=source)
+                    await self._schedule_document_task(
+                        self.index_document(pointer, stats, replace=True), stats,
+                    )
+            after = rows[-1][0]
+
+    async def ensure_document_indexed(
+        self, source: DocumentSource, document_id: str, *, retry_failed: bool = False,
+    ) -> None:
+        """Persist a local document ID if absent; never probe an existing document."""
+        async with self.context.get_session() as session:
+            if await session.get(Document, (source.id, document_id)) is not None:
+                return
+            failure = await session.get(FailedDocument, (source.id, document_id))
+            if failure is not None and not retry_failed:
+                raise RuntimeError(f"Previously failed document {document_id}: {failure.failure_reason}")
+        try:
+            await self.index_document(
+                source.fetch_document(document_id),
+                DocumentIndexingStats(document_id, "index", source=source),
+            )
+        except Exception as exc:
+            await self._record_failure(source, document_id, str(exc))
+            raise
 
     async def summarize_chunks_collection(self, source: DocumentSource):
         # Get set of failed document_ids to skip
@@ -459,7 +533,7 @@ class Indexer:
             if not self._running_documents:
                 return
 
-    async def index_document(self, pointer, stats: DocumentIndexingStats):
+    async def index_document(self, pointer, stats: DocumentIndexingStats, *, replace: bool = False):
         source = pointer.source
         embedding_chunks: list[tuple[dict[str, Any], str]] = []
         async for meta, text_list in pointer.get_chunks(
@@ -515,12 +589,15 @@ class Indexer:
         # Attach chunks to document for cascade merge
         doc_record.chunks = all_chunks
 
-        # Upsert document (cascades to chunks via relationship)
-        await self._upsert_document(source, doc_record)
+        # Persist the complete chunk set together, replacing only on maintenance.
+        await self._upsert_document(source, doc_record, replace=replace)
 
     async def summarize_document_chunks(
         self, source: DocumentSource, document_id: str
     ) -> bool:
+        expected_mtime = await self._document_mtime(source, document_id)
+        if expected_mtime is None:
+            return False
         semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
 
         if not semantic_chunks:
@@ -566,21 +643,47 @@ class Indexer:
 
             next_summary_span += len(spans)
 
-        # Insert summaries first (chunks reference summaries via foreign key)
-        await self._insert_summaries(source, summary_records)
-        await self._update_chunks(source, updated_rows)
+        # Guard and write summaries/references together; refresh may have replaced
+        # the document while the model was working.
+        async with self.context.get_session() as session:
+            current = (await session.execute(select(Document).where(
+                Document.collection_id == source.id,
+                Document.document_id == document_id,
+            ).with_for_update())).scalar_one_or_none()
+            if current is None or current.last_modified != expected_mtime:
+                return False
+            for summary in summary_records:
+                await session.merge(summary)
+            await session.flush()
+            for row in updated_rows:
+                await session.execute(update(DocumentChunk).where(
+                    DocumentChunk.collection_id == source.id,
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.chunk_id == row["chunk_id"],
+                ).values(summary_span=row["summary_span"]))
+            await session.commit()
         return True
+
+    async def _document_mtime(self, source: DocumentSource, document_id: str):
+        async with self.context.get_session() as session:
+            return (await session.execute(select(Document.last_modified).where(
+                Document.collection_id == source.id,
+                Document.document_id == document_id,
+            ))).scalar_one_or_none()
 
     async def summarize_document(
         self, source: DocumentSource, document_id: str
     ) -> bool:
         async with self.context.get_session() as session:
-            existing = (await session.execute(select(Document.summary).where(
+            existing = (await session.execute(select(Document).where(
                 Document.collection_id == source.id,
                 Document.document_id == document_id,
             ))).scalar_one_or_none()
-        if existing:
+        if existing is None:
+            return False
+        if existing.summary:
             return True
+        expected_mtime = existing.last_modified
         pointer = source.fetch_document(document_id)
         metadata_dict = await pointer.get_metadata()
 
@@ -640,56 +743,59 @@ class Indexer:
             document_id=document_id,
             title=title,
             title_strength=title_strength,
-            last_modified=pointer.last_modified,
+            last_modified=expected_mtime,
             summary=final_summary,
             embedding=doc_vector,
             keywords=extracted_keywords if extracted_keywords else metadata_dict.get("keywords", []),
         )
 
-        await self._update_document(source, doc_record)
-        return True
+        return await self._update_document(source, doc_record)
 
     async def _upsert_document(
-        self, source: DocumentSource, doc: Document
+        self, source: DocumentSource, doc: Document, *, replace: bool = False,
     ) -> None:
         async with self.context.get_session() as session:
-            await session.merge(doc)
-            await session.commit()
-
-    async def _insert_summaries(
-        self, source: DocumentSource, summaries: list[ChunkSummary]
-    ) -> None:
-        if not summaries:
-            return
-        async with self.context.get_session() as session:
-            for summary in summaries:
-                await session.merge(summary)
-            await session.commit()
-
-    async def _update_chunks(
-        self, source: DocumentSource, updates: list[dict[str, Any]]
-    ) -> None:
-        if not updates:
-            return
-        async with self.context.get_session() as session:
-            for row in updates:
-                stmt = select(DocumentChunk).where(
-                    DocumentChunk.collection_id == source.id,
-                    DocumentChunk.document_id == row["document_id"],
-                    DocumentChunk.chunk_id == row["chunk_id"],
-                )
-                result = await session.execute(stmt)
-                chunk = result.scalar_one_or_none()
-                if chunk:
-                    chunk.summary_span = row["summary_span"]
+            # The FK cascades remove old chunks and summary spans on refresh.
+            # Preparation has already succeeded before this transaction begins.
+            if replace:
+                await session.execute(delete(Document).where(
+                    Document.collection_id == source.id,
+                    Document.document_id == doc.document_id,
+                ))
+            values = {column.key: getattr(doc, column.key) for column in Document.__table__.columns}
+            inserted = (await session.execute(insert(Document).values(**values)
+                .on_conflict_do_nothing(index_elements=["collection_id", "document_id"])
+                .returning(Document.document_id))).scalar_one_or_none()
+            if inserted is None:
+                # Another search/indexing task already prepared this document.
+                return
+            if doc.chunks:
+                await session.execute(insert(DocumentChunk), [
+                    {column.key: getattr(chunk, column.key) for column in DocumentChunk.__table__.columns}
+                    for chunk in doc.chunks
+                ])
+            await session.execute(delete(FailedDocument).where(
+                FailedDocument.collection_id == source.id,
+                FailedDocument.document_id == doc.document_id,
+            ))
             await session.commit()
 
     async def _update_document(
         self, source: DocumentSource, doc: Document
-    ) -> None:
+    ) -> bool:
         async with self.context.get_session() as session:
-            await session.merge(doc)
+            current = (await session.execute(select(Document).where(
+                Document.collection_id == source.id,
+                Document.document_id == doc.document_id,
+            ).with_for_update())).scalar_one_or_none()
+            if current is None or current.last_modified != doc.last_modified:
+                return False
+            if current.summary:
+                return True
+            for attribute in ("summary", "embedding", "title", "title_strength", "keywords"):
+                setattr(current, attribute, getattr(doc, attribute))
             await session.commit()
+            return True
 
     async def _reconstruct_semantic_chunks(
         self, source: DocumentSource, document_id: str
@@ -831,6 +937,8 @@ async def main():
         help=f"Write per-document indexing statistics to {DEBUG_STATS_FILENAME}",
     )
     parser.add_argument("--index", action="store_true", help="Run chunk indexing")
+    parser.add_argument("--maintenance", action="store_true",
+                        help="Refresh changed and remove missing indexed documents")
     parser.add_argument(
         "--summarize-chunks", action="store_true", help="Run chunk summarization"
     )
@@ -842,6 +950,7 @@ async def main():
         args.index,
         args.summarize_chunks,
         args.summarize_documents,
+        args.maintenance,
     )
     if any(operation_flags):
         run_index = args.index
@@ -863,6 +972,7 @@ async def main():
         index=run_index,
         summarize_chunks=run_summarize_chunks,
         summarize_documents=run_summarize_documents,
+        maintenance=args.maintenance,
     )
     await indexer.wait_for_idle()
 

@@ -59,6 +59,26 @@ async def test_reranker_failure_retains_prepared_hits(caplog):
     assert "model unavailable" in caplog.text
 
 
+@pytest.mark.parametrize("natural", [None, "", " ", "how stars form"])
+async def test_natural_query_routes_to_vector_and_native_keeps_syntax(monkeypatch, natural):
+    calls = []
+    async def native(query, **kwargs):
+        calls.append(("native", query))
+        return []
+    async def vector(source, query, *args):
+        calls.append(("vector", query))
+        return []
+    async def assemble(*args):
+        return []
+    source = SimpleNamespace(reranker=None, native_search=native)
+    indexer = SimpleNamespace(context=SimpleNamespace(collections={"wiki": source}))
+    monkeypatch.setattr(searching, "vector_search_hits", vector)
+    monkeypatch.setattr(searching, "assemble_hits", assemble)
+    await searching.search(indexer, "wiki", "cat:Astronomy", rerank_query=natural)
+    expected = natural if natural and natural.strip() else "cat:Astronomy"
+    assert calls == [("vector", expected), ("native", "cat:Astronomy")]
+
+
 async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):
     events = []
     chunk = SimpleNamespace(chunk_id="doc?c=0", summary=SimpleNamespace(summary="chunk summary"))

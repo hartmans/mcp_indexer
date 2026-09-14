@@ -4,6 +4,26 @@ from pathlib import Path
 from mcp_indexer.config import ConfigManager
 
 
+def test_indexing_mode_defaults_and_fragment_override(tmp_path):
+    base = tmp_path / "base.toml"
+    base.write_text('[collections.wiki]\ntool_prefix = "wiki"\n')
+    assert ConfigManager(str(base)).get_collection_config("wiki").indexing_mode is None
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text('[defaults]\nindexing_mode = "indexed"\n')
+    override = tmp_path / "full.toml"
+    override.write_text('[collections.wiki]\nindexing_mode = "full"\n')
+    assert ConfigManager([str(base), str(defaults)]).get_collection_config("wiki").indexing_mode == "indexed"
+    assert ConfigManager([str(base), str(defaults), str(override)]).get_collection_config("wiki").indexing_mode == "full"
+
+
+def test_indexing_mode_rejects_unknown_value(tmp_path):
+    from pydantic import ValidationError
+    config = tmp_path / "invalid.toml"
+    config.write_text('[collections.wiki]\ntool_prefix = "wiki"\nindexing_mode = "sometimes"\n')
+    with pytest.raises(ValidationError):
+        ConfigManager(str(config)).get_collection_config("wiki")
+
+
 def test_batch_concurrency_defaults(tmp_path):
     conf_file = Path(tmp_path) / "empty.toml"
     conf_file.write_text("")

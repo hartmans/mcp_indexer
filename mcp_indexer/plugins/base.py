@@ -13,6 +13,14 @@ if TYPE_CHECKING:
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
 
+class DocumentNotFoundError(LookupError):
+    """A collection-local document is absent from an available source."""
+
+    def __init__(self, document_id: str, message: str = "Document not found"):
+        self.document_id = document_id
+        super().__init__(f"{message}: {document_id}")
+
+
 @dataclasses.dataclass
 class DocumentPointer:
     """A document to be indexed, returned from DocumentSource."""
@@ -71,6 +79,12 @@ class DocumentSource(Generic[p]):
     """An abstract plugin representing a source of documents."""
 
     reranker: "AbstractReranker | None"
+    default_indexing_mode: Literal["full", "indexed"] = "full"
+    separate_rerank: bool = False
+
+    @property
+    def indexing_mode(self) -> Literal["full", "indexed"]:
+        return self.config.indexing_mode or self.default_indexing_mode
 
     def __init__(
         self,
@@ -94,7 +108,8 @@ class DocumentSource(Generic[p]):
     async def get_documents(self, last_modified: datetime | None = None) -> AsyncGenerator[p, None]:
         ...
 
-    def fetch_document(document_id: str) -> p:
+    def fetch_document(self, document_id: str) -> p:
+        """Resolve a local ID with current mtime; raise DocumentNotFoundError if absent."""
         ...
 
     async def get_document_summary(self, document_id: str) -> str:
