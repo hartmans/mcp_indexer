@@ -5,6 +5,7 @@ inference, and response objects are hydrated after summary writes finish.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
@@ -113,25 +114,40 @@ async def rerank(
     rerank_query: str, hit_limit: int,
 ) -> list[SearchHit]:
     """Prepare candidates independently of assembly and return selected hits."""
+    summary_tasks: dict[str, asyncio.Task[str]] = {}
+
+    async def prepare(hit: SearchHit) -> tuple[SearchHit, str]:
+        if isinstance(hit, DocumentHit):
+            text = hit.summary
+            if not text:
+                task = summary_tasks.get(hit.document_id)
+                if task is None:
+                    task = asyncio.create_task(
+                        _document_summary(indexer, collection, hit.document_id)
+                    )
+                    summary_tasks[hit.document_id] = task
+                text = await task
+            return replace(hit, summary=text), text
+        text = await collection.fetch_chunk(
+            hit.document_id, hit.chunk_metadata, scope="embedding",
+        )
+        return hit, text
+
     prepared: list[SearchHit] = []
     texts: list[str] = []
-    for hit in hits:
-        try:
-            if isinstance(hit, DocumentHit):
-                text = hit.summary or await _document_summary(indexer, collection, hit.document_id)
-                hit = replace(hit, summary=text)
-            else:
-                text = await collection.fetch_chunk(
-                    hit.document_id, hit.chunk_metadata, scope="embedding",
-                )
-            texts.append(text)
-            prepared.append(hit)
-        except Exception:
-            logger.exception("Could not prepare reranker hit %s", hit.document_id)
+    outcomes = await asyncio.gather(*(prepare(hit) for hit in hits), return_exceptions=True)
+    for hit, outcome in zip(hits, outcomes, strict=True):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            logger.error("Could not prepare reranker hit %s: %s", hit.document_id, outcome)
+            continue
+        prepared_hit, text = outcome
+        prepared.append(prepared_hit)
+        texts.append(text)
     if not prepared:
         return []
     try:
-        await collection.reranker.setup()
         ranking = await collection.reranker.score(rerank_query, texts, top_n=hit_limit)
         return [replace(prepared[index], score=score) for index, score in ranking]
     except Exception:
@@ -148,38 +164,49 @@ async def assemble_hits(
         chunks = grouped.setdefault(hit.document_id, [])
         if isinstance(hit, ChunkHit):
             chunks.append(hit)
+    async def assemble_document(
+        document_id: str, chunk_hits: list[ChunkHit],
+    ) -> tuple[Document, list[DocumentChunk]]:
+        await _ensure_indexed(indexer, collection, document_id)
+        await _document_summary(indexer, collection, document_id)
+        if chunk_hits:
+            await indexer.summarize_results(collection.id, [document_id])
+        async with indexer.context.get_session() as session:
+            document = (await session.execute(
+                select(Document).where(
+                    Document.collection_id == collection.id,
+                    Document.document_id == document_id,
+                ).options(selectinload(Document.chunks).selectinload(DocumentChunk.summary))
+            )).scalar_one()
+        if not document.summary:
+            raise ValueError(f"Missing document summary for {document_id}")
+        selected = []
+        seen = set()
+        for hit in chunk_hits:
+            chunk = next((chunk for chunk in document.chunks if (
+                chunk.chunk_id == hit.chunk_id if hit.chunk_id is not None
+                else dict(chunk.metadata_dict) == hit.chunk_metadata
+            )), None)
+            if chunk is None or chunk.summary is None or not chunk.summary.summary:
+                logger.warning("Missing chunk or summary for %s: %s", document_id, hit)
+                continue
+            if chunk.chunk_id not in seen:
+                seen.add(chunk.chunk_id)
+                selected.append(chunk)
+        return document, selected
+
+    outcomes = await asyncio.gather(*(
+        assemble_document(document_id, chunk_hits)
+        for document_id, chunk_hits in grouped.items()
+    ), return_exceptions=True)
     results = []
-    for document_id, chunk_hits in grouped.items():
-        try:
-            await _ensure_indexed(indexer, collection, document_id)
-            await _document_summary(indexer, collection, document_id)
-            if chunk_hits:
-                await indexer.summarize_results(collection.id, [document_id])
-            async with indexer.context.get_session() as session:
-                document = (await session.execute(
-                    select(Document).where(
-                        Document.collection_id == collection.id,
-                        Document.document_id == document_id,
-                    ).options(selectinload(Document.chunks).selectinload(DocumentChunk.summary))
-                )).scalar_one()
-            if not document.summary:
-                raise ValueError(f"Missing document summary for {document_id}")
-            selected = []
-            seen = set()
-            for hit in chunk_hits:
-                chunk = next((chunk for chunk in document.chunks if (
-                    chunk.chunk_id == hit.chunk_id if hit.chunk_id is not None
-                    else dict(chunk.metadata_dict) == hit.chunk_metadata
-                )), None)
-                if chunk is None or chunk.summary is None or not chunk.summary.summary:
-                    logger.warning("Missing chunk or summary for %s: %s", document_id, hit)
-                    continue
-                if chunk.chunk_id not in seen:
-                    seen.add(chunk.chunk_id)
-                    selected.append(chunk)
-            results.append((document, selected))
-        except Exception:
-            logger.exception("Could not assemble search result %s", document_id)
+    for document_id, outcome in zip(grouped, outcomes, strict=True):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            logger.error("Could not assemble search result %s: %s", document_id, outcome)
+        else:
+            results.append(outcome)
     return results
 
 
@@ -193,21 +220,38 @@ async def search(
         return []
     collection = indexer.context.collections[collection_id]
     use_reranker = collection.reranker is not None
+    if use_reranker:
+        try:
+            # Reserve local accelerator memory before embedding or summary models
+            # can issue their first request.
+            await collection.reranker.setup()
+        except Exception:
+            logger.exception("Could not initialize reranker for %s", collection_id)
+            use_reranker = False
     natural_query = rerank_query if rerank_query and rerank_query.strip() else query
     document_limit = document_candidate_limit if document_candidate_limit is not None else limit * 4
     chunk_limit = chunk_candidate_limit if chunk_candidate_limit is not None else limit * 4
-    try:
-        vector_hits = await vector_search_hits(collection, natural_query, document_limit, chunk_limit)
-    except Exception:
-        logger.exception("Vector discovery failed for %s", collection_id)
-        vector_hits = []
-    try:
-        native_hits = await collection.native_search(
-            query, document_limit=document_limit, chunk_limit=chunk_limit,
-        )
-    except Exception:
-        logger.exception("Native discovery failed for %s", collection_id)
-        native_hits = []
+    async def vector_discovery() -> list[SearchHit]:
+        try:
+            return await vector_search_hits(
+                collection, natural_query, document_limit, chunk_limit,
+            )
+        except Exception:
+            logger.exception("Vector discovery failed for %s", collection_id)
+            return []
+
+    async def native_discovery() -> list[SearchHit]:
+        try:
+            return await collection.native_search(
+                query, document_limit=document_limit, chunk_limit=chunk_limit,
+            )
+        except Exception:
+            logger.exception("Native discovery failed for %s", collection_id)
+            return []
+
+    vector_hits, native_hits = await asyncio.gather(
+        vector_discovery(), native_discovery(),
+    )
     if use_reranker:
         hits = await rerank(indexer, collection, vector_hits + native_hits,
                             natural_query, limit)

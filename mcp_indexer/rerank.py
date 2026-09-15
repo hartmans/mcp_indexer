@@ -159,7 +159,7 @@ class QwenReranker(AbstractReranker):
         inputs = {key: value.to(self.model.device) for key, value in inputs.items()}
 
         with torch.inference_mode():
-            logits = self.model(**inputs).logits[:, -1, :]
+            logits = self.model(**inputs, logits_to_keep=1).logits[:, -1, :]
             pair_logits = torch.stack(
                 (logits[:, false_token_id], logits[:, true_token_id]), dim=1
             )

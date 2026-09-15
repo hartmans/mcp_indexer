@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from contextlib import asynccontextmanager
 
@@ -36,6 +37,7 @@ async def test_search_selection_with_and_without_reranking(monkeypatch, enabled)
     indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": source}))
 
     async def vector(*args):
+        assert events == (["setup"] if enabled else [])
         return hits
 
     async def assemble(indexer, collection, selected):
@@ -50,13 +52,38 @@ async def test_search_selection_with_and_without_reranking(monkeypatch, enabled)
 
 
 async def test_reranker_failure_retains_prepared_hits(caplog):
-    async def fail():
+    async def fail(*args, **kwargs):
         raise RuntimeError("model unavailable")
 
-    source = SimpleNamespace(id="test", reranker=SimpleNamespace(setup=fail))
+    source = SimpleNamespace(id="test", reranker=SimpleNamespace(score=fail))
     hits = [DocumentHit("first", 1, "summary")]
     assert await searching.rerank(None, source, hits, "query", 1) == hits
     assert "model unavailable" in caplog.text
+
+
+async def test_reranker_prepares_candidates_concurrently(monkeypatch):
+    started = set()
+    both_started = asyncio.Event()
+
+    async def summary(indexer, source, document_id):
+        started.add(document_id)
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+        return f"summary {document_id}"
+
+    class Reranker:
+        async def score(self, query, documents, top_n):
+            assert documents == ["summary first", "summary second"]
+            return [(0, 1.0), (1, 0.5)]
+
+    monkeypatch.setattr(searching, "_document_summary", summary)
+    source = SimpleNamespace(id="test", reranker=Reranker())
+    result = await searching.rerank(
+        object(), source,
+        [DocumentHit("first", 1), DocumentHit("second", 0.5)], "query", 2,
+    )
+    assert [hit.document_id for hit in result] == ["first", "second"]
 
 
 @pytest.mark.parametrize("natural", [None, "", " ", "how stars form"])
@@ -113,3 +140,35 @@ async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):
                                            [DocumentHit("doc", 1), hit, hit])
     assert result == [(document, [chunk])]
     assert result[0][0].summary == "fresh summary"
+
+
+async def test_assembly_processes_documents_concurrently(monkeypatch):
+    started = set()
+    both_started = asyncio.Event()
+
+    async def ensure(indexer, collection, document_id):
+        started.add(document_id)
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+
+    async def summary(*args):
+        return "summary"
+
+    class Session:
+        async def execute(self, statement):
+            document = SimpleNamespace(summary="summary", chunks=[])
+            return SimpleNamespace(scalar_one=lambda: document)
+
+    @asynccontextmanager
+    async def session():
+        yield Session()
+
+    monkeypatch.setattr(searching, "_ensure_indexed", ensure)
+    monkeypatch.setattr(searching, "_document_summary", summary)
+    indexer = SimpleNamespace(context=SimpleNamespace(get_session=session))
+    results = await asyncio.wait_for(searching.assemble_hits(
+        indexer, SimpleNamespace(id="test"),
+        [DocumentHit("first", 1), DocumentHit("second", 0.5)],
+    ), timeout=1)
+    assert len(results) == 2

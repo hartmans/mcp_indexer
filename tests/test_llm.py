@@ -134,7 +134,7 @@ async def test_embedding_worker_starts_lazily(mock_emb_factory):
 @pytest.mark.asyncio
 async def test_llm_batch_split(mock_llm_factory):
     caller = LlmCall(model="test", batch_timeout=0.05)
-    # Request 15 prompts -> should split into 10 and 5
+    # Request 15 prompts -> should split into 8 and 7
     prompts = [f"Prompt {i}" for i in range(15)]
     res = await caller(prompts)
     
@@ -142,12 +142,12 @@ async def test_llm_batch_split(mock_llm_factory):
     assert res[0] == "Response to Prompt 0"
     assert res[14] == "Response to Prompt 14"
     assert len(mock_llm_factory.calls) == 2
-    assert len(mock_llm_factory.calls[0]) == 10
-    assert len(mock_llm_factory.calls[1]) == 5
+    assert len(mock_llm_factory.calls[0]) == 8
+    assert len(mock_llm_factory.calls[1]) == 7
 
 @pytest.mark.asyncio
 async def test_llm_multi_request_batching(mock_llm_factory):
-    caller = LlmCall(model="test", batch_timeout=0.05)
+    caller = LlmCall(model="test", batch_size=10, batch_timeout=0.05)
     
     # Fire off two requests: one for 6, one for 4
     # These should be combined into one batch of 10

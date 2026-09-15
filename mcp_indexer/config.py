@@ -14,7 +14,7 @@ class ServerConfig(BaseModel):
     min_size: int = 500
     max_size: int = 5000
     max_to_summarize: int = 65536
-    llm_batch_size: int = 10
+    llm_batch_size: int = 8
     embedding_batch_size: int = 10
     llm_max_batch_size: int = 8
     embedding_max_batch_size: int = 64

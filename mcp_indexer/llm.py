@@ -128,7 +128,7 @@ class LlmCall(BatchCall):
     """
     def __init__(
         self,
-        batch_size: int = 10,
+        batch_size: int = 8,
         batch_timeout: float = 0.25,
         max_batch_size: int = 8,
         request_timeout: Optional[float] = 400.0,

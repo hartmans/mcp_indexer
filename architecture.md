@@ -52,8 +52,11 @@ The context includes:
 * Access to the configured embedding model
 * PostgreSQL/pgvector sessions
 * A shared reranker assigned to collections with reranking enabled. Context
-  construction does not load model weights; the first search requiring scoring
-  calls setup. The instance's semaphore coordinates scoring across collections.
+  construction does not load model weights; the first search on an enabled
+  collection completes setup before discovery can issue an embedding or summary
+  model request. This reserves local accelerator memory before another local
+  model server can claim it. The instance's semaphore coordinates scoring across
+  collections.
 
 ## Search
 
@@ -62,7 +65,8 @@ Sources may override `DocumentSource.native_search` to search a corpus that has
 not been embedded in advance. Source-independent vector search always searches
 the indexed subset of the collection. Native and vector search coexist.
 
-Discovery returns detached `DocumentHit` and `ChunkHit` values, not ORM objects.
+Vector and native discovery run concurrently. Discovery returns detached
+`DocumentHit` and `ChunkHit` values, not ORM objects.
 Document hits carry a document ID, score, and optional summary. Chunk hits carry
 a document ID, retrieval metadata, score, and an optional stored chunk ID. The
 metadata follows the existing semantic/embedding retrieval conventions. Native
@@ -83,7 +87,10 @@ Chunk scoring retrieves embedding-chunk text through the source. Reranking
 preparation may index candidates that ultimately are not selected; this work
 is independent of result assembly.
 
-Assembly processes selected hits only. Missing documents are fully chunked and
+Candidate text preparation runs concurrently, sharing one summary task for
+duplicate document hits so model requests can fill the configured batchers.
+Assembly processes selected documents concurrently and selected hits only.
+Missing documents are fully chunked and
 embedded; persisted documents are not reindexed by search. If a document has
 indexed chunks, its complete set of chunks is stored. Embeddings remain
 non-null. Semantic chunks and their summary spans retain their existing meaning.

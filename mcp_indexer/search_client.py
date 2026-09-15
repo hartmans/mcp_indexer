@@ -13,6 +13,44 @@ from .search import search
 from .server import result_info
 
 
+class _SuppressHttpLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(
+            record.name == namespace or record.name.startswith(namespace + ".")
+            for namespace in ("httpx", "httpcore", "httpx2", "httpcore2")
+        )
+
+
+class _ReadableDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_string(dumper: yaml.SafeDumper, value: str):
+    style = "|" if "\n" in value else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+_ReadableDumper.add_representer(str, _represent_string)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(level=logging.INFO)
+    suppress_http = _SuppressHttpLogs()
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(suppress_http)
+
+
+def format_results(results) -> str:
+    return yaml.dump(
+        results,
+        Dumper=_ReadableDumper,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+        width=120,
+    )
+
+
 def split_query(line: str) -> tuple[str, str | None]:
     """Split native discovery syntax from an optional natural-language query."""
     query, separator, rerank_query = line.partition(" => ")
@@ -78,17 +116,11 @@ async def run_repl(args: argparse.Namespace) -> None:
             chunk_candidate_limit=args.chunk_candidate_limit,
             rerank_query=rerank_query,
         )
-        print(
-            yaml.dump(
-                result_info(results, context.collections),
-                default_flow_style=False,
-                sort_keys=False,
-            )
-        )
+        print(format_results(result_info(results, context.collections)))
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args()
     await run_repl(args)

@@ -1,5 +1,6 @@
 """PostgreSQL checks to run once the existing test database is available."""
 from contextlib import asynccontextmanager
+import asyncio
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,6 +100,31 @@ async def test_collection_rename_preserves_local_ids(test_context, tmp_path):
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
         assert chunks[0].chunk_id == "article.txt?c=0"
         assert chunks[0].collection_id == "renamed"
+
+
+async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_path, monkeypatch):
+    indexer, source = make_indexer(test_context, tmp_path)
+    (tmp_path / "article.txt").write_text("First section.\n\n# Second\nSecond section.")
+    await indexer.ensure_document_indexed(source, "article.txt")
+    chunks = await indexer._reconstruct_semantic_chunks(source, "article.txt")
+    assert len(chunks) == 2
+    started = []
+    ready = asyncio.Event()
+
+    async def summarize(text, prompt):
+        started.append(text)
+        if len(started) == 2:
+            ready.set()
+        await ready.wait()
+        return "Summary: " + text
+
+    monkeypatch.setattr(indexer, "_summarize_text", summarize)
+    await asyncio.wait_for(indexer.summarize_document_chunks(source, "article.txt"), 5)
+    async with source.context.get_session() as session:
+        summaries = (await session.execute(
+            select(ChunkSummary).order_by(ChunkSummary.summary_span)
+        )).scalars().all()
+        assert [s.summary for s in summaries] == ["Summary: " + c.text for c in chunks]
 
 
 async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, monkeypatch):

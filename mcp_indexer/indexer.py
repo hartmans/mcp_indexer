@@ -608,27 +608,13 @@ class Indexer:
         updated_rows: list[dict[str, Any]] = []
         summary_records: list[ChunkSummary] = []
         next_summary_span = 0
+        all_spans: list[SummarySpan] = []
 
         for semantic_chunk in semantic_chunks:
             spans = self._split_summary_spans(
                 semantic_chunk.text, self.server_config.max_to_summarize
             )
-            summaries = await asyncio.gather(
-                *[
-                    self._summarize_text(span.text, summary_prompt)
-                    for span in spans
-                ]
-            )
-
-            for offset, summary in enumerate(summaries):
-                summary_records.append(
-                    ChunkSummary(
-                        collection_id=source.id,
-                        document_id=document_id,
-                        summary_span=next_summary_span + offset,
-                        summary=summary,
-                    )
-                )
+            all_spans.extend(spans)
 
             for row in semantic_chunk.embedding_rows:
                 metadata = self._deserialize_metadata(row.metadata_str)
@@ -642,6 +628,20 @@ class Indexer:
                 updated_rows.append(updated)
 
             next_summary_span += len(spans)
+
+        # Submit across semantic boundaries so the model batcher can stay full.
+        summaries = await asyncio.gather(*(
+            self._summarize_text(span.text, summary_prompt) for span in all_spans
+        ))
+        summary_records = [
+            ChunkSummary(
+                collection_id=source.id,
+                document_id=document_id,
+                summary_span=offset,
+                summary=summary,
+            )
+            for offset, summary in enumerate(summaries)
+        ]
 
         # Guard and write summaries/references together; refresh may have replaced
         # the document while the model was working.

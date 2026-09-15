@@ -109,6 +109,34 @@ def test_score_sync_batches_documents(monkeypatch):
     ]
 
 
+def test_score_only_requests_last_token_logits(monkeypatch):
+    import torch
+
+    calls = []
+
+    class Tokenizer:
+        def convert_tokens_to_ids(self, token):
+            return {"no": 0, "yes": 1}[token]
+
+        def __call__(self, prompts, **kwargs):
+            return {"input_ids": torch.ones((len(prompts), 3), dtype=torch.long)}
+
+    class Model:
+        device = torch.device("cpu")
+
+        def __call__(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(logits=torch.tensor([[[0.0, 1.0]]] * 2))
+
+    reranker = QwenReranker()
+    reranker.tokenizer = Tokenizer()
+    reranker.model = Model()
+    monkeypatch.setattr(reranker, "_format_prompt", lambda query, document: document)
+
+    assert len(reranker._score_batch_sync("query", ["one", "two"])) == 2
+    assert calls[0]["logits_to_keep"] == 1
+
+
 async def test_score_requires_setup():
     with pytest.raises(RuntimeError, match="setup"):
         await QwenReranker().score("query", ["document"])
