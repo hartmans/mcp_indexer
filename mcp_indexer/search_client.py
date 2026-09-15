@@ -13,6 +13,14 @@ from .search import search
 from .server import result_info
 
 
+def split_query(line: str) -> tuple[str, str | None]:
+    """Split native discovery syntax from an optional natural-language query."""
+    query, separator, rerank_query = line.partition(" => ")
+    if not separator:
+        return line.strip(), None
+    return query.strip(), rerank_query.strip() or None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive search client")
     parser.add_argument("-c", "--config", action="append", default=[],
@@ -45,7 +53,7 @@ async def run_repl(args: argparse.Namespace) -> None:
 
     while True:
         try:
-            query = input("query> ").strip()
+            query_input = input("query> ")
         except EOFError:
             print()
             break
@@ -53,10 +61,13 @@ async def run_repl(args: argparse.Namespace) -> None:
             print()
             continue
 
+        if not query_input.strip():
+            continue
+        if query_input.strip() in {"quit", "exit"}:
+            break
+        query, rerank_query = split_query(query_input)
         if not query:
             continue
-        if query in {"quit", "exit"}:
-            break
 
         results = await search(
             indexer,
@@ -65,6 +76,7 @@ async def run_repl(args: argparse.Namespace) -> None:
             limit=args.limit,
             document_candidate_limit=args.document_candidate_limit,
             chunk_candidate_limit=args.chunk_candidate_limit,
+            rerank_query=rerank_query,
         )
         print(
             yaml.dump(

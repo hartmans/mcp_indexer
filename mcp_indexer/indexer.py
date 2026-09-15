@@ -968,6 +968,7 @@ async def main():
     logging.getLogger("httpx").setLevel(logging.ERROR)
 
     ctx = Context.build_context(args.config)
+    await ctx.init_db()
     indexer = Indexer(ctx, debug=args.debug)
     await indexer.index_all(
         index=run_index,

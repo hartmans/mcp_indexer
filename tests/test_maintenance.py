@@ -118,6 +118,7 @@ async def test_cli_maintenance_is_an_independent_operation(monkeypatch, flags, e
     import sys
     from mcp_indexer import indexer as module
     calls = []
+    initialized = []
     class FakeIndexer:
         def __init__(self, *args, **kwargs):
             pass
@@ -127,8 +128,12 @@ async def test_cli_maintenance_is_an_independent_operation(monkeypatch, flags, e
             pass
     monkeypatch.setattr(sys, "argv", ["indexer", "-c", "example.toml", *flags])
     monkeypatch.setattr(module, "Indexer", FakeIndexer)
-    monkeypatch.setattr(module.Context, "build_context", lambda paths: object())
+    async def init_db():
+        initialized.append(True)
+    context = SimpleNamespace(init_db=init_db)
+    monkeypatch.setattr(module.Context, "build_context", lambda paths: context)
     await module.main()
+    assert initialized == [True]
     assert calls == [expected]
 
 
