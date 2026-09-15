@@ -1,6 +1,8 @@
 """Search an extracted MediaWiki corpus through its existing Xapian index."""
 import asyncio
+import hashlib
 from pathlib import Path
+from typing import Any
 
 from .text_source import TextFileSource, TextFileSourceConfig, TextFilePointer
 from ..search import DocumentHit, SearchHit
@@ -11,12 +13,20 @@ class WikipediaSourceConfig(TextFileSourceConfig):
 
 
 class WikipediaPointer(TextFilePointer):
-    async def get_metadata(self) -> dict[str, str]:
-        return {**await super().get_metadata(), "title": self.path.stem}
+    async def get_metadata(self) -> dict[str, Any]:
+        title = self.path.stem
+        keywords = await asyncio.to_thread(self.source._xapian_keywords, title)
+        return {
+            **await super().get_metadata(),
+            "title": title,
+            "title_strength": 10,
+            "keywords": keywords,
+        }
 
 
 class WikipediaSource(TextFileSource):
     source_prefix = "wikipedia"
+    pointer_type = WikipediaPointer
     default_indexing_mode = "indexed"
     separate_rerank = True
     semantic_boundary_regexps = (rb"(?m)^={2,6}[^\n]+?={2,6}[ \t]*$",)
@@ -30,8 +40,34 @@ class WikipediaSource(TextFileSource):
     def _is_included(self, path: Path) -> bool:
         return path.suffix == ".mediawiki" and super()._is_included(path)
 
-    def fetch_document(self, document_id: str) -> WikipediaPointer:
-        return WikipediaPointer(self, document_id, self._document_path(document_id))
+    def _xapian_keywords(self, title: str) -> list[str]:
+        import xapian
+
+        unique_term = "Q" + (
+            title if len(title) < 200 else hashlib.sha256(title.encode()).hexdigest()
+        )
+        try:
+            database = xapian.Database(str(self.source_config.xapian_directory))
+        except xapian.Error:
+            return []
+        try:
+            postings = database.postlist(unique_term)
+            try:
+                posting = next(iter(postings))
+            except StopIteration:
+                return []
+            document = database.get_document(posting.docid)
+            if document.get_data().decode("utf-8") != title:
+                return []
+            return sorted({
+                term.term.decode("utf-8")[1:]
+                for term in document.termlist()
+                if term.term.startswith(b"C") and len(term.term) > 1
+            })
+        except (UnicodeDecodeError, xapian.Error):
+            return []
+        finally:
+            database.close()
 
     async def native_search(
         self, query: str, *, document_limit: int, chunk_limit: int,

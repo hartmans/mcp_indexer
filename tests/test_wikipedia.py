@@ -5,7 +5,7 @@ import pytest
 from mcp_indexer.config import CollectionConfig
 from mcp_indexer.plugins.base import DocumentNotFoundError, create_embedding_chunks
 from mcp_indexer.plugins.text_source import TextFileSource
-from mcp_indexer.plugins.wikipedia import WikipediaSource
+from mcp_indexer.plugins.wikipedia import WikipediaPointer, WikipediaSource
 
 
 def source_for(tmp_path, **config_values):
@@ -35,8 +35,12 @@ async def test_wikipedia_raw_text_round_trip(tmp_path):
     pointers = [p async for p in source.get_documents()]
     assert len(pointers) == 1
     pointer = pointers[0]
+    assert isinstance(pointer, WikipediaPointer)
     assert pointer.document_id == source.encode_document_path(filename)
-    assert (await pointer.get_metadata())["title"] == "100% Élan"
+    metadata = await pointer.get_metadata()
+    assert metadata["title"] == "100% Élan"
+    assert metadata["title_strength"] == 10
+    assert metadata["keywords"] == []
     semantic = [chunk async for chunk in pointer.get_chunks(1, 8)]
     assert len(semantic) == 2
     assert "".join("".join(parts) for _, parts in semantic) == text
@@ -75,6 +79,7 @@ async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypat
         for name in ["100% Élan", "Other"]:
             document = xapian.Document()
             document.set_data(name)
+            document.add_boolean_term("Q" + name)
             generator = xapian.TermGenerator()
             generator.set_document(document)
             generator.set_stemmer(xapian.Stem("english"))
@@ -85,6 +90,9 @@ async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypat
         database.commit()
     finally:
         database.close()
+    (tmp_path / "100% Élan.mediawiki").write_text("Article")
+    metadata = await source.fetch_document("100%25%20%C3%89lan.mediawiki").get_metadata()
+    assert metadata["keywords"] == ["physics"]
     def unexpected_fetch(*args):
         raise AssertionError("Native discovery must not probe article presence")
     monkeypatch.setattr(source, "fetch_document", unexpected_fetch)

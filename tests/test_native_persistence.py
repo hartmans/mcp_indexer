@@ -101,6 +101,23 @@ async def test_collection_rename_preserves_local_ids(test_context, tmp_path):
         assert chunks[0].collection_id == "renamed"
 
 
+async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, monkeypatch):
+    indexer, source = make_indexer(test_context, tmp_path)
+    (tmp_path / "article.txt").write_text("Article")
+    pointer = source.fetch_document("article.txt")
+
+    async def metadata():
+        return {"title": "Article", "keywords": ["Good_Key", "bad keyword", "GOOD_KEY"]}
+
+    monkeypatch.setattr(pointer, "get_metadata", metadata)
+    await indexer.index_document(
+        pointer, DocumentIndexingStats(pointer.document_id, "index", source=source),
+    )
+    async with source.context.get_session() as session:
+        document = await session.get(Document, (source.id, pointer.document_id))
+        assert document.keywords == ["good-key"]
+
+
 async def test_manual_migration_from_legacy_constraints(test_context):
     async with test_context.engine.begin() as connection:
         await connection.exec_driver_sql("ALTER TABLE document_chunk DROP CONSTRAINT fk_document_chunk_document")

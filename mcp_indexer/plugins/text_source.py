@@ -25,6 +25,7 @@ class TextFileSource(FileSource[TextFilePointer]):
     """
     
     source_prefix = "text"
+    pointer_type: type[TextFilePointer] = TextFilePointer
 
     # Semantic boundaries:
     # 1. RST style headers (underline of = or -)
@@ -76,4 +77,4 @@ class TextFileSource(FileSource[TextFilePointer]):
     def fetch_document(self, document_id: str) -> TextFilePointer:
         """Resolves a document_id into a TextFilePointer."""
         absolute_path = self._document_path(document_id)
-        return TextFilePointer(self, document_id, absolute_path)
+        return self.pointer_type(self, document_id, absolute_path)

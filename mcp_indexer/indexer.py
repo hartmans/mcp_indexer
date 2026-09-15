@@ -584,7 +584,7 @@ class Indexer:
             last_modified=pointer.last_modified,
             summary="",
             embedding=[0.0] * VECTOR_DIMENSIONS,
-            keywords=metadata_dict.get("keywords", []),
+            keywords=normalize_keywords(metadata_dict.get("keywords", [])),
         )
         # Attach chunks to document for cascade merge
         doc_record.chunks = all_chunks
@@ -746,7 +746,8 @@ class Indexer:
             last_modified=expected_mtime,
             summary=final_summary,
             embedding=doc_vector,
-            keywords=extracted_keywords if extracted_keywords else metadata_dict.get("keywords", []),
+            keywords=(extracted_keywords if extracted_keywords else
+                      normalize_keywords(metadata_dict.get("keywords", []))),
         )
 
         return await self._update_document(source, doc_record)
