@@ -20,6 +20,7 @@ dependencies = [
     "psycopg[binary]",
     "langchain-openai",
     "langchain-ollama",
+    "mwparserfromhell",
 ]
 
 [project.optional-dependencies]

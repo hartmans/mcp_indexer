@@ -103,3 +103,55 @@ async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypat
     assert len(await source.native_search("physics", document_limit=1, chunk_limit=0)) == 1
     assert await source.native_search("physics", document_limit=0, chunk_limit=5) == []
     assert await source.native_search(" ", document_limit=2, chunk_limit=0) == []
+
+
+def _lead_wikitext() -> str:
+    return (
+        "{{Short description|A fictional article}}\n"
+        "{{Infobox\n"
+        "|name = Test article\n"
+        "|caption = an infobox\n"
+        "}}\n"
+        "[[File:example.jpg|thumb|An image]]\n"
+        "'''Test article''' is a thing. It is {{inline template|a=1}} described in prose.\n"
+        "\n"
+        "== History ==\n"
+        "History body that must not appear in the summary.\n"
+        "\n"
+        "== See also ==\n"
+        "See also body.\n"
+    )
+
+
+async def test_wikipedia_summary_is_structural_lead(tmp_path):
+    pytest.importorskip("mwparserfromhell")
+    (tmp_path / "Test article.mediawiki").write_text(_lead_wikitext(), encoding="utf-8")
+    source = source_for(tmp_path)
+    summary = await source.get_document_summary("Test%20article.mediawiki")
+
+    # The lead renders to plain text: prose survives, wikilinks become their
+    # display text, and nothing after the first heading does.
+    assert summary == "Test article is a thing. It is described in prose."
+    for markup in ("{{", "[[", "'''", "Short description", "Infobox",
+                   "File:", "History body", "See also body"):
+        assert markup not in summary
+
+
+async def test_wikipedia_summary_empty_without_prose(tmp_path):
+    pytest.importorskip("mwparserfromhell")
+    # Only block markup and a magic word: no actual introductory prose.
+    (tmp_path / "Empty.mediawiki").write_text(
+        "{{Short description|no prose here}}\n"
+        "{{Infobox}}\n"
+        "__NOTOC__\n",
+        encoding="utf-8",
+    )
+    source = source_for(tmp_path)
+    assert await source.get_document_summary("Empty.mediawiki") == ""
+
+
+async def test_wikipedia_summary_missing_document(tmp_path):
+    pytest.importorskip("mwparserfromhell")
+    source = source_for(tmp_path)
+    with pytest.raises(DocumentNotFoundError):
+        await source.get_document_summary("absent.mediawiki")
