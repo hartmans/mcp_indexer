@@ -34,6 +34,33 @@ def test_batch_concurrency_defaults(tmp_path):
     assert server.embedding_max_batch_size == 64
 
 
+def test_rerank_config_defaults_to_qwen(tmp_path):
+    conf_file = tmp_path / "empty.toml"
+    conf_file.write_text("")
+
+    config = ConfigManager(str(conf_file)).get_rerank_config()
+
+    assert config.plugin == "qwen"
+    assert config.command_line is None
+    assert config.url == "http://127.0.0.1:8080/v1"
+
+
+def test_llama_cpp_rerank_config(tmp_path):
+    conf_file = tmp_path / "llama.toml"
+    conf_file.write_text(
+        '[rerank]\nplugin = "llama_cpp"\n'
+        'model = "Qwen/Qwen3-Reranker-0.6B"\n'
+        'command_line = ["llama-server", "-m", "/models/reranker.gguf", '
+        '"--embedding", "--rerank"]\n'
+    )
+
+    config = ConfigManager(str(conf_file)).get_rerank_config()
+
+    assert config.plugin == "llama_cpp"
+    assert config.command_line[0] == "llama-server"
+    assert config.model == "Qwen/Qwen3-Reranker-0.6B"
+
+
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [

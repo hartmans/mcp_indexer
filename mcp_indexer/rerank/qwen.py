@@ -1,48 +1,16 @@
-"""Local reranking models."""
+"""In-process Qwen3 reranker."""
 
 from __future__ import annotations
 
 import asyncio
-from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Any, TypeAlias
+from typing import Any
 
-RerankResult: TypeAlias = tuple[int, float]
-
-
-class AbstractReranker(ABC):
-    """Interface for allocating and invoking a reranker.
-
-    Enabled collections share one instance so its scoring semaphore limits
-    concurrent calls across collections. Construction must not load the model;
-    search calls setup on first use and awaits it before scoring.
-    """
-
-    @abstractmethod
-    async def setup(self) -> None:
-        """Download the model, allocate its resources, and make it ready.
-
-        Must be idempotent and coordinate concurrent callers: simultaneous
-        first searches must initialize the shared model only once. Subsequent
-        calls after successful initialization must reuse the allocated model.
-        """
-
-    @abstractmethod
-    async def score(
-        self,
-        query: str,
-        documents: Sequence[str],
-        top_n: int | None = None,
-    ) -> list[RerankResult]:
-        """Return ``(document_index, score)`` pairs in descending score order."""
+from .base import AbstractReranker, RerankResult
 
 
 class QwenReranker(AbstractReranker):
-    """Run a Qwen3 reranker locally with Transformers.
-
-    CUDA hosts use the 4B model with 8-bit weights. CPU-only hosts use the
-    0.6B model without bitsandbytes quantization.
-    """
+    """Run a Qwen3 reranker locally with Transformers."""
 
     CPU_MODEL = "Qwen/Qwen3-Reranker-0.6B"
     CUDA_MODEL = "Qwen/Qwen3-Reranker-4B"
@@ -75,7 +43,6 @@ class QwenReranker(AbstractReranker):
         self.tokenizer: Any | None = None
 
     async def setup(self) -> None:
-        """Select, download, and load the model for the available hardware."""
         async with self._setup_lock, self.semaphore:
             if self.model is not None:
                 return
@@ -133,11 +100,9 @@ class QwenReranker(AbstractReranker):
         assert self.tokenizer is not None
 
         scores: list[float] = []
-
         for offset in range(0, len(documents), self.batch_size):
             batch = documents[offset : offset + self.batch_size]
             scores.extend(self._score_batch_sync(query, batch))
-
         return scores
 
     def _score_batch_sync(self, query: str, documents: Sequence[str]) -> list[float]:

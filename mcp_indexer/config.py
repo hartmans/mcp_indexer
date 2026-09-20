@@ -23,6 +23,18 @@ class ServerConfig(BaseModel):
     llm_timeout_retries: int = 20
     embedding_timeout_retries: int = 20
 
+
+class RerankConfig(BaseModel):
+    """Configuration for the shared reranker."""
+
+    model_config = ConfigDict(extra="forbid")
+    plugin: Literal["qwen", "llama_cpp"] = "qwen"
+    command_line: list[str] | None = None
+    url: str = "http://127.0.0.1:8080/v1"
+    model: str | None = None
+    startup_timeout: float = 60.0
+    request_timeout: float = 400.0
+
 class CollectionInfraConfig(BaseModel):
     """
     Shared infrastructure configuration for collections.
@@ -91,6 +103,10 @@ class ConfigManager:
     def get_server_config(self) -> ServerConfig:
         """Returns the [server] section as a validated ServerConfig."""
         return ServerConfig.model_validate(self._raw_config.get("server", {}))
+
+    def get_rerank_config(self) -> RerankConfig:
+        """Return the global ``[rerank]`` section."""
+        return RerankConfig.model_validate(self._raw_config.get("rerank", {}))
 
     def list_collections(self) -> list[str]:
         """Returns a list of all configured collection IDs."""

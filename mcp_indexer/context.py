@@ -119,9 +119,20 @@ class Context:
 
             if col_config.rerank:
                 if reranker is None:
-                    from mcp_indexer.rerank import QwenReranker
+                    from mcp_indexer.rerank import LlamaCppReranker, QwenReranker
 
-                    reranker = QwenReranker()
+                    get_config = getattr(self.config, "get_rerank_config", None)
+                    rerank_config = get_config() if get_config is not None else None
+                    if rerank_config is None or rerank_config.plugin == "qwen":
+                        reranker = QwenReranker()
+                    else:
+                        reranker = LlamaCppReranker(
+                            url=rerank_config.url,
+                            model=rerank_config.model,
+                            command_line=rerank_config.command_line,
+                            startup_timeout=rerank_config.startup_timeout,
+                            request_timeout=rerank_config.request_timeout,
+                        )
             source = cls(
                 collection_id=collection_id,
                 context=self,

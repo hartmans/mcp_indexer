@@ -160,3 +160,18 @@ Configuration is managed via a TOML file and supports a hierarchical structure:
     *   **Source Config**: A plugin-specific configuration blob. The `DocumentSource` plugin is responsible for validating this blob into its own schema.
 
 *ConfigManager* is a class that collects all the configuration together.
+
+### Reranker configuration
+
+The optional global `[rerank]` section selects the single reranker shared by
+collections whose `rerank` setting is enabled. `plugin = "qwen"` (the default)
+uses the in-process Transformers implementation. `plugin = "llama_cpp"` with a
+`url` connects to an existing llama.cpp TCP server and follows OpenAI client
+base-URL convention, including the `/v1` suffix by default. An optional `model`
+selects the served model and is included in rerank requests; it is needed when
+the server requires explicit model selection, such as vLLM. Supplying `command_line`
+instead makes the indexer launch that command on a temporary Unix-domain socket;
+the command contains the model and reranking flags, while the indexer appends
+the socket `--host` argument. Both transports use the base URL's `/models` for
+readiness and its vLLM-compatible `/rerank` API for scoring. No request escapes
+the configured base-URL path.

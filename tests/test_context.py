@@ -96,3 +96,58 @@ async def test_build_collections_assigns_configured_reranker(monkeypatch):
     assert context.collections["enabled-one"].reranker is reranker
     assert context.collections["enabled-two"].reranker is reranker
     assert context.collections["disabled"].reranker is None
+
+
+async def test_build_collections_selects_llama_cpp_reranker(monkeypatch):
+    from mcp_indexer.config import CollectionConfig, RerankConfig
+    from mcp_indexer.context import SOURCE_REGISTRY
+    from mcp_indexer.plugins.base import DocumentSource
+    import mcp_indexer.rerank
+
+    class TestSource(DocumentSource):
+        source_prefix = "context-llama-rerank-test"
+
+    class FakeLlamaCppReranker:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    collection = CollectionConfig.model_validate(
+        {
+            "collection_id": "docs",
+            "tool_prefix": "docs",
+            "rerank": True,
+            "source_blob": {"type": "context-llama-rerank-test"},
+        }
+    )
+    rerank_config = RerankConfig(
+        plugin="llama_cpp",
+        url="http://reranker:8080",
+        model="reranker-model",
+        request_timeout=12,
+    )
+    config = SimpleNamespace(
+        list_collections=lambda: ["docs"],
+        get_collection_config=lambda collection_id: collection,
+        get_rerank_config=lambda: rerank_config,
+    )
+    context = Context(
+        engine=None,
+        session_factory=None,
+        embedding=None,
+        llm=None,
+        config=config,
+    )
+    monkeypatch.setattr(
+        mcp_indexer.rerank, "LlamaCppReranker", FakeLlamaCppReranker
+    )
+
+    try:
+        await context.build_collections()
+    finally:
+        SOURCE_REGISTRY.pop("context-llama-rerank-test", None)
+
+    reranker = context.collections["docs"].reranker
+    assert isinstance(reranker, FakeLlamaCppReranker)
+    assert reranker.kwargs["url"] == "http://reranker:8080"
+    assert reranker.kwargs["model"] == "reranker-model"
+    assert reranker.kwargs["request_timeout"] == 12
