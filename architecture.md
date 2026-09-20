@@ -175,3 +175,30 @@ the command contains the model and reranking flags, while the indexer appends
 the socket `--host` argument. Both transports use the base URL's `/models` for
 readiness and its vLLM-compatible `/rerank` API for scoring. No request escapes
 the configured base-URL path.
+### Search score thresholds and diagnostics
+
+Discovery quality is bounded by two overridable thresholds, both exposed as
+`[defaults]` infrastructure settings and per-collection overrides (and
+therefore inherited like `indexing_mode` and `rerank`):
+
+*   `min_cosine_distance`. Vector discovery excludes, in the
+    database query, any document or chunk whose pgvector cosine distance
+    exceeds this value. The predicate sits in the SQL `WHERE` clause ahead of
+    the per-type `LIMIT`, so distant rows are never fetched only to be
+    dropped in Python. The per-type limit then applies to the filtered set.
+*   `min_rerank_score`. When a reranker is active, ranked
+    candidates scoring below this value are dropped before the result limit is
+    applied, so a low-scoring candidate does not consume a result slot.
+
+Both are `CollectionInfraConfig` fields, so they default from the model and
+are overridable per collection or through `[defaults]`. `search()` reads both
+from the collection's `CollectionConfig` and threads them through
+`vector_search_hits` and `rerank`.
+
+Per-hit score diagnostics are logged by `search` at the DEBUG level: the
+native score of each native hit, the cosine distance of each vector hit, and
+the reranker score of each reranked hit (or the retained initial score when
+reranking fails). They are silent at the default logging level.
+`set_debug_search()` toggles this module's logger between INFO and DEBUG; the
+search client's `--debug-search` argument calls it so the diagnostics appear
+on demand.

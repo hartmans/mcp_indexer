@@ -45,6 +45,8 @@ class CollectionInfraConfig(BaseModel):
     chunk_summary_prompt: str = ""
     rerank: bool = False
     indexing_mode: Literal["full", "indexed"] | None = None
+    min_cosine_distance: float = 0.65
+    min_rerank_score: float = 0.5
     
 class CollectionConfig(CollectionInfraConfig):
     """

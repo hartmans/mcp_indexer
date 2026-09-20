@@ -86,6 +86,40 @@ def test_collection_rerank_boolean_values(configured, expected):
     assert config.rerank is expected
 
 
+def test_search_threshold_defaults(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[collections.wiki]\ntool_prefix = "wiki"\n')
+    config = ConfigManager(str(config_file)).get_collection_config("wiki")
+    assert config.min_cosine_distance == 0.65
+    assert config.min_rerank_score == 0.5
+
+
+def test_search_thresholds_overridable_from_defaults_and_collection(tmp_path):
+    base = tmp_path / "base.toml"
+    base.write_text('[collections.wiki]\ntool_prefix = "wiki"\n')
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text(
+        '[defaults]\n'
+        'min_cosine_distance = 0.8\n'
+        'min_rerank_score = 0.4\n'
+    )
+    assert ConfigManager([str(base), str(defaults)]).get_collection_config(
+        "wiki",
+    ).min_cosine_distance == 0.8
+
+    override = tmp_path / "override.toml"
+    override.write_text(
+        '[collections.wiki]\n'
+        'tool_prefix = "wiki"\n'
+        'min_rerank_score = 0.9\n'
+    )
+    config = ConfigManager(
+        [str(base), str(defaults), str(override)],
+    ).get_collection_config("wiki")
+    assert config.min_cosine_distance == 0.8
+    assert config.min_rerank_score == 0.9
+
+
 class TestDeepMerge:
     def test_deep_merge_dicts(self):
         base = {"a": 1, "b": {"x": 10, "y": 20}, "c": [1, 2]}

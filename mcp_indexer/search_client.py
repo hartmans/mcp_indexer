@@ -9,7 +9,7 @@ import yaml
 
 from .context import Context
 from .indexer import Indexer
-from .search import search
+from .search import search, set_debug_search
 from .server import result_info
 
 
@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Candidate chunk hit limit before global ranking",
     )
+    parser.add_argument(
+        "--debug-search",
+        action="store_true",
+        help="Log per-hit native, cosine, and reranker scores",
+    )
     return parser
 
 
@@ -87,6 +92,8 @@ async def run_repl(args: argparse.Namespace) -> None:
         raise KeyError(f"Unknown collection_id: {args.collection_id}")
 
     indexer = Indexer(context)
+    if args.debug_search:
+        set_debug_search()
     readline.parse_and_bind("tab: complete")
 
     while True:

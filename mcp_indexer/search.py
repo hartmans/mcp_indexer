@@ -22,6 +22,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def set_debug_search(enabled: bool = True) -> None:
+    """Enable or disable per-hit search score diagnostics.
+
+    The diagnostics are logged by this module at DEBUG level; they stay
+    quiet at the default logging level and appear once the effective level
+    of this logger reaches DEBUG (for example, the search client's
+    ``--debug-search`` argument).
+    """
+    logger.setLevel(logging.DEBUG if enabled else logging.INFO)
+
+
 @dataclass
 class DocumentHit:
     document_id: str
@@ -42,11 +53,14 @@ SearchHit = DocumentHit | ChunkHit
 
 async def vector_search_hits(
     collection: DocumentSource, query: str, document_limit: int, chunk_limit: int,
+    min_cosine_distance: float,
 ) -> list[SearchHit]:
     """Return document hits followed by chunk hits, each ranked by distance.
 
     Scores are negative cosine distances (larger is better). They are not
-    compared with native scores or across the two lists.
+    compared with native scores or across the two lists. Hits whose cosine
+    distance exceeds ``min_cosine_distance`` are excluded in the database
+    query, before the per-type limit is applied.
     """
     context = collection.context
     vector = await context.embedding.query(query)
@@ -60,7 +74,10 @@ async def vector_search_hits(
                 (DocumentChunk.document_id, DocumentChunk.chunk_id,
                  DocumentChunk.metadata_str, distance.label("distance"))
             )
-            statement = select(*columns).where(model.collection_id == collection.id)
+            statement = select(*columns).where(
+                model.collection_id == collection.id,
+                distance <= min_cosine_distance,
+            )
             if model is Document:
                 # Zero vectors cannot be useful document-level candidates.
                 statement = statement.where(Document.summary != "")
@@ -71,14 +88,19 @@ async def vector_search_hits(
                 rows = (await session.execute(statement.limit(count))).mappings().all()
             for row in rows:
                 if model is Document:
-                    hits.append(DocumentHit(row["document_id"], -row["distance"], row["summary"]))
+                    hit = DocumentHit(row["document_id"], -row["distance"], row["summary"])
                 else:
                     from .models import deserialize_metadata
 
-                    hits.append(ChunkHit(
+                    hit = ChunkHit(
                         row["document_id"], deserialize_metadata(row["metadata_str"]),
                         -row["distance"], row["chunk_id"],
-                    ))
+                    )
+                logger.debug(
+                    "vector hit for %s: %s cosine_distance=%.4f",
+                    collection.id, hit.document_id, row["distance"],
+                )
+                hits.append(hit)
         except Exception:
             logger.exception("Vector search failed for %s (%s)", collection.id, model.__name__)
     return hits
@@ -111,9 +133,13 @@ async def _document_summary(indexer: Indexer, source: DocumentSource, document_i
 
 async def rerank(
     indexer: Indexer, collection: DocumentSource, hits: list[SearchHit],
-    rerank_query: str, hit_limit: int,
+    rerank_query: str, hit_limit: int, min_rerank_score: float,
 ) -> list[SearchHit]:
-    """Prepare candidates independently of assembly and return selected hits."""
+    """Prepare candidates independently of assembly and return selected hits.
+
+    Reranked candidates scoring below ``min_rerank_score`` are dropped before
+    the result limit is applied.
+    """
     summary_tasks: dict[str, asyncio.Task[str]] = {}
 
     async def prepare(hit: SearchHit) -> tuple[SearchHit, str]:
@@ -149,9 +175,24 @@ async def rerank(
         return []
     try:
         ranking = await collection.reranker.score(rerank_query, texts, top_n=hit_limit)
-        return [replace(prepared[index], score=score) for index, score in ranking]
+        selected = []
+        for index, score in ranking:
+            logger.debug(
+                "reranked %s: rerank_score=%.4f", prepared[index].document_id, score,
+            )
+            if score < min_rerank_score:
+                continue
+            selected.append(replace(prepared[index], score=score))
+            if len(selected) == hit_limit:
+                break
+        return selected
     except Exception:
         logger.exception("Reranking failed for %s; using initial ordering", collection.id)
+        for prepared_hit in prepared[:hit_limit]:
+            logger.debug(
+                "rerank fallback for %s: rerank_score=n/a initial_score=%.4f",
+                prepared_hit.document_id, prepared_hit.score,
+            )
         return prepared[:hit_limit]
 
 
@@ -219,6 +260,8 @@ async def search(
     if limit <= 0:
         return []
     collection = indexer.context.collections[collection_id]
+    min_cosine_distance = collection.config.min_cosine_distance
+    min_rerank_score = collection.config.min_rerank_score
     use_reranker = collection.reranker is not None
     if use_reranker:
         try:
@@ -235,6 +278,7 @@ async def search(
         try:
             return await vector_search_hits(
                 collection, natural_query, document_limit, chunk_limit,
+                min_cosine_distance,
             )
         except Exception:
             logger.exception("Vector discovery failed for %s", collection_id)
@@ -242,19 +286,23 @@ async def search(
 
     async def native_discovery() -> list[SearchHit]:
         try:
-            return await collection.native_search(
+            hits = await collection.native_search(
                 query, document_limit=document_limit, chunk_limit=chunk_limit,
             )
         except Exception:
             logger.exception("Native discovery failed for %s", collection_id)
             return []
+        for hit in hits:
+            logger.debug("native hit for %s: %s native_score=%.4f",
+                         collection_id, hit.document_id, hit.score)
+        return hits
 
     vector_hits, native_hits = await asyncio.gather(
         vector_discovery(), native_discovery(),
     )
     if use_reranker:
         hits = await rerank(indexer, collection, vector_hits + native_hits,
-                            natural_query, limit)
+                            natural_query, limit, min_rerank_score)
     else:
         hits = []
         for candidates in (vector_hits, native_hits):
