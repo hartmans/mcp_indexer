@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from .context import Context
 from .indexer import Indexer
-from .search import search
+from .search import SearchResult, search
 from .models import Document, DocumentChunk
 from .plugins.base import DocumentSource
 
@@ -50,6 +50,18 @@ def result_info(
 
 def _document_ref(collection_id: str, ref_id: str) -> str:
     return f"{collection_id}:{ref_id}"
+
+
+def search_result_info(page: SearchResult, collection_sources) -> dict[str, Any]:
+    return {
+        "results": result_info(page.results, collection_sources),
+        "resume_cursor": page.resume_cursor,
+        "resume_cursor_usage": (
+            "End of documents reached" if page.resume_cursor is None else
+            "Call this tool again and pass in the cursor in the cursor argument to resume."
+        ),
+        "warnings": list(page.warnings),
+    }
 
 
 def _tool_name(collection_id: str, suffix: str) -> str:
@@ -137,10 +149,11 @@ async def core_search(
     context: Context,
     indexer: Indexer,
     collection_id: str,
-    query: str,
+    query: str | None = None,
     limit: int = 5,
     rerank_query: str | None = None,
-) -> list[dict[str, Any]]:
+    cursor: str | None = None,
+) -> dict[str, Any]:
     _get_collection_source(context, collection_id)
     results = await search(
         indexer,
@@ -148,8 +161,9 @@ async def core_search(
         query,
         limit=limit,
         rerank_query=rerank_query,
+        cursor=cursor,
     )
-    return result_info(results, context.collections)
+    return search_result_info(results, context.collections)
 
 
 async def core_fetch_document(
@@ -269,17 +283,19 @@ def build_tools(
     collection_description = source.config.description
 
     async def collection_search(
-        query: str,
+        query: str | None = None,
         limit: int = 5,
-    ) -> list[dict[str, Any]]:
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         """Search the collection and return matching documents.
 
         Args:
-            query: The search query string.
-            limit: Number of matching documents to return (default: 5).
+            query: Required for a new search; saved query is reused on resume.
+            limit: Maximum distinct matching documents to return (default: 5).
+            cursor: Resume discovery, or retry the latest page-producing cursor.
 
         Returns:
-            A list of documents with summaries and relevant chunks.
+            Documents, continuation cursor, usage instructions, and warnings.
         """
         return await core_search(
             context=context,
@@ -287,22 +303,26 @@ def build_tools(
             collection_id=collection_id,
             query=query,
             limit=limit,
+            cursor=cursor,
         )
 
     async def structured_collection_search(
-        query: str, limit: int = 5, rerank_query: str | None = None,
-    ) -> list[dict[str, Any]]:
+        query: str | None = None, limit: int = 5, rerank_query: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         """Search with native syntax and an optional natural-language query.
 
         Args:
             query: Source-native expression, including supported fields and operators.
-            limit: Number of matching documents to return.
+            limit: Maximum distinct matching documents to return.
             rerank_query: Natural-language information need for vector search and reranking.
                 If omitted, query is used for both.
+            cursor: Resume using saved queries, or replay the latest page.
         """
         return await core_search(
             context=context, indexer=indexer, collection_id=collection_id,
             query=query, limit=limit, rerank_query=rerank_query,
+            cursor=cursor,
         )
 
     server.tool(
@@ -312,6 +332,9 @@ def build_tools(
             f"Search the {collection_id!r} collection ({collection_description}). "
             "Returns ranked documents with summaries and relevant chunks. "
             "Each result includes collection-prefixed identifiers for the companion fetch tools."
+            " Pass resume_cursor as cursor to continue; query may be omitted on resume."
+            " Cursors expire after 60 minutes of inactivity. The latest used cursor"
+            " replays its page until the next cursor is successfully used."
             + (" Use query for native search syntax and rerank_query for the natural-language "
                "information need used by vector search and reranking." if source.separate_rerank else "")
         ),

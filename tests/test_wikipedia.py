@@ -26,12 +26,14 @@ def test_source_default_can_be_overridden(tmp_path):
     assert not text.separate_rerank
 
 
-async def test_wikipedia_raw_text_round_trip(tmp_path):
+async def test_wikipedia_raw_text_round_trip(tmp_path, monkeypatch):
     text = "{{Infobox|name=Élan}}\nLead text.\n\n== History ==\nCafé history.\n"
     filename = "100% Élan.mediawiki"
     (tmp_path / filename).write_text(text)
     (tmp_path / "ignore.txt").write_text("Not an article")
     source = source_for(tmp_path)
+    # Raw-text chunking is independent of the optional Xapian binding.
+    monkeypatch.setattr(source, "_xapian_keywords", lambda title: [])
     pointers = [p async for p in source.get_documents()]
     assert len(pointers) == 1
     pointer = pointers[0]
@@ -97,12 +99,90 @@ async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypat
         raise AssertionError("Native discovery must not probe article presence")
     monkeypatch.setattr(source, "fetch_document", unexpected_fetch)
     hits = await source.native_search("cat:Physics", document_limit=2, chunk_limit=0)
-    assert {hit.document_id for hit in hits} == {
+    assert {hit.document_id for hit in hits.hits} == {
         source.encode_document_path("100% Élan.mediawiki"), "Other.mediawiki",
     }
-    assert len(await source.native_search("physics", document_limit=1, chunk_limit=0)) == 1
-    assert await source.native_search("physics", document_limit=0, chunk_limit=5) == []
-    assert await source.native_search(" ", document_limit=2, chunk_limit=0) == []
+    assert len((await source.native_search("physics", document_limit=1, chunk_limit=0)).hits) == 1
+    assert await source.native_search("physics", document_limit=0, chunk_limit=5) is None
+    assert await source.native_search(" ", document_limit=2, chunk_limit=0) is None
+
+
+def _native_fixture(tmp_path, names, monkeypatch):
+    import sys
+    requests = []
+
+    class Database:
+        def __init__(self, path):
+            pass
+        def close(self):
+            pass
+
+    class Parser:
+        STEM_SOME = FLAG_DEFAULT = FLAG_BOOLEAN_ANY_CASE = 1
+        def set_database(self, value): pass
+        def set_stemmer(self, value): pass
+        def set_stemming_strategy(self, value): pass
+        def set_default_op(self, value): pass
+        def add_prefix(self, name, term): pass
+        def parse_query(self, query, flags): return query
+
+    class Enquire:
+        ASCENDING = 1
+        def __init__(self, database): pass
+        def set_docid_order(self, order): assert order == self.ASCENDING
+        def set_query(self, query): pass
+        def get_mset(self, offset, count):
+            requests.append((offset, count))
+            return [SimpleNamespace(document=SimpleNamespace(get_data=lambda name=name: name.encode()),
+                                    weight=1.0) for name in names[offset:offset + count]]
+
+    monkeypatch.setitem(sys.modules, "xapian", SimpleNamespace(
+        Database=Database, QueryParser=Parser, Enquire=Enquire,
+        Stem=lambda language: language, Query=SimpleNamespace(OP_OR=1),
+    ))
+    async def inline(function, *args):
+        return function(*args)
+    monkeypatch.setattr("asyncio.to_thread", inline)
+    return source_for(tmp_path), requests
+
+
+async def test_native_empty_scan_advances_past_filtering_budget(tmp_path, monkeypatch):
+    source, requests = _native_fixture(tmp_path, [f"bad/{i}" for i in range(100)] + ["Valid"], monkeypatch)
+    batch = await source.native_search("physics", document_limit=1, chunk_limit=0)
+    assert batch.hits == []
+    assert batch.document_offset == 100
+    batch = await source.native_search("physics", document_limit=1, chunk_limit=0,
+                                       document_offset=batch.document_offset)
+    assert [hit.document_id for hit in batch.hits] == ["Valid.mediawiki"]
+    assert batch.document_offset == 101
+    assert requests[1][0] == 100  # Resume directly; no prefix rescan.
+    assert await source.native_search("physics", document_limit=1, chunk_limit=0,
+                                      document_offset=101) is None
+
+
+async def test_native_offset_stops_at_last_examined_match_and_preserves_duplicates(tmp_path, monkeypatch):
+    source, requests = _native_fixture(tmp_path, ["Same", "Same", "Third"], monkeypatch)
+    batches = []
+    offset = 0
+    for _ in range(3):
+        batch = await source.native_search("physics", document_limit=1, chunk_limit=0,
+                                           document_offset=offset)
+        batches.append(batch)
+        offset = batch.document_offset
+    assert [batch.document_offset for batch in batches] == [1, 2, 3]
+    assert [offset for offset, _ in requests] == [0, 1, 2]
+    assert [batch.hits[0].document_id for batch in batches] == [
+        "Same.mediawiki", "Same.mediawiki", "Third.mediawiki",
+    ]
+    assert await source.native_search("physics", document_limit=1, chunk_limit=0,
+                                      document_offset=3) is None
+
+
+async def test_native_discovery_failure_propagates(tmp_path):
+    xapian = pytest.importorskip("xapian")
+    source = source_for(tmp_path)
+    with pytest.raises(xapian.Error):
+        await source.native_search("physics", document_limit=1, chunk_limit=0)
 
 
 def _lead_wikitext() -> str:

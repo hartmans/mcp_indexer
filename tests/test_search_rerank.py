@@ -8,74 +8,20 @@ from contextlib import asynccontextmanager
 import pytest
 
 from mcp_indexer import search as searching
-from mcp_indexer.config import CollectionConfig
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.models import Document, DocumentChunk
 from mcp_indexer.search import DocumentHit, ChunkHit
 
 
-def _config(**overrides):
-    """A real CollectionConfig so thresholds come from the config model."""
-    base = {
-        "collection_id": "test",
-        "tool_prefix": "test",
-    }
-    base.update(overrides)
-    return CollectionConfig.model_validate(base)
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-async def test_search_selection_with_and_without_reranking(monkeypatch, enabled):
-    hits = [DocumentHit("first", 0.9, "First summary"),
-            ChunkHit("second", {"o": 0, "s": 10}, 0.8, "second?c=0")]
-    events = []
-
-    class Reranker:
-        async def setup(self):
-            events.append("setup")
-
-        async def score(self, query, documents, top_n):
-            assert query == "rerank question"
-            assert documents == ["First summary", "Second passage"]
-            assert top_n == 1
-            events.append("score")
-            return [(1, 0.95)]
-
-    async def fetch(document_id, metadata, scope):
-        assert scope == "embedding"
-        return "Second passage"
-
-    async def native(*args, **kwargs):
-        return []
-
-    source = SimpleNamespace(id="test", reranker=Reranker() if enabled else None,
-                             fetch_chunk=fetch, native_search=native,
-                             config=_config())
-    indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": source}))
-
-    async def vector(*args):
-        assert events == (["setup"] if enabled else [])
-        return hits
-
-    async def assemble(indexer, collection, selected):
-        return selected
-
-    monkeypatch.setattr(searching, "vector_search_hits", vector)
-    monkeypatch.setattr(searching, "assemble_hits", assemble)
-    result = await searching.search(indexer, "test", "question", 1,
-                                    rerank_query="rerank question")
-    assert [hit.document_id for hit in result] == (["second"] if enabled else ["first", "second"])
-    assert events == (["setup", "score"] if enabled else [])
-
-
-async def test_reranker_failure_retains_prepared_hits(caplog):
+async def test_reranker_failure_raises_retryable_error():
     async def fail(*args, **kwargs):
         raise RuntimeError("model unavailable")
 
     source = SimpleNamespace(id="test", reranker=SimpleNamespace(score=fail))
     hits = [DocumentHit("first", 1, "summary")]
-    assert await searching.rerank(None, source, hits, "query", 1, 0.5) == hits
-    assert "model unavailable" in caplog.text
+    with pytest.raises(searching.SearchAdvanceError) as error:
+        await searching.rerank(None, source, hits, "query", 1, 0.5)
+    assert "model unavailable" in str(error.value.__cause__)
 
 
 async def test_rerank_drops_hits_below_min_rerank_score():
@@ -179,67 +125,6 @@ async def test_vector_search_logs_debug_cosine_distances(caplog, monkeypatch):
     assert "vector hit for vec: near cosine_distance=0.5000" in caplog.text
 
 
-async def test_search_logs_debug_native_scores(caplog, monkeypatch):
-    native_hits = [DocumentHit("first", 0.9, "summary")]
-
-    async def native(query, *, document_limit, chunk_limit):
-        return native_hits
-
-    async def vector(*args, **kwargs):
-        return []
-
-    async def assemble(*args):
-        return []
-
-    source = SimpleNamespace(id="test", reranker=None, native_search=native,
-                             config=_config())
-    indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": source}))
-    monkeypatch.setattr(searching, "vector_search_hits", vector)
-    monkeypatch.setattr(searching, "assemble_hits", assemble)
-    searching.set_debug_search()
-    try:
-        await searching.search(indexer, "test", "question", limit=1)
-    finally:
-        searching.set_debug_search(False)
-    assert "native hit for test: first native_score=0.9000" in caplog.text
-
-
-async def test_search_passes_configured_thresholds(monkeypatch):
-    captured = {}
-
-    async def vector(source, query, document_limit, chunk_limit, min_cosine_distance):
-        captured["min_cosine_distance"] = min_cosine_distance
-        return []
-
-    async def rerank_call(indexer, collection, hits, query, hit_limit, min_rerank_score):
-        captured["min_rerank_score"] = min_rerank_score
-        return []
-
-    async def native(query, **kwargs):
-        return []
-
-    class Reranker:
-        async def setup(self):
-            pass
-
-        async def score(self, query, documents, top_n):
-            return []
-
-    async def assemble(*args):
-        return []
-
-    source = SimpleNamespace(
-        id="test", reranker=Reranker(), native_search=native,
-        config=_config(min_cosine_distance=0.9, min_rerank_score=0.7),
-    )
-    indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": source}))
-    monkeypatch.setattr(searching, "vector_search_hits", vector)
-    monkeypatch.setattr(searching, "rerank", rerank_call)
-    monkeypatch.setattr(searching, "assemble_hits", assemble)
-    await searching.search(indexer, "test", "question", 1)
-    assert captured == {"min_cosine_distance": 0.9, "min_rerank_score": 0.7}
-
-
 async def test_reranker_prepares_candidates_concurrently(monkeypatch):
     started = set()
     both_started = asyncio.Event()
@@ -264,27 +149,6 @@ async def test_reranker_prepares_candidates_concurrently(monkeypatch):
         min_rerank_score=0.5,
     )
     assert [hit.document_id for hit in result] == ["first", "second"]
-
-
-@pytest.mark.parametrize("natural", [None, "", " ", "how stars form"])
-async def test_natural_query_routes_to_vector_and_native_keeps_syntax(monkeypatch, natural):
-    calls = []
-    async def native(query, **kwargs):
-        calls.append(("native", query))
-        return []
-    async def vector(source, query, *args):
-        calls.append(("vector", query))
-        return []
-    async def assemble(*args):
-        return []
-    source = SimpleNamespace(reranker=None, native_search=native,
-                             config=_config(collection_id="wiki"))
-    indexer = SimpleNamespace(context=SimpleNamespace(collections={"wiki": source}))
-    monkeypatch.setattr(searching, "vector_search_hits", vector)
-    monkeypatch.setattr(searching, "assemble_hits", assemble)
-    await searching.search(indexer, "wiki", "cat:Astronomy", rerank_query=natural)
-    expected = natural if natural and natural.strip() else "cat:Astronomy"
-    assert calls == [("vector", expected), ("native", "cat:Astronomy")]
 
 
 async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):

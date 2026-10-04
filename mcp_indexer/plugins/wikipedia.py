@@ -7,7 +7,7 @@ from typing import Any
 
 from .text_source import TextFileSource, TextFileSourceConfig, TextFilePointer
 from .base import DocumentNotFoundError
-from ..search import DocumentHit, SearchHit
+from ..search import DocumentHit, NativeSearchBatch
 
 
 class WikipediaSourceConfig(TextFileSourceConfig):
@@ -142,12 +142,17 @@ class WikipediaSource(TextFileSource):
 
     async def native_search(
         self, query: str, *, document_limit: int, chunk_limit: int,
-    ) -> list[SearchHit]:
+        document_offset: int = 0, chunk_offset: int = 0,
+    ) -> NativeSearchBatch | None:
         if not query.strip() or document_limit <= 0:
-            return []
-        return await asyncio.to_thread(self._native_search, query, document_limit)
+            return None
+        return await asyncio.to_thread(
+            self._native_search, query, document_limit, document_offset, chunk_offset,
+        )
 
-    def _native_search(self, query: str, document_limit: int) -> list[SearchHit]:
+    def _native_search(
+        self, query: str, document_limit: int, document_offset: int, chunk_offset: int,
+    ) -> NativeSearchBatch | None:
         import xapian
 
         database = xapian.Database(str(self.source_config.xapian_directory))
@@ -160,20 +165,24 @@ class WikipediaSource(TextFileSource):
             parser.add_prefix("title", "T")
             parser.add_prefix("cat", "C")
             enquiry = xapian.Enquire(database)
+            enquiry.set_docid_order(enquiry.ASCENDING)
             enquiry.set_query(parser.parse_query(
                 query, parser.FLAG_DEFAULT | parser.FLAG_BOOLEAN_ANY_CASE,
             ))
             hits = []
-            seen = set()
             # Bound filtering work even if an index contains excluded/bad entries.
-            offset = 0
+            offset = document_offset
+            scanned = 0
             budget = max(100, document_limit * 10)
-            while len(hits) < document_limit and offset < budget:
-                matches = enquiry.get_mset(offset, min(document_limit, budget - offset))
+            while len(hits) < document_limit and scanned < budget:
+                matches = enquiry.get_mset(offset, min(100, budget - scanned))
                 if not matches:
+                    if not hits:
+                        return None
                     break
-                offset += len(matches)
                 for match in matches:
+                    offset += 1
+                    scanned += 1
                     try:
                         stem = match.document.get_data().decode("utf-8")
                         if not stem or "/" in stem or "\x00" in stem:
@@ -182,13 +191,11 @@ class WikipediaSource(TextFileSource):
                         if not self._is_included(path):
                             continue
                         document_id = self.encode_document_path(path.as_posix())
-                        if document_id not in seen:
-                            seen.add(document_id)
-                            hits.append(DocumentHit(document_id, match.weight))
+                        hits.append(DocumentHit(document_id, match.weight))
                     except UnicodeDecodeError:
                         continue
                     if len(hits) == document_limit:
                         break
-            return hits
+            return NativeSearchBatch(hits, offset, chunk_offset)
         finally:
             database.close()

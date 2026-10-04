@@ -76,7 +76,7 @@ async def test_run_repl_enables_debug_search_only_when_flagged(monkeypatch):
         return []
 
     monkeypatch.setattr(search_client_module, "search", search)
-    monkeypatch.setattr(search_client_module, "result_info",
+    monkeypatch.setattr(search_client_module, "search_result_info",
                         lambda results, collections: [])
     monkeypatch.setattr("builtins.input", lambda prompt="": "quit")
 
@@ -88,3 +88,32 @@ async def test_run_repl_enables_debug_search_only_when_flagged(monkeypatch):
     await search_client_module.run_repl(build_parser().parse_args(["wiki", "--debug-search"]))
     assert searching.logger.level == logging.DEBUG
     searching.set_debug_search(False)
+
+
+async def test_more_resumes_saved_search_and_retries_errors(monkeypatch, capsys):
+    from types import SimpleNamespace
+    from mcp_indexer.search import SearchResult
+    from mcp_indexer.search_state import SearchAdvanceError
+
+    context = SimpleNamespace(collections={"wiki": object()})
+    async def build():
+        pass
+    context.build_collections = build
+    monkeypatch.setattr(search_client_module, "Context", SimpleNamespace(build_context=lambda paths: context))
+    monkeypatch.setattr(search_client_module, "Indexer", lambda context: object())
+    calls = []
+    async def search(indexer, collection_id, query, **kwargs):
+        calls.append((query, kwargs))
+        if len(calls) == 2:
+            raise SearchAdvanceError("temporarily unavailable")
+        return SearchResult([], "next" if len(calls) == 1 else None)
+    monkeypatch.setattr(search_client_module, "search", search)
+    lines = iter(["cat:Physics => natural", ":more", ":more", ":more", "quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    await search_client_module.run_repl(build_parser().parse_args(["wiki"]))
+    assert calls[0][0] == "cat:Physics" and calls[0][1]["rerank_query"] == "natural"
+    assert calls[1][0] is None and calls[1][1]["cursor"] == "next"
+    assert calls[2][0] is None and calls[2][1]["cursor"] == "next"
+    output = capsys.readouterr().out
+    assert "temporarily unavailable" in output
+    assert "End of documents reached" in output and "No continuation" in output

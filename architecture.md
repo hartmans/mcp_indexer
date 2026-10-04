@@ -73,12 +73,14 @@ metadata follows the existing semantic/embedding retrieval conventions. Native
 hits can exist before their database records do. Each mechanism ranks document
 and chunk hits separately; scores are not comparable between lists.
 
-Without reranking, take up to the result limit from each document/chunk list,
-vector lists first, then native lists. This can yield four times the limit
-before grouping. With reranking, combine candidate lists and score their text,
-selecting the requested number of hits before grouping. Candidate overfetch
-defaults are centralized in search, not in MCP tools. A separate optional
-rerank query is available to Python callers.
+Search returns a named `SearchResult` with `results`, `resume_cursor`, and
+`warnings`. The result limit applies to distinct, previously unreturned documents.
+Without reranking, selection uses encounter order: vector document/chunk lists,
+then native document/chunk lists. With reranking, score every distinct new hit and
+retain its score; order eligible documents by their best discovered hit score.
+Include all qualifying discovered chunk hits for selected documents. Candidate
+overfetch defaults remain centralized in search. A separate optional rerank query
+is available to Python callers.
 
 Document scoring uses the supplied hit summary when available. Otherwise it
 uses a stored summary, or indexes the document and obtains a summary through
@@ -87,8 +89,9 @@ Chunk scoring retrieves embedding-chunk text through the source. Reranking
 preparation may index candidates that ultimately are not selected; this work
 is independent of result assembly.
 
-Candidate text preparation runs concurrently, sharing one summary task for
-duplicate document hits so model requests can fill the configured batchers.
+Candidate hits are deduplicated before concurrent text preparation, so each
+document summary or distinct chunk is scored at most once per search session.
+Concurrent preparation lets model requests fill the configured batchers.
 Assembly processes selected documents concurrently and selected hits only.
 Missing documents are fully chunked and
 embedded; persisted documents are not reindexed by search. If a document has
@@ -103,16 +106,60 @@ summarize all spans to produce a document summary.
 
 Response ORM objects are loaded in fresh sessions after summary writes finish.
 Assembly groups by first occurrence of each document, merges relevant chunks,
-and removes duplicate chunk references. Failures are logged and other usable
-results are returned; reranker failure falls back to initial candidate order.
-Search does not add concurrency coordination for indexing or summarization.
+and removes duplicate chunk references. Failures are logged and usable results
+continue with warnings. Failed hit preparation and document assembly each permit
+one later retry before discarding the failed item. Reranker setup/batch failures
+raise retryable errors; continuation retains discovery work and successful scores.
+Discovery failures never mean exhaustion. Search does not add concurrency
+coordination for indexing or summarization across independent search sessions.
 
 Sources with structured native syntax set `separate_rerank = True`. Their MCP
 search tools expose an optional natural-language `rerank_query`, used for vector
 discovery and reranking, while `query` goes to native discovery. An omitted or
-blank natural-language query falls back to `query`. Other sources retain their
-existing tool signature. Native search is always called; its base implementation
-returns no hits.
+blank natural-language query falls back to `query`. Other sources expose the
+same cursor API without `rerank_query`. Native discovery is called until exhausted;
+its base implementation returns `None`.
+
+### Resume cursors
+
+Each `DocumentSource` owns an in-memory search-session store. One advancing call
+performs at most one bounded discovery batch per unfinished mechanism, selecting
+from new and retained hits. Vector discovery uses separate document/chunk offsets,
+a cached query embedding, and the existing ANN/HNSW path. Approximate recall may
+miss documents; search does not introduce exhaustive vector scans. Offsets advance
+by raw candidate counts before orchestration suppresses duplicates, already
+returned documents, and rejected hits. Sources do not receive those seen sets.
+
+Native discovery accepts separate source-defined continuation offsets and returns
+`NativeSearchBatch(hits, document_offset, chunk_offset)` or `None`. Every batch,
+including an empty one, advances an enabled offset; only `None` establishes native
+exhaustion. Wikipedia offsets count raw Xapian matches actually examined and
+retain a bounded scanning budget. It resumes at that position without rescanning
+earlier matches; search orchestration handles repeated document/chunk identities.
+Unchanged native inputs require deterministic traversal and stable ties. Changes
+to documents may reorder or omit results during an active search.
+
+A cursor resumes using the saved query and rerank query; supplied mismatches
+produce warnings. Candidate sizes, thresholds, and reranker remain fixed; page
+limits may change. Each hit is scored once successfully, and each document is
+returned once along successive cursors. A later strong chunk may qualify a
+previously unreturned parent. Pages order discovered evidence only, so later pages
+can contain better-scoring documents. A short or empty page can still continue.
+
+Concurrent requests using the same current cursor share shielded advancement.
+The latest used cursor replays a cached page and next cursor without source/model
+work. Successfully using that next cursor frees the older replay token. Final
+pages remain replayable. Sessions expire after 60 minutes of inactivity, including
+idle cleanup; restarts/source replacement invalidate them. Tokens are opaque and
+collection-local, and replay copies loaded response data without database reads.
+State is process-local and needs sticky routing with multiple serving processes.
+
+MCP search tools accept `cursor` and allow query omission on resume. Their JSON
+objects contain `results`, `resume_cursor`, `resume_cursor_usage`, and `warnings`.
+When the cursor is null, usage is `End of documents reached`; otherwise it is
+`Call this tool again and pass in the cursor in the cursor argument to resume.`
+Invalid/expired cursors are explicit errors. The interactive client uses `:more`
+to resume. See `search-cursor-design.md` for the approved implementation contract.
 
 ## Indexing coverage and maintenance
 
@@ -188,7 +235,8 @@ therefore inherited like `indexing_mode` and `rerank`):
     dropped in Python. The per-type limit then applies to the filtered set.
 *   `min_rerank_score`. When a reranker is active, ranked
     candidates scoring below this value are dropped before the result limit is
-    applied, so a low-scoring candidate does not consume a result slot.
+    applied, so a low-scoring candidate does not consume a document slot. Scores for rejected hits remain
+    recorded so repeated discovery does not rerank them.
 
 Both are `CollectionInfraConfig` fields, so they default from the model and
 are overridable per collection or through `[defaults]`. `search()` reads both
@@ -197,8 +245,7 @@ from the collection's `CollectionConfig` and threads them through
 
 Per-hit score diagnostics are logged by `search` at the DEBUG level: the
 native score of each native hit, the cosine distance of each vector hit, and
-the reranker score of each reranked hit (or the retained initial score when
-reranking fails). They are silent at the default logging level.
+the reranker score of each successfully scored hit. They are silent at the default logging level.
 `set_debug_search()` toggles this module's logger between INFO and DEBUG; the
 search client's `--debug-search` argument calls it so the diagnostics appear
 on demand.

@@ -10,7 +10,8 @@ import yaml
 from .context import Context
 from .indexer import Indexer
 from .search import search, set_debug_search
-from .server import result_info
+from .search_state import InvalidSearchCursor, SearchAdvanceError
+from .server import search_result_info
 
 
 class _SuppressHttpLogs(logging.Filter):
@@ -95,6 +96,8 @@ async def run_repl(args: argparse.Namespace) -> None:
     if args.debug_search:
         set_debug_search()
     readline.parse_and_bind("tab: complete")
+    cursor = None
+    print("Enter a query, :more to resume, or quit. Cursors expire after 60 minutes of inactivity.")
 
     while True:
         try:
@@ -110,20 +113,29 @@ async def run_repl(args: argparse.Namespace) -> None:
             continue
         if query_input.strip() in {"quit", "exit"}:
             break
-        query, rerank_query = split_query(query_input)
-        if not query:
+        resume = query_input.strip() == ":more"
+        if resume:
+            if cursor is None:
+                print("No continuation is available. Enter a new query.")
+                continue
+            query, rerank_query = None, None
+        else:
+            query, rerank_query = split_query(query_input)
+            if not query:
+                continue
+            cursor = None
+        try:
+            results = await search(
+                indexer, args.collection_id, query, limit=args.limit,
+                document_candidate_limit=args.document_candidate_limit,
+                chunk_candidate_limit=args.chunk_candidate_limit,
+                rerank_query=rerank_query, cursor=cursor,
+            )
+        except (InvalidSearchCursor, SearchAdvanceError, ValueError) as exc:
+            print(f"Search failed: {exc}")
             continue
-
-        results = await search(
-            indexer,
-            args.collection_id,
-            query,
-            limit=args.limit,
-            document_candidate_limit=args.document_candidate_limit,
-            chunk_candidate_limit=args.chunk_candidate_limit,
-            rerank_query=rerank_query,
-        )
-        print(format_results(result_info(results, context.collections)))
+        cursor = results.resume_cursor
+        print(format_results(search_result_info(results, context.collections)))
 
 
 async def main() -> None:

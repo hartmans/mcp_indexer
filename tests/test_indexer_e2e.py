@@ -140,9 +140,9 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
     # Search must prepare summaries before hydrating its response, including
     # when indexing left documents without summaries.
     results = await search(indexer, "notes", "alpha", limit=2)
-    assert results
-    assert any(chunks for _, chunks in results)
-    for document, chunks in results:
+    assert results.results
+    assert any(chunks for _, chunks in results.results)
+    for document, chunks in results.results:
         assert document.summary
         assert all(chunk.summary and chunk.summary.summary for chunk in chunks)
 

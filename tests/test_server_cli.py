@@ -27,10 +27,14 @@ async def test_search_tool_only_exposes_rerank_query_when_requested(monkeypatch,
     module.build_tools(Server(), context=context, indexer=object(), collection_id="wiki")
     tool = registered["wiki_search"]
     assert ("rerank_query" in inspect.signature(tool).parameters) == separate
+    assert "cursor" in inspect.signature(tool).parameters
+    assert inspect.signature(tool).parameters["query"].default is None
     kwargs = {"rerank_query": "natural language"} if separate else {}
     await tool("cat:Physics", **kwargs)
     assert calls[0]["query"] == "cat:Physics"
     assert calls[0].get("rerank_query") == ("natural language" if separate else None)
+    await tool(cursor="continuation")
+    assert calls[-1]["cursor"] == "continuation" and calls[-1]["query"] is None
 
 
 def test_build_parser_defaults_host_to_localhost_and_stdio():
@@ -61,12 +65,13 @@ async def test_registered_search_tool_smoke(monkeypatch):
         keywords=["physics"], summary="An article",
     )
 
-    async def search(actual_indexer, collection_id, query, *, limit, rerank_query):
+    async def search(actual_indexer, collection_id, query, *, limit, rerank_query, cursor):
         assert actual_indexer is indexer
         assert (collection_id, query, limit, rerank_query) == (
             "wiki", "cat:Physics", 2, "Explain physics",
         )
-        return [(document, [])]
+        assert cursor is None
+        return module.SearchResult([(document, [])], "next")
 
     monkeypatch.setattr(module, "search", search)
     server = _create_server()
@@ -75,10 +80,11 @@ async def test_registered_search_tool_smoke(monkeypatch):
         "query": "cat:Physics", "limit": 2, "rerank_query": "Explain physics",
     })
     assert not result.is_error
-    assert result.structured_content == {"result": [{
+    assert result.structured_content == {"results": [{
         "title": "Article", "keywords": ["physics"],
         "document_id": "wiki:article", "summary": "An article", "relevant_chunks": [],
-    }]}
+    }], "resume_cursor": "next", "warnings": [],
+        "resume_cursor_usage": "Call this tool again and pass in the cursor in the cursor argument to resume."}
 
 
 def test_transport_switches_to_streamable_http_when_port_is_specified():

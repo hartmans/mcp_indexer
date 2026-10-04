@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from ..config import CollectionConfig
     from ..context import Context
     from ..rerank import AbstractReranker
-    from ..search import SearchHit
+    from ..search import NativeSearchBatch
 
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
@@ -98,6 +98,8 @@ class DocumentSource(Generic[p]):
         self.config = collection_config
         self.id = collection_id
         self.reranker = reranker
+        from ..search_state import SearchSessionStore
+        self._search_sessions = SearchSessionStore()
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -116,15 +118,26 @@ class DocumentSource(Generic[p]):
         return ""
 
     async def native_search(
-        self, query: str, *, document_limit: int, chunk_limit: int
-    ) -> list["SearchHit"]:
-        """Return ranked document and embedding-chunk hits, documents first.
+        self, query: str, *, document_limit: int, chunk_limit: int,
+        document_offset: int = 0, chunk_offset: int = 0,
+    ) -> "NativeSearchBatch | None":
+        """Return a bounded batch of ranked hits, or None for exhaustion.
 
-        Limits apply separately to each hit type. Chunk metadata uses the same
-        retrieval convention as get_chunks/fetch_chunk, even before indexing.
-        Scores are meaningful within each ranked list only.
+        Limits apply separately; zero disables a hit type. Offsets are
+        source-defined nonnegative positions, initially zero, passed back from
+        the previous batch unchanged. Every batch, including one with no hits,
+        advances at least one enabled position and never decreases positions.
+        Return final hits before returning None on a subsequent call. Raise on
+        failure; empty batches do not mean exhaustion.
+
+        Unchanged inputs/corpus require deterministic traversal and stable ties.
+        Return documents first, then chunks. Search orchestration suppresses
+        duplicates and already returned documents. Chunk metadata follows the
+        get_chunks/fetch_chunk convention; equivalent spans must use consistent
+        metadata across discovery mechanisms. Scores are meaningful within each
+        ranked list only.
         """
-        return []
+        return None
 
     def chunk_lengths(
         self, chunk_metadata: dict[str, Any]
