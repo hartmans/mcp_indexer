@@ -7,6 +7,17 @@ import pytest
 from mcp_indexer.rerank import AbstractReranker, QwenReranker
 
 
+class RoleTemplateTokenizer:
+    """Mirror the template's role lookup, including empty fields for wrong roles."""
+    def apply_chat_template(self, messages, **kwargs):
+        roles = {message["role"]: message["content"] for message in messages}
+        return (
+            f"<Instruct>: {roles.get('system', '')}\n"
+            f"<Query>: {roles.get('query', '')}\n"
+            f"<Document>: {roles.get('document', '')}" + QwenReranker.PROMPT_SUFFIX
+        )
+
+
 def test_abstract_reranker_cannot_be_instantiated():
     with pytest.raises(TypeError):
         AbstractReranker()
@@ -119,7 +130,13 @@ def test_score_only_requests_last_token_logits(monkeypatch):
             return {"no": 0, "yes": 1}[token]
 
         def __call__(self, prompts, **kwargs):
-            return {"input_ids": torch.ones((len(prompts), 3), dtype=torch.long)}
+            return {"input_ids": [[3, 4, 5] for _ in prompts]}
+
+        def encode(self, text, **kwargs):
+            return [6]
+
+        def pad(self, inputs, **kwargs):
+            return {"input_ids": torch.tensor(inputs["input_ids"])}
 
     class Model:
         device = torch.device("cpu")
@@ -131,10 +148,58 @@ def test_score_only_requests_last_token_logits(monkeypatch):
     reranker = QwenReranker()
     reranker.tokenizer = Tokenizer()
     reranker.model = Model()
-    monkeypatch.setattr(reranker, "_format_prompt", lambda query, document: document)
+    monkeypatch.setattr(reranker, "_format_prompt", lambda query, document: document + reranker.PROMPT_SUFFIX)
 
     assert len(reranker._score_batch_sync("query", ["one", "two"])) == 2
     assert calls[0]["logits_to_keep"] == 1
+
+
+def test_prompt_uses_template_query_document_and_instruction_roles():
+    reranker = QwenReranker(instruction="Match the requested topic")
+    reranker.tokenizer = RoleTemplateTokenizer()
+    prompt = reranker._format_prompt("Explain gravity", "Gravity attracts bodies.")
+    assert "<Instruct>: Match the requested topic" in prompt
+    assert "<Query>: Explain gravity" in prompt
+    assert "<Document>: Gravity attracts bodies." in prompt
+    assert reranker._format_prompt("Explain gravity", "Beijing is a city.") != prompt
+
+
+def test_batch_truncation_preserves_answer_suffix_and_padding_mask():
+    import torch
+    model_inputs = []
+    bodies = []
+    class Tokenizer(RoleTemplateTokenizer):
+        def encode(self, text, **kwargs):
+            assert kwargs["add_special_tokens"] is False
+            assert text == QwenReranker.PROMPT_SUFFIX
+            return [12, 13]
+        def convert_tokens_to_ids(self, token):
+            return {"no": 0, "yes": 1}[token]
+        def __call__(self, prompts, **kwargs):
+            assert kwargs["max_length"] == 6
+            assert not kwargs["padding"] and kwargs["truncation"]
+            assert not kwargs["add_special_tokens"]
+            bodies.extend(prompts)
+            # An overlong document and a short one after body-only truncation.
+            return {"input_ids": [[10, 11, 2, 3, 4, 5], [10, 11, 7]]}
+        def pad(self, inputs, **kwargs):
+            rows = inputs["input_ids"]
+            assert rows == [[10, 11, 2, 3, 4, 5, 12, 13], [10, 11, 7, 12, 13]]
+            return {"input_ids": torch.tensor([rows[0], [0, 0, 0] + rows[1]]),
+                    "attention_mask": torch.tensor([[1] * 8, [0, 0, 0] + [1] * 5])}
+    class Model:
+        device = torch.device("cpu")
+        def __call__(self, **kwargs):
+            model_inputs.append(kwargs)
+            return SimpleNamespace(logits=torch.tensor([[[0.0, 2.0]], [[2.0, 0.0]]]))
+    reranker = QwenReranker(max_length=8)
+    reranker.tokenizer = Tokenizer()
+    reranker.model = Model()
+    scores = reranker._score_batch_sync("gravity", ["Long " * 100, "Short"])
+    assert scores[0] > 0.5 > scores[1]
+    assert "<Query>: gravity" in bodies[0] and "<Document>: Long" in bodies[0]
+    assert model_inputs[0]["attention_mask"][1].tolist() == [0, 0, 0, 1, 1, 1, 1, 1]
+    assert model_inputs[0]["logits_to_keep"] == 1
 
 
 async def test_score_requires_setup():

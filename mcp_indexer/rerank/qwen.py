@@ -17,6 +17,9 @@ class QwenReranker(AbstractReranker):
     DEFAULT_INSTRUCTION = (
         "Given a web search query, retrieve relevant passages that answer the query"
     )
+    # Preserve the model's answer suffix when truncating the rendered template.
+    # https://huggingface.co/Qwen/Qwen3-Reranker-4B#using-transformers
+    PROMPT_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
     def __init__(
         self,
@@ -113,12 +116,24 @@ class QwenReranker(AbstractReranker):
 
         true_token_id = self.tokenizer.convert_tokens_to_ids("yes")
         false_token_id = self.tokenizer.convert_tokens_to_ids("no")
+        suffix = self.tokenizer.encode(self.PROMPT_SUFFIX, add_special_tokens=False)
+        body_limit = self.max_length - len(suffix)
+        if body_limit < 1:
+            raise ValueError("max_length must leave room for the reranking prompt and input text")
         prompts = [self._format_prompt(query, document) for document in documents]
+        if any(not prompt.endswith(self.PROMPT_SUFFIX) for prompt in prompts):
+            raise ValueError("Qwen reranker chat template is missing its expected answer suffix")
         inputs = self.tokenizer(
-            prompts,
-            padding=True,
+            [prompt[:-len(self.PROMPT_SUFFIX)] for prompt in prompts],
+            add_special_tokens=False,
+            padding=False,
             truncation=True,
-            max_length=self.max_length,
+            max_length=body_limit,
+            return_attention_mask=False,
+        )
+        inputs = self.tokenizer.pad(
+            {"input_ids": [body + suffix for body in inputs["input_ids"]]},
+            padding=True,
             return_tensors="pt",
         )
         inputs = {key: value.to(self.model.device) for key, value in inputs.items()}
@@ -133,24 +148,13 @@ class QwenReranker(AbstractReranker):
         return [float(score) for score in batch_scores.cpu().tolist()]
 
     def _format_prompt(self, query: str, document: str) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Judge whether the Document meets the requirements based on the "
-                    "Query and the Instruct provided. Answer only yes or no."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"<Instruct>: {self.instruction}\n\n"
-                    f"<Query>: {query}\n\n<Document>: {document}"
-                ),
-            },
-        ]
+        """Use the reranker template's roles, rather than generic chat roles."""
         return self.tokenizer.apply_chat_template(
-            messages,
+            [
+                {"role": "system", "content": self.instruction},
+                {"role": "query", "content": query},
+                {"role": "document", "content": document},
+            ],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,

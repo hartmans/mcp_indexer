@@ -564,3 +564,19 @@ Thread/local-server tests ran outside the sandbox because sandbox restrictions
 prevented asyncio worker-thread completions from waking the event loop. No database
 or index migration is required or was performed. Compilation and whitespace checks
 passed. Existing user-generated `build/` files were left alone.
+
+Follow-up live verification with both `/srv/datasets/asstr.db/config.toml` and
+`/srv/datasets/asstr.db/ollama.toml` found a separate Qwen adapter bug: it passed
+generic system/user chat messages to a template expecting system/query/document
+roles. The rendered Query and Document fields were empty, producing the same
+0.0311 score for every candidate. The adapter now uses the distributed template's
+roles, supplies the retrieval instruction as system content, and preserves the
+answer suffix when truncating long inputs. Regression tests cover role lookup,
+distinct rendered pairs, suffix preservation, left padding, and scoring.
+
+The corrected 4B model scored relevant synthetic passages at 1.0 and 0.9805 and
+irrelevant ones below 0.00003. Live `asstr` search for `science fiction`, with six
+candidates per type, returned two documents without warnings; resuming completed
+without duplicates, with that next batch below the configured threshold. The
+reranker, cursor, vector SQL, database search, and external-reranker regression
+run passed all 59 tests. This live check supplements the earlier fake-based tests.
