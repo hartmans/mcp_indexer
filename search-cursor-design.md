@@ -422,7 +422,7 @@ Return a JSON object, replacing the old top-level array:
 }
 ```
 
-Use `result_info(page.results, context.collections)` for the existing result entry
+Use `result_info(page.results)` for the existing result entry
 format. Keep global ID formatting and companion fetch tools unchanged. Use one
 shared response-envelope helper for MCP and CLI, so empty/terminal usage text
 cannot diverge. Document limit as maximum distinct documents, query reuse,

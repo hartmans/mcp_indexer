@@ -28,19 +28,17 @@ def _create_server() -> MCPServer:
 
 def result_info(
     results: Iterable[tuple[Document, list[DocumentChunk]]],
-    collection_sources: dict[str, DocumentSource],
 ) -> list[dict[str, Any]]:
     formatted_results: list[dict[str, Any]] = []
     for document, relevant_chunks in results:
-        source = collection_sources[document.collection_id]
         formatted_results.append(
             {
                 "title": document.title,
                 "keywords": list(document.keywords),
                 "document_id": _document_ref(document.collection_id, document.document_id),
                 "summary": document.summary,
-                "relevant_chunks": [
-                    _relevant_chunk_info(document, chunk, source)
+                "relevant_embedding_chunks": [
+                    _relevant_chunk_info(document, chunk)
                     for chunk in relevant_chunks
                 ],
             }
@@ -52,9 +50,9 @@ def _document_ref(collection_id: str, ref_id: str) -> str:
     return f"{collection_id}:{ref_id}"
 
 
-def search_result_info(page: SearchResult, collection_sources) -> dict[str, Any]:
+def search_result_info(page: SearchResult) -> dict[str, Any]:
     return {
-        "results": result_info(page.results, collection_sources),
+        "results": result_info(page.results),
         "resume_cursor": page.resume_cursor,
         "resume_cursor_usage": (
             "End of documents reached" if page.resume_cursor is None else
@@ -112,6 +110,8 @@ async def _load_chunk_record(
     document_id: str,
     chunk_id: str,
 ) -> DocumentChunk | None:
+    # Load the owning document and its full chunk set alongside the chunk so
+    # callers can navigate to the chunk's semantic root without extra queries.
     async with context.get_session() as session:
         result = await session.execute(
             select(DocumentChunk)
@@ -120,7 +120,12 @@ async def _load_chunk_record(
                 DocumentChunk.document_id == document_id,
                 DocumentChunk.chunk_id == chunk_id,
             )
-            .options(selectinload(DocumentChunk.summary))
+            .options(
+                selectinload(DocumentChunk.summary),
+                selectinload(DocumentChunk.document)
+                .selectinload(Document.chunks)
+                .selectinload(DocumentChunk.summary),
+            )
         )
         return result.scalars().one_or_none()
 
@@ -128,19 +133,15 @@ async def _load_chunk_record(
 def _relevant_chunk_info(
     document: Document,
     chunk: DocumentChunk,
-    source: DocumentSource,
 ) -> dict[str, Any]:
-    chunk_metadata = dict(chunk.metadata_dict)
-    semantic_length, embedding_length = source.chunk_lengths(chunk_metadata)
-
     return {
         "chunk_id": _document_ref(
             document.collection_id,
             chunk.chunk_id,
         ),
         "summary": chunk.summary.summary if chunk.summary else None,
-        "semantic_length": semantic_length,
-        "embedding_length": embedding_length,
+        "semantic_length": chunk.semantic_length,
+        "embedding_length": chunk.embedding_length,
     }
 
 
@@ -163,7 +164,7 @@ async def core_search(
         rerank_query=rerank_query,
         cursor=cursor,
     )
-    return search_result_info(results, context.collections)
+    return search_result_info(results)
 
 
 async def core_fetch_document(
@@ -199,8 +200,7 @@ async def core_fetch_document(
     # Compute total semantic length across all chunks.
     total_semantic_length = 0
     for chunk in document.chunks:
-        meta = dict(chunk.metadata_dict)
-        semantic_len, _ = source.chunk_lengths(meta)
+        semantic_len = chunk.semantic_length
         if semantic_len is not None:
             total_semantic_length += semantic_len
 
@@ -217,10 +217,43 @@ async def core_fetch_document(
             full_text_parts.append(part)
         result["full_text"] = "".join(full_text_parts)
     else:
-        # Otherwise include per‑chunk info as before.
-        result["chunks"] = [
-            _relevant_chunk_info(document, chunk, source) for chunk in document.chunks
-        ]
+        # Otherwise group the chunks into semantic chunks. document.chunks is
+        # ordered by `order`, so each semantic chunk's root row (the one with
+        # order == semantic_chunk_id) is its first row. The semantic chunk's
+        # summary is the root row's span summary; when the summary span
+        # shifts within the chunk, the first row of the new span carries that
+        # span's summary in its embedding_chunks entry.
+        semantic_chunks: list[dict[str, Any]] = []
+        current: dict[str, Any] = {}
+        current_semantic_id: int | None = None
+        last_summary_span: int | None = None
+        for chunk in document.chunks:
+            entry: dict[str, Any] = {
+                "chunk_id": _document_ref(collection_id, chunk.chunk_id),
+                "length": chunk.embedding_length,
+            }
+            if chunk.semantic_chunk_id != current_semantic_id:
+                current = {
+                    "chunk_id": _document_ref(collection_id, chunk.chunk_id),
+                    "summary": chunk.summary.summary if chunk.summary else None,
+                    "embedding_chunks": [entry],
+                    "length": chunk.semantic_length,
+                }
+                semantic_chunks.append(current)
+                current_semantic_id = chunk.semantic_chunk_id
+                last_summary_span = chunk.summary_span
+            else:
+                if (
+                    chunk.summary_span is not None
+                    and chunk.summary_span != last_summary_span
+                ):
+                    entry["summary"] = (
+                        chunk.summary.summary if chunk.summary else None
+                    )
+                current["embedding_chunks"].append(entry)
+            if chunk.summary_span is not None:
+                last_summary_span = chunk.summary_span
+        result["semantic_chunks"] = semantic_chunks
 
     return result
 
@@ -235,16 +268,6 @@ async def core_fetch_chunk(
     source = _get_collection_source(context, collection_id)
     document_id = source.document_id(chunk_id)
 
-    document = await _load_document_record(
-        context,
-        collection_id=collection_id,
-        document_id=document_id,
-    )
-    if document is None:
-        raise LookupError(
-            f"Document not found for chunk {prefixed_chunk_id!r} in collection {collection_id!r}"
-        )
-
     chunk = await _load_chunk_record(
         context,
         collection_id=collection_id,
@@ -256,19 +279,31 @@ async def core_fetch_chunk(
             f"Chunk not found in indexed collection {collection_id!r}: {chunk_id!r}"
         )
 
+    warnings: list[str] = []
+    # A semantic fetch always returns the whole semantic chunk, so if the
+    # requested chunk is not the chunk's semantic root, fetch from the root
+    # instead and report the substitution.
+    if scope == "semantic" and not chunk.is_semantic_chunk:
+        root = next(c for c in chunk.document.chunks if c.order == chunk.semantic_chunk_id)
+        chunk = root
+        warnings.append(
+            f"Requested chunk {prefixed_chunk_id!r} is not the first chunk in its "
+            "semantic chunk; returning the full semantic chunk from its first chunk "
+            f"({_document_ref(collection_id, root.chunk_id)!r}) instead."
+        )
+
     chunk_metadata = dict(chunk.metadata_dict)
     text = await source.fetch_chunk(document_id=document_id, chunk_metadata=chunk_metadata, scope=scope)
-    semantic_length, embedding_length = source.chunk_lengths(chunk_metadata)
 
     return {
         "document_id": _document_ref(collection_id, document_id),
-        "chunk_id": _document_ref(collection_id, chunk_id),
+        "chunk_id": _document_ref(collection_id, chunk.chunk_id),
         "scope": scope,
         "text": text,
         "summary": chunk.summary.summary if chunk.summary else None,
-        "semantic_length": semantic_length,
-        "embedding_length": embedding_length,
-        "metadata": chunk_metadata,
+        "semantic_length": chunk.semantic_length,
+        "embedding_length": chunk.embedding_length,
+        "warnings": warnings,
     }
 
 
@@ -346,7 +381,7 @@ def build_tools(
         description=(
             f"Fetch a single indexed document from the {collection_id!r} collection. "
             "Use this after search when you want the document-level summary plus the full "
-            "list of indexed chunks for that document. The returned chunk entries use the same "
+            "list of indexed chunks for that document. The returned entries use the same "
             "identifier and length conventions as search results. Pass the fully-prefixed "
             "document_id returned by search."
         ),
@@ -361,7 +396,9 @@ def build_tools(
 
         Returns:
             A document with its title, keywords, summary, and either a full_text field
-            (for small documents) or a chunks array with per-chunk metadata.
+            (for small documents) or a semantic_chunks array. Each semantic chunk lists
+            its chunk_id (the first embedding chunk), summary, length, and an
+            embedding_chunks list of chunk_id/length entries.
         """
         return await core_fetch_document(
             context=context,
@@ -373,12 +410,13 @@ def build_tools(
         name=_tool_name(collection_id, "fetch_chunk"),
         title=f"Fetch chunk from {collection_id}",
         description=(
-            f"Fetch the text for a single indexed chunk in the {collection_id!r} collection. "
+            f"Fetch the text for a chunk in the {collection_id!r} collection. "
             "Pass the fully-prefixed chunk_id returned by search or fetch_document. The tool "
             "derives document identity from the chunk_id, so no separate document_id is needed. "
-            "Supports scope='semantic' to return the full semantic chunk and scope='embedding' "
-            "to return just the embedding-sized slice used for retrieval. Returns the chunk text, "
-            "summary, metadata, and the same semantic_length/embedding_length fields used elsewhere."
+            "Pass an embedding chunk_id with scope='embedding' to fetch that embedding-sized "
+            "slice, or a semantic chunk_id (the chunk_id of a semantic chunk's first embedding "
+            "chunk) with scope='semantic' to fetch the whole semantic chunk. Returns the chunk "
+            "text, summary, and the same semantic_length/embedding_length fields used elsewhere."
         ),
     )
     async def collection_fetch_chunk(
@@ -392,14 +430,15 @@ def build_tools(
                 (e.g., 'collection:chunk_id'). This is the same format used in
                 search and fetch_document results. Pass the fully-prefixed identifier
                 returned by those tools to ensure the correct collection is targeted.
-            scope: Either 'semantic' for the full semantic chunk or 'embedding' for
-                just the embedding-sized slice. Use 'embedding' for narrowly scoped
-                queries where a small text fragment will answer the query; use
-                'semantic' for understanding the broader document context.
+            scope: Either 'semantic' (with a semantic chunk's id) for the full semantic
+                chunk or 'embedding' (with an embedding chunk's id) for just the
+                embedding-sized slice. Use 'embedding' for narrowly scoped queries
+                where a small text fragment will answer the query; use 'semantic' for
+                understanding the broader document context.
 
         Returns:
-            A chunk with its text, summary, metadata, and semantic_length/embedding_length
-            fields that indicate the response size.
+            A chunk with its text, summary, and semantic_length/embedding_length
+            fields that indicate the response size, plus a warnings list.
         """
         return await core_fetch_chunk(
             context=context,

@@ -82,7 +82,7 @@ async def test_registered_search_tool_smoke(monkeypatch):
     assert not result.is_error
     assert result.structured_content == {"results": [{
         "title": "Article", "keywords": ["physics"],
-        "document_id": "wiki:article", "summary": "An article", "relevant_chunks": [],
+        "document_id": "wiki:article", "summary": "An article", "relevant_embedding_chunks": [],
     }], "resume_cursor": "next", "warnings": [],
         "resume_cursor_usage": "Call this tool again and pass in the cursor in the cursor argument to resume."}
 

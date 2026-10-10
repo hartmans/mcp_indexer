@@ -77,7 +77,7 @@ async def test_run_repl_enables_debug_search_only_when_flagged(monkeypatch):
 
     monkeypatch.setattr(search_client_module, "search", search)
     monkeypatch.setattr(search_client_module, "search_result_info",
-                        lambda results, collections: [])
+                        lambda results: [])
     monkeypatch.setattr("builtins.input", lambda prompt="": "quit")
 
     searching.set_debug_search(False)

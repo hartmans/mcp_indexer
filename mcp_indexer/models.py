@@ -89,6 +89,27 @@ class DocumentChunk(Base):
         return self.order == self.semantic_chunk_id
 
     @property
+    def semantic_length(self) -> int | None:
+        """Length of the semantic span this chunk belongs to, if known.
+
+        Under the ``b``/``e`` convention that span is the distance between the
+        semantic chunk's start (``b``) and end (``e``); when those are absent
+        the embedding length is used as a proxy.
+        """
+        meta = self.metadata_dict
+        if "e" in meta:
+            return int(meta["e"]) - int(meta.get("b", 0))
+        return self.embedding_length
+
+    @property
+    def embedding_length(self) -> int | None:
+        """Length of this chunk's embedding span, if known (``s``)."""
+        meta = self.metadata_dict
+        if "s" in meta:
+            return int(meta["s"])
+        return None
+
+    @property
     def metadata_dict(self) -> Mapping[str, Any]:
         """Return metadata as a read-only mapping."""
         return MappingProxyType(deserialize_metadata(self.metadata_str))

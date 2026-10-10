@@ -134,7 +134,7 @@ def test_result_info_includes_chunk_lengths():
         metadata_str=json.dumps({"b": 10, "e": 42, "o": 5, "s": 11}),
     )
 
-    formatted = result_info([(document, [chunk])], {"col1": source})
+    formatted = result_info([(document, [chunk])])
 
     assert formatted == [
         {
@@ -142,7 +142,7 @@ def test_result_info_includes_chunk_lengths():
             "keywords": ["alpha"],
             "document_id": "col1:doc1",
             "summary": "Document summary",
-            "relevant_chunks": [
+            "relevant_embedding_chunks": [
                 {
                     "chunk_id": "col1:doc1?c=0",
                     "summary": None,

@@ -135,7 +135,7 @@ async def run_repl(args: argparse.Namespace) -> None:
             print(f"Search failed: {exc}")
             continue
         cursor = results.resume_cursor
-        print(format_results(search_result_info(results, context.collections)))
+        print(format_results(search_result_info(results)))
 
 
 async def main() -> None:

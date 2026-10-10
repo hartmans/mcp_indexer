@@ -156,6 +156,166 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_fetch_chunk_semantic_returns_first_chunk_with_warning(test_context, tmp_path):
+    """A semantic fetch of a non-first chunk returns the first chunk's text,
+    its chunk_id, and a warning; no metadata is returned."""
+    from mcp_indexer.server import core_fetch_chunk
+    from mcp_indexer.models import DocumentChunk
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.txt").write_text(
+        "first paragraph of the doc about the alpha project and its goals\n"
+        "\n"
+        "# Section B\n"
+        "second paragraph of the doc about the beta launch and the timeline\n",
+        encoding="utf-8",
+    )
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "text", "directory": str(docs_dir)},
+    })
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 10,
+        "max_size": 40,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+    from mcp_indexer.context import Context
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
+
+    async with test_context.session_factory() as session:
+        chunks = (await session.execute(
+            select(DocumentChunk).where(DocumentChunk.document_id == "alpha.txt")
+        )).scalars().all()
+    chunks.sort(key=lambda c: c.order)
+    assert len(chunks) > 1
+    non_root = next(c for c in chunks if not c.is_semantic_chunk)
+    root = next(c for c in chunks if c.is_semantic_chunk)
+
+    result = await core_fetch_chunk(
+        context=context,
+        prefixed_chunk_id=f"notes:{non_root.chunk_id}",
+        scope="semantic",
+    )
+    assert "metadata" not in result
+    assert isinstance(result["warnings"], list)
+    assert result["chunk_id"] == f"notes:{root.chunk_id}"
+    assert any("not the first chunk" in w for w in result["warnings"])
+
+    root_result = await core_fetch_chunk(
+        context=context,
+        prefixed_chunk_id=f"notes:{root.chunk_id}",
+        scope="semantic",
+    )
+    # Both resolve to the same semantic chunk, so the text matches.
+    assert root_result["text"] == result["text"]
+    assert root_result["warnings"] == []
+    assert root_result["chunk_id"] == f"notes:{root.chunk_id}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_document_groups_semantic_chunks_with_span_summaries(
+    test_context, tmp_path, monkeypatch,
+):
+    """A large document's fetch_document returns semantic_chunks, each a group
+    of embedding chunks. The root chunk_id is the first embedding chunk; the
+    top-level summary is the root's span summary, and an embedding chunk carries
+    a summary only when it is the first row of a new summary span."""
+    import mcp_indexer.server as server
+    from mcp_indexer.server import core_fetch_document
+    from mcp_indexer.models import DocumentChunk
+
+    monkeypatch.setattr(server, "FULL_DOCUMENT_LENGTH", 0)
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "alpha.txt").write_text(
+        "first paragraph of the doc about the alpha project and its goals\n"
+        "\n"
+        "# Section B\n"
+        "second paragraph of the doc about the beta launch and the timeline\n",
+        encoding="utf-8",
+    )
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "text", "directory": str(docs_dir)},
+    })
+    # Small max_to_summarize so each semantic chunk splits across several
+    # summary spans.
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 10,
+        "max_size": 40,
+        "max_to_summarize": 20,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+    from mcp_indexer.context import Context
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    # Two passes so span summaries exist by the time we fetch.
+    await run_indexing_pipeline(indexer, passes=2)
+
+    async with test_context.session_factory() as session:
+        rows = (await session.execute(
+            select(DocumentChunk).where(DocumentChunk.document_id == "alpha.txt")
+        )).scalars().all()
+    rows.sort(key=lambda c: c.order)
+    root = next(c for c in rows if c.is_semantic_chunk)
+    assert root is not None
+    # There must be a non-root chunk to make the grouping non-trivial.
+    assert any(not c.is_semantic_chunk for c in rows)
+
+    result = await core_fetch_document(
+        context=context,
+        indexer=indexer,
+        prefixed_document_id="notes:alpha.txt",
+    )
+    assert "full_text" not in result
+    semantic_chunks = result["semantic_chunks"]
+    assert len(semantic_chunks) >= 1
+
+    for sc in semantic_chunks:
+        assert set(sc) == {"chunk_id", "summary", "embedding_chunks", "length"}
+        assert sc["length"] is not None
+        assert sc["embedding_chunks"], "each semantic chunk has at least one row"
+        # Root chunk id is the first embedding chunk's id.
+        assert sc["chunk_id"] == sc["embedding_chunks"][0]["chunk_id"]
+        # The first embedding chunk never carries a summary key.
+        assert "summary" not in sc["embedding_chunks"][0]
+        for ec in sc["embedding_chunks"][1:]:
+            assert "chunk_id" in ec and ec["length"] is not None
+
+
+@pytest.mark.asyncio
 async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(test_context, tmp_path):
     """Test that oversized semantic chunks are split for summary only."""
     docs_dir = tmp_path / "docs"
