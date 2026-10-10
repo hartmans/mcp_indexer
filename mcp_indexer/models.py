@@ -84,6 +84,7 @@ class Document(Base):
 
     collection_id: Mapped[str] = mapped_column(String, primary_key=True)
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    parent_document_id: Mapped[str | None] = mapped_column(String, nullable=True)
     title: Mapped[str]
     title_strength: Mapped[int]
     embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
@@ -101,6 +102,24 @@ class Document(Base):
         order_by="DocumentChunk.order",
     )
 
+    # Self-referencing sub-document hierarchy. `parent_document_id` is a bare
+    # column on this table; the composite FK
+    # (collection_id, parent_document_id) -> (collection_id, document_id)
+    # means a sub-document is always rooted in its own collection, and the
+    # ON DELETE CASCADE deletes the whole subtree in one statement.
+    # `delete-orphan` makes a rescan that drops a child from `children`
+    # delete that child's entire subtree on commit.
+    children: Mapped[List["Document"]] = relationship(
+        back_populates="parent",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Document.document_id",
+    )
+    parent: Mapped["Document | None"] = relationship(
+        back_populates="children",
+        remote_side=[document_id],
+    )
+
     summaries: Mapped[List[ChunkSummary]] = relationship(
         back_populates="document", cascade="all, delete-orphan", passive_deletes=True,
         overlaps="chunks,summary",
@@ -109,6 +128,13 @@ class Document(Base):
     __table_args__ = (
         Index("ix_document_title", "title"),
         Index("ix_document_last_modified", "last_modified"),
+        Index("ix_document_parent_document_id", "collection_id", "parent_document_id"),
+        ForeignKeyConstraint(
+            ["collection_id", "parent_document_id"],
+            ["document.collection_id", "document.document_id"],
+            name="fk_document_parent",
+            ondelete="CASCADE",
+        ),
     )
 
 
