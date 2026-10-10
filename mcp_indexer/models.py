@@ -44,6 +44,12 @@ class DocumentChunk(Base):
     # semantic chunk repeats that first row's `order`, so
     # `order == semantic_chunk_id` identifies a semantic-chunk boundary.
     semantic_chunk_id: Mapped[int]
+    # Denormalized length of the semantic chunk (e - b). Duplicated across
+    # every embedding chunk in the semantic chunk so a length lookup is a
+    # single-column read rather than a metadata decode.
+    semantic_length: Mapped[int | None]
+    # Length of this chunk's embedding span (s).
+    embedding_length: Mapped[int | None]
     metadata_str: Mapped[str]
 
     # Relationships
@@ -87,27 +93,6 @@ class DocumentChunk(Base):
         first row's ``order``.
         """
         return self.order == self.semantic_chunk_id
-
-    @property
-    def semantic_length(self) -> int | None:
-        """Length of the semantic span this chunk belongs to, if known.
-
-        Under the ``b``/``e`` convention that span is the distance between the
-        semantic chunk's start (``b``) and end (``e``); when those are absent
-        the embedding length is used as a proxy.
-        """
-        meta = self.metadata_dict
-        if "e" in meta:
-            return int(meta["e"]) - int(meta.get("b", 0))
-        return self.embedding_length
-
-    @property
-    def embedding_length(self) -> int | None:
-        """Length of this chunk's embedding span, if known (``s``)."""
-        meta = self.metadata_dict
-        if "s" in meta:
-            return int(meta["s"])
-        return None
 
     @property
     def metadata_dict(self) -> Mapping[str, Any]:

@@ -528,6 +528,8 @@ class Indexer:
         source = pointer.source
         embedding_chunks: list[tuple[dict[str, Any], str]] = []
         semantic_chunk_ids: list[int] = []
+        semantic_lengths: list[int | None] = []
+        embedding_lengths: list[int | None] = []
         async for meta, text_list in pointer.get_chunks(
             self.server_config.min_size, self.server_config.max_size
         ):
@@ -542,9 +544,14 @@ class Indexer:
             # The first embedding chunk of this semantic chunk is the next
             # global row; every embedding chunk in the chunk points back to it.
             first_order = len(embedding_chunks)
-            for e_chunk in plan.embedding_chunks:
-                embedding_chunks.append(e_chunk)
+            # Denormalized semantic length: the length of the semantic chunk's
+            # text, duplicated across every embedding chunk in the chunk.
+            semantic_length = len("".join(text_list))
+            for e_meta, e_text in plan.embedding_chunks:
+                embedding_chunks.append((e_meta, e_text))
                 semantic_chunk_ids.append(first_order)
+                semantic_lengths.append(semantic_length)
+                embedding_lengths.append(len(e_text))
 
         batch_embeddings = (
             await self._embed_batch([text for _, text in embedding_chunks])
@@ -557,8 +564,8 @@ class Indexer:
             )
 
         all_chunks = []
-        for order, ((e_meta, _e_text), embedding, semantic_chunk_id) in enumerate(
-            zip(embedding_chunks, batch_embeddings, semantic_chunk_ids, strict=True)
+        for order, ((e_meta, _e_text), embedding, semantic_chunk_id, semantic_length, embedding_length) in enumerate(
+            zip(embedding_chunks, batch_embeddings, semantic_chunk_ids, semantic_lengths, embedding_lengths, strict=True)
         ):
             all_chunks.append(
                 DocumentChunk(
@@ -569,6 +576,8 @@ class Indexer:
                     embedding=embedding,
                     summary_span=None,
                     semantic_chunk_id=semantic_chunk_id,
+                    semantic_length=semantic_length,
+                    embedding_length=embedding_length,
                     metadata_str=json.dumps(e_meta),
                 )
             )
@@ -853,7 +862,7 @@ class Indexer:
             chunk_span: list[int] = []
             for row in rows:
                 o = int(self._deserialize_metadata(row.metadata_str).get("o", 0))
-                s = int(self._deserialize_metadata(row.metadata_str).get("s", 0))
+                s = row.embedding_length or 0
                 if current and size_of(current) + s > max_to_summarize:
                     spans.append(current)
                     current = []

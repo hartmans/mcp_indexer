@@ -83,7 +83,10 @@ of the first embedding chunk in that semantic chunk. Every row repeats that firs
 row's `order`, so the first row of a semantic chunk is the one where
 `semantic_chunk_id == order`; `is_semantic_chunk` exposes that. The column is a
 deferred self-referential foreign key onto `(collection_id, document_id, order)`,
-so rows may be written in any order and it resolves at commit. `summary_span`
+so rows may be written in any order and it resolves at commit. `semantic_length`
+and `embedding_length` are populated by the indexer from the chunk metadata
+(`e - b` and `s`); `semantic_length` is denormalized across every row of the
+semantic chunk so a length lookup does not decode `metadata_str`. `summary_span`
 points at the `chunk_summary` covering this chunk (null until summarization).
 `metadata_str` is the JSON blob the source needs to re-fetch the chunk.
 
