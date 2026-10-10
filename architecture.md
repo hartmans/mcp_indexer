@@ -58,6 +58,47 @@ The context includes:
   model server can claim it. The instance's semaphore coordinates scoring across
   collections.
 
+## Storage
+
+Postgres stores four tables. `document` is the unit of indexing; `document_chunk`
+holds one row per embedding chunk; `chunk_summary` holds a summary for a span of
+chunks; `failed_document` records documents that could not be indexed.
+
+### document
+
+Keyed by `(collection_id, document_id)`. `parent_document_id` is a bare column
+pointing at another row in the same collection through a composite foreign key,
+so documents form a tree of sub-documents rooted in one collection; deleting a
+document cascades to its whole subtree. `last_modified` carries the source
+modification time used to detect changes. The document-level `embedding`
+represents the document summary; `summary` and `keywords` are filled by
+summarization.
+
+### document_chunk
+
+Keyed by `(collection_id, document_id, chunk_id)`. `order` is the global ordinal
+of the embedding chunk within its document, unique per document. Each embedding
+chunk belongs to exactly one semantic chunk; `semantic_chunk_id` is the `order`
+of the first embedding chunk in that semantic chunk. Every row repeats that first
+row's `order`, so the first row of a semantic chunk is the one where
+`semantic_chunk_id == order`; `is_semantic_chunk` exposes that. The column is a
+deferred self-referential foreign key onto `(collection_id, document_id, order)`,
+so rows may be written in any order and it resolves at commit. `summary_span`
+points at the `chunk_summary` covering this chunk (null until summarization).
+`metadata_str` is the JSON blob the source needs to re-fetch the chunk.
+
+### chunk_summary
+
+Keyed by `(collection_id, document_id, summary_span)`. `summary_span` is the
+ordinal of the summary within the document; the chunks it covers all carry the
+same `summary_span`.
+
+### failed_document
+
+Keyed by `(collection_id, document_id)` but not foreign-keyed to `document`, so a
+failure can be recorded for a document that does not exist yet or has been
+deleted.
+
 ## Search
 
 Search orchestration lives in `search.py`; MCP and CLI consumers call it directly.

@@ -22,6 +22,7 @@ def test_document_chunk_metadata_is_json_backed():
         chunk_id="doc-1?c=0",
         text="chunk text",
         summary_span=0,
+        semantic_chunk_id=0,
         embedding=[0.0] * 768,
         metadata_str=metadata_str,
     )

@@ -11,7 +11,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy import Integer, JSON, DateTime, Float, Index, String, Text
+from sqlalchemy import Integer, JSON, DateTime, Float, Index, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -40,6 +40,10 @@ class DocumentChunk(Base):
     text: Mapped[str | None]
     embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
     summary_span: Mapped[int | None]
+    # `order` of the first row of this row's semantic chunk. Every row in a
+    # semantic chunk repeats that first row's `order`, so
+    # `order == semantic_chunk_id` identifies a semantic-chunk boundary.
+    semantic_chunk_id: Mapped[int]
     metadata_str: Mapped[str]
 
     # Relationships
@@ -49,6 +53,17 @@ class DocumentChunk(Base):
     __table_args__ = (
         Index("ix_document_chunk_document_id", "document_id"),
         Index("ix_document_chunk_order", "order"),
+        UniqueConstraint(
+            "collection_id", "document_id", "order",
+            name="uq_document_chunk_order",
+        ),
+        ForeignKeyConstraint(
+            ["collection_id", "document_id", "semantic_chunk_id"],
+            ["document_chunk.collection_id", "document_chunk.document_id", "document_chunk.order"],
+            name="fk_document_chunk_semantic",
+            ondelete="CASCADE",
+            deferrable=True, initially="DEFERRED",
+        ),
         ForeignKeyConstraint(
             ["collection_id", "document_id"],
             ["document.collection_id", "document.document_id"],
@@ -62,6 +77,16 @@ class DocumentChunk(Base):
             ondelete='set null(summary_span)', deferrable=True, initially="IMMEDIATE",
         ),
     )
+
+    @property
+    def is_semantic_chunk(self) -> bool:
+        """True for the first row of a semantic chunk.
+
+        The first row of a semantic chunk carries its own ``order`` in
+        ``semantic_chunk_id``; every other row in that chunk repeats the
+        first row's ``order``.
+        """
+        return self.order == self.semantic_chunk_id
 
     @property
     def metadata_dict(self) -> Mapping[str, Any]:

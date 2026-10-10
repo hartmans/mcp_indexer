@@ -463,8 +463,9 @@ async def test_replay_copies_real_detached_orm_graph(harness, monkeypatch):
             summary = ChunkSummary(collection_id="test", document_id=hit.document_id,
                                    summary_span=0, summary="passage")
             chunk = DocumentChunk(collection_id="test", document_id=hit.document_id,
-                                  chunk_id=hit.document_id + "?c=0", order=0,
-                                  metadata_str='{"o":0}', embedding=[1.0], summary=summary)
+                                   chunk_id=hit.document_id + "?c=0", order=0,
+                                   metadata_str='{"o":0}', embedding=[1.0], summary_span=None,
+                                   semantic_chunk_id=0, summary=summary)
             document.chunks = [chunk]
             results.append((document, [chunk]))
         return results

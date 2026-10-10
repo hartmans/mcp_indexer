@@ -130,6 +130,14 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
     # Chunks were created in Postgres during indexing.
     assert len(chunks) == 2
 
+    # semantic_chunk_id points at the order of the first embedding chunk of
+    # its semantic chunk: a real row in the same document.
+    first_rows = {(c.collection_id, c.document_id, c.order) for c in chunks}
+    for c in chunks:
+        assert (c.collection_id, c.document_id, c.semantic_chunk_id) in first_rows
+        if c.order == c.semantic_chunk_id:
+            assert c.is_semantic_chunk
+
     # After passage testing, Document records are populated with title and embedding from the LLM pass.
     async with test_context.session_factory() as session:
         documents = (await session.execute(select(Document))).scalars().all()

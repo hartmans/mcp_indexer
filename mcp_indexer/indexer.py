@@ -527,6 +527,7 @@ class Indexer:
     async def index_document(self, pointer, stats: DocumentIndexingStats):
         source = pointer.source
         embedding_chunks: list[tuple[dict[str, Any], str]] = []
+        semantic_chunk_ids: list[int] = []
         async for meta, text_list in pointer.get_chunks(
             self.server_config.min_size, self.server_config.max_size
         ):
@@ -538,7 +539,12 @@ class Indexer:
             )
             stats.semantic_chunks += 1
             stats.embedding_chunks += len(plan.embedding_chunks)
-            embedding_chunks.extend(plan.embedding_chunks)
+            # The first embedding chunk of this semantic chunk is the next
+            # global row; every embedding chunk in the chunk points back to it.
+            first_order = len(embedding_chunks)
+            for e_chunk in plan.embedding_chunks:
+                embedding_chunks.append(e_chunk)
+                semantic_chunk_ids.append(first_order)
 
         batch_embeddings = (
             await self._embed_batch([text for _, text in embedding_chunks])
@@ -551,8 +557,8 @@ class Indexer:
             )
 
         all_chunks = []
-        for order, ((e_meta, _e_text), embedding) in enumerate(
-            zip(embedding_chunks, batch_embeddings, strict=True)
+        for order, ((e_meta, _e_text), embedding, semantic_chunk_id) in enumerate(
+            zip(embedding_chunks, batch_embeddings, semantic_chunk_ids, strict=True)
         ):
             all_chunks.append(
                 DocumentChunk(
@@ -562,6 +568,7 @@ class Indexer:
                     chunk_id=f"{pointer.document_id}?c={order}",
                     embedding=embedding,
                     summary_span=None,
+                    semantic_chunk_id=semantic_chunk_id,
                     metadata_str=json.dumps(e_meta),
                 )
             )

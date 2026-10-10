@@ -130,6 +130,7 @@ def test_result_info_includes_chunk_lengths():
         text="hello world",
         embedding=[0.0] * VECTOR_DIMENSIONS,
         summary_span=None,
+        semantic_chunk_id=0,
         metadata_str=json.dumps({"b": 10, "e": 42, "o": 5, "s": 11}),
     )
 
