@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import delete, select, update
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from mcp_indexer.context import Context
@@ -58,21 +57,13 @@ def monitor_time() -> float:
 
 
 @dataclass
-class SummarySpan:
-    offset: int
-    size: int
-    text: str
-
-
-@dataclass
 class SemanticChunkPlan:
     embedding_chunks: list[tuple[dict[str, Any], str]]
 
 
 @dataclass
 class ReconstructedSemanticChunk:
-    metadata: dict[str, Any]
-    embedding_rows: list[dict[str, Any]]
+    rows: list[DocumentChunk]
     text: str
 
 
@@ -247,7 +238,7 @@ class Indexer:
                 if pointer.last_modified != last_modified:
                     stats = DocumentIndexingStats(document_id, "refresh", source=source)
                     await self._schedule_document_task(
-                        self.index_document(pointer, stats, replace=True), stats,
+                        self.index_document(pointer, stats), stats,
                     )
             after = rows[-1][0]
 
@@ -533,7 +524,7 @@ class Indexer:
             if not self._running_documents:
                 return
 
-    async def index_document(self, pointer, stats: DocumentIndexingStats, *, replace: bool = False):
+    async def index_document(self, pointer, stats: DocumentIndexingStats):
         source = pointer.source
         embedding_chunks: list[tuple[dict[str, Any], str]] = []
         async for meta, text_list in pointer.get_chunks(
@@ -586,18 +577,19 @@ class Indexer:
             embedding=[0.0] * VECTOR_DIMENSIONS,
             keywords=normalize_keywords(metadata_dict.get("keywords", [])),
         )
-        # Attach chunks to document for cascade merge
+        # Attach chunks to document; the merge cascades them on insert and
+        # replaces the previous chunk set on refresh.
         doc_record.chunks = all_chunks
-
-        # Persist the complete chunk set together, replacing only on maintenance.
-        await self._upsert_document(source, doc_record, replace=replace)
+        await self._index_document(source, doc_record)
 
     async def summarize_document_chunks(
         self, source: DocumentSource, document_id: str
     ) -> bool:
-        expected_mtime = await self._document_mtime(source, document_id)
-        if expected_mtime is None:
+        async with self.context.get_session() as session:
+            doc = await session.get(Document, (source.id, document_id))
+        if doc is None:
             return False
+        expected_mtime = doc.last_modified
         semantic_chunks = await self._reconstruct_semantic_chunks(source, document_id)
 
         if not semantic_chunks:
@@ -605,35 +597,19 @@ class Indexer:
 
         summary_prompt = source.config.chunk_summary_prompt or source.config.doc_summary_prompt
 
-        updated_rows: list[dict[str, Any]] = []
-        summary_records: list[ChunkSummary] = []
-        next_summary_span = 0
-        all_spans: list[SummarySpan] = []
-
-        for semantic_chunk in semantic_chunks:
-            spans = self._split_summary_spans(
-                semantic_chunk.text, self.server_config.max_to_summarize
-            )
-            all_spans.extend(spans)
-
-            for row in semantic_chunk.embedding_rows:
-                metadata = self._deserialize_metadata(row.metadata_str)
-                local_index = self._summary_span_for_embedding_chunk(metadata, spans)
-                updated = {
-                    "collection_id": row.collection_id,
-                    "document_id": row.document_id,
-                    "chunk_id": row.chunk_id,
-                    "summary_span": next_summary_span + local_index,
-                }
-                updated_rows.append(updated)
-
-            next_summary_span += len(spans)
+        # Plan the summary spans: one per semantic chunk, split only when the
+        # semantic chunk exceeds max_to_summarize, and never splitting an
+        # embedding chunk. Returns the texts to summarize and each embedding
+        # chunk's span index.
+        span_texts, chunk_spans = self._plan_summarization_spans(
+            semantic_chunks, self.server_config.max_to_summarize
+        )
 
         # Submit across semantic boundaries so the model batcher can stay full.
-        summaries = await asyncio.gather(*(
-            self._summarize_text(span.text, summary_prompt) for span in all_spans
-        ))
-        summary_records = [
+        summaries = await asyncio.gather(*[
+            self._summarize_text(text, summary_prompt) for text in span_texts
+        ])
+        doc_summaries = [
             ChunkSummary(
                 collection_id=source.id,
                 document_id=document_id,
@@ -643,53 +619,47 @@ class Indexer:
             for offset, summary in enumerate(summaries)
         ]
 
-        # Guard and write summaries/references together; refresh may have replaced
-        # the document while the model was working.
+        # Write in a short session after the model work. The row lock makes the
+        # mtime read and the write atomic: if a maintenance refresh lands first,
+        # we see its new last_modified and skip; if we win, the refresh blocks
+        # on the lock and then overwrites with the current content. A stale
+        # summary can therefore never be committed.
         async with self.context.get_session() as session:
-            current = (await session.execute(select(Document).where(
-                Document.collection_id == source.id,
-                Document.document_id == document_id,
-            ).with_for_update())).scalar_one_or_none()
-            if current is None or current.last_modified != expected_mtime:
+            doc = await session.get(
+                Document, (source.id, document_id),
+                options=[selectinload(Document.chunks),
+                         selectinload(Document.summaries)],
+                with_for_update=True,
+            )
+            if doc is None or doc.last_modified != expected_mtime:
                 return False
-            for summary in summary_records:
-                await session.merge(summary)
-            await session.flush()
-            for row in updated_rows:
-                await session.execute(update(DocumentChunk).where(
-                    DocumentChunk.collection_id == source.id,
-                    DocumentChunk.document_id == document_id,
-                    DocumentChunk.chunk_id == row["chunk_id"],
-                ).values(summary_span=row["summary_span"]))
+            for chunk in doc.chunks:
+                span_index = chunk_spans.get(chunk.chunk_id)
+                if span_index is not None:
+                    chunk.summary_span = span_index
+            doc.summaries = doc_summaries
             await session.commit()
         return True
-
-    async def _document_mtime(self, source: DocumentSource, document_id: str):
-        async with self.context.get_session() as session:
-            return (await session.execute(select(Document.last_modified).where(
-                Document.collection_id == source.id,
-                Document.document_id == document_id,
-            ))).scalar_one_or_none()
 
     async def summarize_document(
         self, source: DocumentSource, document_id: str
     ) -> bool:
         async with self.context.get_session() as session:
-            existing = (await session.execute(select(Document).where(
-                Document.collection_id == source.id,
-                Document.document_id == document_id,
-            ))).scalar_one_or_none()
-        if existing is None:
+            doc = await session.get(
+                Document, (source.id, document_id),
+                options=[selectinload(Document.summaries)],
+            )
+        if doc is None:
             return False
-        if existing.summary:
-            return True
-        expected_mtime = existing.last_modified
+        expected_mtime = doc.last_modified
         pointer = source.fetch_document(document_id)
         metadata_dict = await pointer.get_metadata()
 
         doc_summary = await source.get_document_summary(document_id)
         if not doc_summary:
-            span_summaries = await self._load_summary_texts(source, document_id)
+            span_summaries = [s.summary for s in sorted(
+                doc.summaries, key=lambda s: s.summary_span
+            ) if s.summary]
             if not span_summaries:
                 return False
             doc_summary_text = "\n\n".join(span_summaries)
@@ -738,65 +708,47 @@ class Indexer:
         title = extracted_title if extracted_title else metadata_dict.get("title", "Untitled")
         title_strength = 9 if extracted_title else int(metadata_dict.get("title_strength", 0))
 
-        doc_record = Document(
-            collection_id=source.id,
-            document_id=document_id,
-            title=title,
-            title_strength=title_strength,
-            last_modified=expected_mtime,
-            summary=final_summary,
-            embedding=doc_vector,
-            keywords=(extracted_keywords if extracted_keywords else
-                      normalize_keywords(metadata_dict.get("keywords", []))),
-        )
-
-        return await self._update_document(source, doc_record)
-
-    async def _upsert_document(
-        self, source: DocumentSource, doc: Document, *, replace: bool = False,
-    ) -> None:
+        # Write through the loaded document: changed attributes only. The row
+        # lock makes the mtime read and the write atomic, so this can never
+        # commit a summary for content that is no longer current.
         async with self.context.get_session() as session:
-            # The FK cascades remove old chunks and summary spans on refresh.
-            # Preparation has already succeeded before this transaction begins.
-            if replace:
-                await session.execute(delete(Document).where(
-                    Document.collection_id == source.id,
-                    Document.document_id == doc.document_id,
-                ))
-            values = {column.key: getattr(doc, column.key) for column in Document.__table__.columns}
-            inserted = (await session.execute(insert(Document).values(**values)
-                .on_conflict_do_nothing(index_elements=["collection_id", "document_id"])
-                .returning(Document.document_id))).scalar_one_or_none()
-            if inserted is None:
-                # Another search/indexing task already prepared this document.
-                return
-            if doc.chunks:
-                await session.execute(insert(DocumentChunk), [
-                    {column.key: getattr(chunk, column.key) for column in DocumentChunk.__table__.columns}
-                    for chunk in doc.chunks
-                ])
-            await session.execute(delete(FailedDocument).where(
-                FailedDocument.collection_id == source.id,
-                FailedDocument.document_id == doc.document_id,
-            ))
-            await session.commit()
-
-    async def _update_document(
-        self, source: DocumentSource, doc: Document
-    ) -> bool:
-        async with self.context.get_session() as session:
-            current = (await session.execute(select(Document).where(
-                Document.collection_id == source.id,
-                Document.document_id == doc.document_id,
-            ).with_for_update())).scalar_one_or_none()
-            if current is None or current.last_modified != doc.last_modified:
+            doc = await session.get(
+                Document, (source.id, document_id), with_for_update=True
+            )
+            if doc is None or doc.last_modified != expected_mtime:
                 return False
-            if current.summary:
-                return True
-            for attribute in ("summary", "embedding", "title", "title_strength", "keywords"):
-                setattr(current, attribute, getattr(doc, attribute))
+            doc.title = title
+            doc.title_strength = title_strength
+            doc.summary = final_summary
+            doc.embedding = doc_vector
+            doc.keywords = (extracted_keywords if extracted_keywords else
+                            normalize_keywords(metadata_dict.get("keywords", [])))
             await session.commit()
             return True
+
+    async def _index_document(self, source: DocumentSource, doc: Document) -> None:
+        """Persist the prepared document, fully replacing any previous version."""
+        async with self.context.get_session() as session:
+            # The transient clobbers the previous version: every field is
+            # written, the chunk set is replaced (delete-orphan), and previous
+            # chunk summaries are cleared so summarization re-queues.
+            doc.summaries = []
+            for _ in range(2):
+                try:
+                    await session.merge(doc)
+                    await session.execute(delete(FailedDocument).where(
+                        FailedDocument.collection_id == source.id,
+                        FailedDocument.document_id == doc.document_id,
+                    ))
+                    await session.commit()
+                    return
+                except IntegrityError:
+                    # A concurrent index committed this document first; re-merge
+                    # the same prepared document so the latest write wins.
+                    await session.rollback()
+            raise RuntimeError(
+                f"Could not index {source.id}:{doc.document_id} after concurrent conflict"
+            )
 
     async def _reconstruct_semantic_chunks(
         self, source: DocumentSource, document_id: str
@@ -825,18 +777,15 @@ class Indexer:
             grouped_rows.setdefault(key, []).append(row)
             grouped_metadata.setdefault(key, semantic_metadata)
 
-        semantic_chunks = []
-        for key, rows_for_semantic_chunk in grouped_rows.items():
-            text = await source.fetch_chunk(
-                document_id, grouped_metadata[key], scope="semantic"
+        semantic_chunks = [
+            ReconstructedSemanticChunk(
+                rows=rows,
+                text=await source.fetch_chunk(
+                    document_id, grouped_metadata[key], scope="semantic",
+                ),
             )
-            semantic_chunks.append(
-                ReconstructedSemanticChunk(
-                    metadata=grouped_metadata[key],
-                    embedding_rows=rows_for_semantic_chunk,
-                    text=text,
-                )
-            )
+            for key, rows in grouped_rows.items()
+        ]
         return semantic_chunks
 
     async def _summarize_text(self, text: str, prompt: str) -> str:
@@ -861,57 +810,56 @@ class Indexer:
             ),
         )
 
-    def _split_summary_spans(
-        self, text: str, max_to_summarize: int
-    ) -> list[SummarySpan]:
-        if len(text) <= max_to_summarize:
-            return [SummarySpan(offset=0, size=len(text), text=text)]
-
-        split_size = max(1, max_to_summarize // 2)
-        spans = []
-        for offset in range(0, len(text), split_size):
-            chunk_text = text[offset : offset + split_size]
-            spans.append(SummarySpan(offset=offset, size=len(chunk_text), text=chunk_text))
-        return spans
-
-    def _summary_span_for_embedding_chunk(
+    def _plan_summarization_spans(
         self,
-        embedding_metadata: dict[str, Any],
-        summary_spans: list[SummarySpan],
-    ) -> int:
-        if len(summary_spans) == 1:
-            return 0
+        semantic_chunks: list[ReconstructedSemanticChunk],
+        max_to_summarize: int,
+    ) -> tuple[list[str], dict[str, int]]:
+        """Plan summary spans and map each embedding chunk to its span.
 
-        start = int(embedding_metadata.get("o", 0))
-        end = start + int(embedding_metadata.get("s", 0))
-        best_index = 0
-        best_overlap = -1
+        A semantic chunk normally yields one span. It is split into several
+        spans only when it exceeds max_to_summarize, and the split groups whole
+        embedding chunks (ordered by their in-chunk offset) so a single
+        embedding chunk is never split across spans. Returns the span texts to
+        summarize and a chunk_id -> absolute span index mapping.
+        """
+        span_texts: list[str] = []
+        chunk_by_id: dict[str, int] = {}
 
-        for index, span in enumerate(summary_spans):
-            span_end = span.offset + span.size
-            overlap = max(0, min(end, span_end) - max(start, span.offset))
-            if overlap > best_overlap:
-                best_index = index
-                best_overlap = overlap
+        def size_of(group: list[str]) -> int:
+            return sum(len(part) for part in group)
 
-        return best_index
-
-    async def _load_summary_texts(
-        self, source: DocumentSource, document_id: str
-    ) -> list[str]:
-        async with self.context.get_session() as session:
-            result = await session.execute(
-                select(ChunkSummary).where(
-                    ChunkSummary.collection_id == source.id,
-                    ChunkSummary.document_id == document_id,
-                )
+        for semantic_chunk in semantic_chunks:
+            base = len(span_texts)
+            text = semantic_chunk.text
+            rows = sorted(
+                semantic_chunk.rows,
+                key=lambda r: int(
+                    self._deserialize_metadata(r.metadata_str).get("o", 0)
+                ),
             )
-            summaries = result.scalars().all()
-            if not summaries:
-                return []
 
-            sorted_summaries = sorted(summaries, key=lambda s: s.summary_span)
-            return [s.summary for s in sorted_summaries if s.summary]
+            # Group whole embedding chunks under the budget; a chunk that
+            # alone exceeds the budget becomes its own single span.
+            spans: list[list[str]] = []
+            current: list[str] = []
+            chunk_span: list[int] = []
+            for row in rows:
+                o = int(self._deserialize_metadata(row.metadata_str).get("o", 0))
+                s = int(self._deserialize_metadata(row.metadata_str).get("s", 0))
+                if current and size_of(current) + s > max_to_summarize:
+                    spans.append(current)
+                    current = []
+                current.append(text[o:o + s])
+                chunk_span.append(len(spans))
+            spans.append(current)
+
+            for group in spans:
+                span_texts.append("".join(group))
+            for row, gi in zip(rows, chunk_span):
+                chunk_by_id[row.chunk_id] = base + gi
+
+        return span_texts, chunk_by_id
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)

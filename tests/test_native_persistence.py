@@ -58,8 +58,7 @@ async def test_refresh_failure_and_deletion_are_atomic(test_context, tmp_path, m
     monkeypatch.setattr(indexer, "_embed_batch", fail)
     with pytest.raises(RuntimeError, match="embedding failed"):
         await indexer.index_document(source.fetch_document(path.name),
-                                     DocumentIndexingStats(path.name, "refresh", source=source),
-                                     replace=True)
+                                     DocumentIndexingStats(path.name, "refresh", source=source))
     async with source.context.get_session() as session:
         kept = await session.get(Document, (source.id, path.name))
         assert kept.last_modified == old_mtime

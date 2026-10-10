@@ -55,8 +55,7 @@ async def test_maintenance_refreshes_changed_and_deletes_immediately(monkeypatch
     source = SimpleNamespace(id="wiki", indexing_mode=mode, fetch_document=fetch)
     indexer = Indexer(context_for(session))
 
-    async def index_document(pointer, stats, *, replace=False):
-        assert replace
+    async def index_document(pointer, stats):
         events.append(("refresh", pointer.document_id, stats.operation))
 
     async def schedule(coroutine, stats):
@@ -140,15 +139,43 @@ async def test_cli_maintenance_is_an_independent_operation(monkeypatch, flags, e
 @pytest.mark.parametrize("deleted", [False, True])
 async def test_stale_summary_cannot_restore_replaced_or_deleted_document(deleted):
     now = datetime(2026, 1, 1)
-    current = None if deleted else SimpleNamespace(last_modified=now + timedelta(days=1), summary="")
+    original = SimpleNamespace(last_modified=now, summaries=[])
+    replaced = None if deleted else SimpleNamespace(last_modified=now + timedelta(days=1), summaries=[])
+    loads = iter([original, replaced])
+
     class Session:
-        async def execute(self, statement):
-            assert statement._for_update_arg is not None
-            return SimpleNamespace(scalar_one_or_none=lambda: current)
+        def __init__(self):
+            self.calls = 0
+        async def get(self, model, identity, *args, **kwargs):
+            assert identity == ("wiki", "article")
+            self.calls += 1
+            result = next(loads)
+            # The write-session read (2nd call) must be locked so the mtime
+            # guard and the write are atomic against a concurrent refresh.
+            if self.calls == 2:
+                assert kwargs.get("with_for_update") is True
+            return result
         async def commit(self):
             raise AssertionError("Stale summary must not commit")
+
     @asynccontextmanager
     async def session():
         yield Session()
-    doc = SimpleNamespace(document_id="article", last_modified=now)
-    assert not await Indexer(context_for(session))._update_document(SimpleNamespace(id="wiki"), doc)
+
+    async def get_metadata():
+        return {"title": "Article"}
+    pointer = SimpleNamespace(get_metadata=get_metadata)
+
+    def fetch(document_id):
+        return pointer
+    async def get_document_summary(document_id):
+        return "A summary."
+
+    async def embedding(texts):
+        return [[0.1]]
+
+    context = context_for(session)
+    context.embedding = embedding
+    source = SimpleNamespace(id="wiki", fetch_document=fetch,
+                             get_document_summary=get_document_summary)
+    assert not await Indexer(context).summarize_document(source, "article")
