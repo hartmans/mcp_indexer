@@ -127,8 +127,9 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
     async with test_context.session_factory() as session:
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
 
-    # Chunks were created in Postgres during indexing.
-    assert len(chunks) == 2
+    # Chunks were created in Postgres during indexing: one embedding chunk
+    # per paragraph (the first candidate boundary reaches min_size).
+    assert len(chunks) == 4
 
     # semantic_chunk_id points at the order of the first embedding chunk of
     # its semantic chunk: a real row in the same document.

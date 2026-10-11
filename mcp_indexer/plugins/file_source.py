@@ -146,6 +146,10 @@ class FileSource(DocumentSource[P]):
         current_semantic_start = 0
         for s_chunk in semantic_chunks:
             current_semantic_end = current_semantic_start + len(s_chunk)
+            # Candidate embedding chunks at the embedding boundaries, with no
+            # sizing: min_size/max_size enforcement is the
+            # create_embedding_chunks step's job, which gets the list of
+            # candidates as a hint.
             e_chunks = []
             e_start = 0
             e_matches = []
@@ -156,16 +160,11 @@ class FileSource(DocumentSource[P]):
             for pos in e_matches:
                 if pos <= e_start:
                     continue
-                chunk = s_chunk[e_start:pos]
-                if len(chunk) >= min_size:
-                    e_chunks.append(chunk)
-                    e_start = pos
+                e_chunks.append(s_chunk[e_start:pos])
+                e_start = pos
             remnant = s_chunk[e_start:]
             if remnant:
-                if e_chunks and len(remnant) < min_size:
-                    e_chunks[-1] += remnant
-                else:
-                    e_chunks.append(remnant)
+                e_chunks.append(remnant)
             if e_chunks:
                 chunk_metadata = {**metadata, 'b': current_semantic_start, 'e': current_semantic_end}
                 yield chunk_metadata, [c.decode('utf-8', errors='replace') for c in e_chunks]

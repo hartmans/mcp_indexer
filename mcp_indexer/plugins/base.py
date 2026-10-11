@@ -1,3 +1,4 @@
+import bisect
 import dataclasses
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Generic, List, Literal, TypeVar
@@ -10,6 +11,7 @@ if TYPE_CHECKING:
     from ..rerank import AbstractReranker
     from ..search import NativeSearchBatch
 
+# The metadata for a semantic chunk, and a proposed set of good splits into embedding chunks.
 ChunkInfo = tuple[dict[str, Any], list[str]]
 
 
@@ -47,27 +49,56 @@ def create_embedding_chunks(
 ) -> List[tuple[dict, str]]:
     """
     Processes a single semantic chunk into embedding-sized chunks.
-    Returns a list of (metadata, text) tuples.
+
+    ``text_list`` is the list of candidate embedding chunks proposed by the
+    source (at its embedding boundaries). The candidates are a hint: each
+    output chunk is cut at the first candidate boundary that yields a chunk
+    of at least ``min_size`` (absorbing any smaller leading fragments), so
+    with a wide min_size/max_size gap the cut lands near min_size and
+    ``max_size`` binds only when no usable boundary appears. Where none
+    does, a hard cut is made at ``max_size``; after such a slice the next
+    cut resumes at the next candidate boundary, so chunks re-align with the
+    source's boundaries as soon as the remainder allows. ``max_size`` is a
+    constraint (no output chunk exceeds it); ``min_size`` is a hint
+    (undersized chunks are emitted only when a boundary cut or tail would
+    otherwise violate ``max_size``).
+
+    Returns a list of (metadata, text) tuples. Each result metadata is a
+    copy of the semantic metadata with ``o`` (offset into the semantic
+    text) and ``s`` (length) added, set at emit time.
     """
     text = "".join(text_list)
     text_len = len(text)
 
-    results = []
+    # Candidate boundary positions: cumulative end of each proposed chunk.
+    boundaries = []
+    pos = 0
+    for piece in text_list:
+        pos += len(piece)
+        boundaries.append(pos)
+
+    results: List[tuple[dict, str]] = []
     offset = 0
-
     while offset < text_len:
-        end = min(offset + max_size, text_len)
-        if offset > 0 and (end - offset) < min_size:
-            if results:
-                last_meta, last_text = results[-1]
-                results[-1] = (last_meta, last_text + text[offset:end])
-                offset = end
-                continue
+        # First candidate boundary at which the chunk reaches min_size.
+        idx = bisect.bisect_left(boundaries, offset + min_size)
+        b = boundaries[idx] if idx < len(boundaries) else None
+        if b is None or b - offset > max_size:
+            # No boundary in [offset + min_size, offset + max_size]:
+            # hard cut at the cap.
+            cut = min(offset + max_size, text_len)
+        else:
+            cut = b
+        results.append(({**metadata, "o": offset, "s": cut - offset}, text[offset:cut]))
+        offset = cut
 
-        chunk_text = text[offset:end]
-        chunk_meta = {**metadata, "o": offset, "s": len(chunk_text)}
-        results.append((chunk_meta, chunk_text))
-        offset = end
+    # Tail: merge an undersized final chunk into the previous one if it
+    # fits without exceeding max_size; otherwise emit it as-is.
+    if len(results) >= 2 and results[-1][0]["s"] < min_size:
+        if results[-2][0]["s"] + results[-1][0]["s"] <= max_size:
+            last_meta, last_text = results.pop()
+            prev_meta, prev_text = results[-1]
+            results[-1] = ({**prev_meta, "s": prev_meta["s"] + last_meta["s"]}, prev_text + last_text)
 
     return results
 

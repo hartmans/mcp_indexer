@@ -32,6 +32,17 @@ Embedding chunks are appropriately sized for vector embeddings.
 *DocumentChunk* is a model stored in the database for each document chunk. It contains a metadata dictionary used to actually retrieve chunks; that can be passed into DocumentPointer.fetch_chunk to get the semantic chunk. *DocumentSource.fetch_chunk* can get semantic or embedding chunks.
 * *DocumentPointer.get_chunks* describes the chunk metadata dictionary in detail.
 
+The source's `get_chunks` yields, per semantic chunk, a list of *candidate*
+embedding chunks cut at the source's embedding boundaries. The candidates
+are a hint, not a sizing decision: `create_embedding_chunks` converts them
+into the stored embedding chunks, cutting at candidate boundaries wherever
+possible. A stored chunk therefore never straddles a boundary, except
+inside a single candidate larger than `max_size`, which is sliced at the
+cap and re-aligns with the source's boundaries at the following cuts.
+`max_size` is a constraint (no stored chunk exceeds it); `min_size` is a
+hint (chunks smaller than it are emitted only where the alternative would
+violate `max_size`).
+
 
 ## Collections
 
