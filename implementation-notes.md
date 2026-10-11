@@ -30,11 +30,14 @@ window can see stale stored results until maintenance finishes.
 
 ## Production steps for review
 
-1. Review `scripts/migrate_native_sources.sql` and back up the production database.
-   With application writers stopped, apply it using `psql -v ON_ERROR_STOP=1 -f`
-   against the intended database. It updates FK cascades/deferrability and deletes
-   orphan summaries in one transaction. The cleanup is recoverable through the
-   backup or transaction rollback before commit, not after commit without a backup.
+1. Review `scripts/migrate_semantic_schema.py` and back up the production
+   database. With application writers stopped, run it against the intended
+   database with `--config` (preview with `--dry-run`). It is idempotent and
+   resumable: it applies the native-sources FK cleanup, adds the
+   parent/semantic-chunk schema, backfills from the legacy metadata, reads
+   flagged chunks from the source files, strips the legacy `o`/`s` metadata,
+   and `SET NOT NULL`s the new columns. The cleanup is recoverable through the
+   backup before the script runs, not after commit without a backup.
    Do not use the new maintenance code against the old schema.
 2. Run the application and PostgreSQL tests in an environment with the project
    dependencies and a dedicated test database. `tests/conftest.py` currently points

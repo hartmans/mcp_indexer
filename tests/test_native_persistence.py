@@ -143,7 +143,20 @@ async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, mon
         assert document.keywords == ["good-key"]
 
 
-async def test_manual_migration_from_legacy_constraints(test_context):
+async def test_manual_migration_from_legacy_constraints(test_context, pg_url):
+    import importlib.util
+    import sys
+    import psycopg
+    from psycopg.rows import dict_row
+
+    spec = importlib.util.spec_from_file_location(
+        "migrate_semantic_schema",
+        Path(__file__).parents[1] / "scripts" / "migrate_semantic_schema.py",
+    )
+    migration = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = migration
+    spec.loader.exec_module(migration)
+
     async with test_context.engine.begin() as connection:
         await connection.exec_driver_sql("ALTER TABLE document_chunk DROP CONSTRAINT fk_document_chunk_document")
         await connection.exec_driver_sql("ALTER TABLE document_chunk DROP CONSTRAINT fk_document_chunk_summary")
@@ -155,18 +168,24 @@ async def test_manual_migration_from_legacy_constraints(test_context):
             REFERENCES chunk_summary (collection_id, document_id, summary_span)
             ON DELETE SET NULL (summary_span)""")
         await connection.exec_driver_sql("""INSERT INTO chunk_summary VALUES ('wiki', 'orphan', 0, 'orphan summary')""")
-    migration = (Path(__file__).parents[1] / "scripts/migrate_native_sources.sql").read_text()
-    # The test supplies the transaction; retain the DO block's BEGIN/END.
-    migration = migration.replace("BEGIN;\n", "", 1).replace("\nCOMMIT;", "")
-    async with test_context.engine.begin() as connection:
-        await connection.execute(text(migration))
-        count = (await connection.exec_driver_sql("SELECT count(*) FROM chunk_summary")).scalar_one()
+    # The script owns the transaction for the FK step.
+    conn = psycopg.connect(pg_url.replace("+psycopg", ""), row_factory=dict_row,
+                           autocommit=False)
+    try:
+        migration.step_fks(conn.cursor(), dry=False)
+        count = conn.cursor().execute(
+            "SELECT count(*) AS n FROM chunk_summary").fetchone()["n"]
         assert count == 0
-        constraints = (await connection.exec_driver_sql("""SELECT conname, condeferrable, confdeltype
+        constraints = conn.cursor().execute("""SELECT conname, condeferrable, confdeltype
             FROM pg_constraint WHERE conname IN
-            ('fk_document_chunk_document', 'fk_document_chunk_summary', 'fk_chunk_summary_document')""")).all()
-        assert set(constraints) == {
+            ('fk_document_chunk_document', 'fk_document_chunk_summary',
+             'fk_chunk_summary_document')""").fetchall()
+        assert {(c["conname"], c["condeferrable"], c["confdeltype"])
+                for c in constraints} == {
             ("fk_document_chunk_document", True, "c"),
             ("fk_document_chunk_summary", True, "n"),
             ("fk_chunk_summary_document", True, "c"),
         }
+        conn.commit()
+    finally:
+        conn.close()

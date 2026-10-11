@@ -1,5 +1,5 @@
 [server]
-db_uri = "~/.lancedb"
+db_uri = "postgresql://postgres@:5432/indexer?host=/var/run/postgresql"
 log_level = "INFO"
 llm_batch_size = 10
 embedding_batch_size = 100
