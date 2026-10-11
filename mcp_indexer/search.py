@@ -52,6 +52,11 @@ class ChunkHit:
     chunk_metadata: dict[str, Any]
     score: float
     chunk_id: str | None = None
+    # Char span of this chunk within its semantic chunk's decoded text.
+    # Required for embedding-scope fetches; the dedup rule compares spans
+    # (containment) for hits sharing a metadata dict.
+    embedding_offset: int | None = None
+    embedding_length: int | None = None
 
 
 SearchHit = DocumentHit | ChunkHit
@@ -85,7 +90,9 @@ async def _vector_type_hits(collection, vector, model, count, offset, threshold)
         (Document.document_id, Document.summary, distance.label("distance"))
         if model is Document else
         (DocumentChunk.document_id, DocumentChunk.chunk_id,
-         DocumentChunk.metadata_str, distance.label("distance"))
+         DocumentChunk.metadata_str,
+         DocumentChunk.embedding_offset, DocumentChunk.embedding_length,
+         distance.label("distance"))
     )
     statement = select(*columns).where(
         model.collection_id == collection.id, distance <= threshold,
@@ -104,7 +111,8 @@ async def _vector_type_hits(collection, vector, model, count, offset, threshold)
         else:
             from .models import deserialize_metadata
             hit = ChunkHit(row["document_id"], deserialize_metadata(row["metadata_str"]),
-                           -row["distance"], row["chunk_id"])
+                           -row["distance"], row["chunk_id"],
+                           row["embedding_offset"], row["embedding_length"])
         logger.debug("vector hit for %s: %s cosine_distance=%.4f",
                      collection.id, hit.document_id, row["distance"])
         hits.append(hit)
@@ -179,6 +187,7 @@ async def _prepare_hit(indexer, collection, hit):
         return replace(hit, summary=text), text
     return hit, await collection.fetch_chunk(
         hit.document_id, hit.chunk_metadata, scope="embedding",
+        offset=hit.embedding_offset, length=hit.embedding_length,
     )
 
 
@@ -206,7 +215,14 @@ async def rerank(
     """Standalone scoring helper. Resumable search retains scores separately."""
     unique = {}
     for hit in hits:
-        unique.setdefault(_hit_key(hit), hit)
+        key = _hit_key(hit)
+        # Drop duplicates per the span-containment rule; distinct spans
+        # under the same metadata are kept separately, disambiguated by span.
+        if _duplicate_in_group(unique.items(), key, hit):
+            continue
+        if isinstance(hit, ChunkHit):
+            key = (key, hit.embedding_offset, hit.embedding_length)
+        unique[key] = hit
     outcomes = await asyncio.gather(*(
         _prepare_hit(indexer, collection, hit) for hit in unique.values()
     ), return_exceptions=True)
@@ -258,9 +274,13 @@ async def assemble_hits(
         selected = []
         seen = set()
         for hit in chunk_hits:
+            # Match on chunk_id first (stable identity); fall back to the
+            # char span, which uniquely identifies a chunk within its
+            # semantic chunk now that all rows share one metadata dict.
             chunk = next((chunk for chunk in document.chunks if (
                 chunk.chunk_id == hit.chunk_id if hit.chunk_id is not None
-                else dict(chunk.metadata_dict) == hit.chunk_metadata
+                else (chunk.embedding_offset == hit.embedding_offset
+                      and chunk.embedding_length == hit.embedding_length)
             )), None)
             if chunk is None or chunk.summary is None or not chunk.summary.summary:
                 logger.warning("Missing chunk or summary for %s: %s", document_id, hit)
@@ -294,6 +314,52 @@ def _hit_key(hit: SearchHit) -> tuple:
     return ("chunk", hit.document_id, metadata)
 
 
+def _spans_overlap_contained(a: ChunkHit, b: ChunkHit) -> bool:
+    """True if one hit's char span contains the other's (the dedup rule).
+
+    Called only for hits that already share the same document and metadata
+    dict. A spanless hit duplicates only another spanless hit; a spanned
+    hit duplicates any kept span that contains it (or that it contains).
+    """
+    if a.embedding_offset is None or a.embedding_length is None:
+        return b.embedding_offset is None and b.embedding_length is None
+    if b.embedding_offset is None or b.embedding_length is None:
+        return False
+    a_start, a_end = a.embedding_offset, a.embedding_offset + a.embedding_length
+    b_start, b_end = b.embedding_offset, b.embedding_offset + b.embedding_length
+    return a_start <= b_start and b_end <= a_end or b_start <= a_start and a_end <= b_end
+
+
+def _duplicate_in_group(entries, base_key: tuple, hit: SearchHit) -> bool:
+    """True if a kept entry in this hit's group duplicates it.
+
+    ``entries`` is an iterable of ``(key, existing_hit)`` pairs. A document
+    hit's group is the single base key. A chunk hit's group is the base key
+    plus every span-disambiguated variant (a nested
+    ``(base_key, offset, length)``): containment must be checked against all
+    kept spans, because a non-primary span may contain the new hit even
+    though the base key holds a different span.
+    """
+    for key, existing in entries:
+        if existing is None or existing.document_id != hit.document_id:
+            continue
+        if isinstance(hit, ChunkHit):
+            if not isinstance(existing, ChunkHit):
+                continue
+            # A chunk hit's group is the base key plus its nested span
+            # variants (``(base_key, offset, length)``); note the variant key
+            # is the same arity as base_key, so match on the first element.
+            same_group = (key == base_key
+                          or (isinstance(key, tuple) and key[0] == base_key))
+            if not same_group:
+                continue
+            if _spans_overlap_contained(existing, hit):
+                return True
+        elif key == base_key:
+            return True
+    return False
+
+
 def _accept_hits(session, hits, warnings):
     for hit in hits:
         if hit.document_id in session.returned or hit.document_id in session.failed_documents:
@@ -303,9 +369,16 @@ def _accept_hits(session, hits, warnings):
         except (ValueError, TypeError):
             warnings.append("Discarded a hit with invalid retrieval metadata")
             continue
-        if key not in session.records:
-            session.records[key] = HitRecord(copy.deepcopy(hit), session.encounter)
-            session.encounter += 1
+        # Drop duplicates per the span-containment rule; distinct spans
+        # under the same metadata are kept separately, disambiguated by span.
+        if _duplicate_in_group(
+            ((k, r.hit) for k, r in session.records.items()), key, hit,
+        ):
+            continue
+        if isinstance(hit, ChunkHit):
+            key = (key, hit.embedding_offset, hit.embedding_length)
+        session.records[key] = HitRecord(copy.deepcopy(hit), session.encounter)
+        session.encounter += 1
 
 
 def _validate_native(batch, session):

@@ -7,8 +7,8 @@ from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSo
 
 
 class ConcreteFileSource(FileSource):
-    semantic_boundary_regexps = (rb"\n={3,}\n",)
-    embedding_boundary_regexps = (rb"\n\s*\n",)
+    semantic_boundary_regexps = (r"\n={3,}\n",)
+    embedding_boundary_regexps = (r"\n\s*\n",)
 
     def fetch_document(self, document_id: str) -> FileSourcePointer:
         relative_path_str = self.decode_document_path(document_id)
@@ -51,7 +51,7 @@ async def test_file_source_discovery(temp_file_env, mock_context):
 
 @pytest.mark.asyncio
 async def test_split_text_rst_headers(mock_context):
-    text = "Title\n=======\nSubtitle\n--------\nParagraph".encode("utf-8")
+    text = "Title\n=======\nSubtitle\n--------\nParagraph"
 
     source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 
@@ -84,8 +84,8 @@ async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
 
     assert len(chunks) == 1
     meta, _ = chunks[0]
-    text_list = await pointer.fetch_chunk(meta)
-    assert "Semantic 1" in "".join(text_list)
+    text = await pointer.fetch_chunk(meta)
+    assert "Semantic 1" in text
 
 
 @pytest.mark.asyncio

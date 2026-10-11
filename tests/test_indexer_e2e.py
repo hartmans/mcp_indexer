@@ -231,6 +231,73 @@ async def test_fetch_chunk_semantic_returns_first_chunk_with_warning(test_contex
 
 
 @pytest.mark.asyncio
+async def test_fetch_document_full_text_is_not_duplicated_per_embedding_row(
+    test_context, tmp_path,
+):
+    """A short document returns full_text from the full_text branch. That
+    branch must fetch each semantic chunk once, not once per embedding row:
+    the semantic text is shared by every row in the chunk, so a per-row fetch
+    would repeat it."""
+    from mcp_indexer.server import core_fetch_document
+    from mcp_indexer.models import DocumentChunk
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    # No semantic boundaries (headers/hr), but blank lines give one embedding
+    # chunk per paragraph -> one semantic chunk, three embedding rows.
+    doc_text = "alpha alpha alpha\n\nbeta beta beta\n\ngamma gamma gamma\n"
+    (docs_dir / "short.txt").write_text(doc_text, encoding="utf-8")
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "text", "directory": str(docs_dir)},
+    })
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 5,
+        "max_size": 100,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+    from mcp_indexer.context import Context
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
+
+    async with test_context.session_factory() as session:
+        chunks = (await session.execute(
+            select(DocumentChunk).where(DocumentChunk.document_id == "short.txt")
+        )).scalars().all()
+    chunks.sort(key=lambda c: c.order)
+    # Precondition for the bug: one semantic chunk with several rows.
+    assert len(chunks) >= 2
+    assert all(c.semantic_chunk_id == chunks[0].semantic_chunk_id for c in chunks)
+    semantic_length = chunks[0].semantic_length
+
+    result = await core_fetch_document(
+        context=context,
+        indexer=indexer,
+        prefixed_document_id="notes:short.txt",
+    )
+    # full_text present (document is short), and equal to the single semantic
+    # chunk's text -- not multiplied by the number of embedding rows.
+    assert "full_text" in result
+    assert result["full_text"] == doc_text
+    assert len(result["full_text"]) == semantic_length
+
+
+@pytest.mark.asyncio
 async def test_fetch_document_groups_semantic_chunks_with_span_summaries(
     test_context, tmp_path, monkeypatch,
 ):

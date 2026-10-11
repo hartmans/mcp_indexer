@@ -44,11 +44,15 @@ class DocumentChunk(Base):
     # semantic chunk repeats that first row's `order`, so
     # `order == semantic_chunk_id` identifies a semantic-chunk boundary.
     semantic_chunk_id: Mapped[int]
-    # Denormalized length of the semantic chunk (e - b). Duplicated across
-    # every embedding chunk in the semantic chunk so a length lookup is a
+    # Char offset of this chunk's embedding span within the semantic chunk's
+    # decoded text. Together with `embedding_length`, fully identifies the
+    # span; the metadata dict no longer carries chunk-level offsets.
+    embedding_offset: Mapped[int]
+    # Denormalized char length of the semantic chunk. Duplicated across every
+    # embedding chunk in the semantic chunk so a length lookup is a
     # single-column read rather than a metadata decode.
     semantic_length: Mapped[int | None]
-    # Length of this chunk's embedding span (s).
+    # Char length of this chunk's embedding span.
     embedding_length: Mapped[int | None]
     metadata_str: Mapped[str]
 

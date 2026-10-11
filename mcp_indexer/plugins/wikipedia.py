@@ -35,12 +35,12 @@ class WikipediaSource(TextFileSource):
     # form covers all six levels (2-6 equals signs, closing run optional).
     # HTML <h1>-<h6> headings are also valid MediaWiki markup.
     semantic_boundary_regexps = (
-        rb"(?m)^={2,6}[^=\n]+?={2,6}[\t ]*$",
-        rb"(?m)^</?[Hh][1-6][^>]*>.*$",
+        r"(?m)^={2,6}[^=\n]+?={2,6}[\t ]*$",
+        r"(?m)^</?[Hh][1-6][^>]*>.*$",
     )
     # Embedding boundaries: blank lines between paragraphs. There is no
     # finer structural boundary worth splitting on in raw wikitext.
-    embedding_boundary_regexps = (rb"\n\s*\n",)
+    embedding_boundary_regexps = (r"\n\s*\n",)
 
     def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
         super().__init__(collection_id, context=context,

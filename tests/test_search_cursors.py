@@ -10,7 +10,7 @@ from mcp_indexer import search as searching
 from mcp_indexer.models import Document, DocumentChunk, ChunkSummary
 from mcp_indexer.plugins.base import DocumentSource
 from mcp_indexer.search import ChunkHit, DocumentHit, NativeSearchBatch, VectorSearchBatch
-from mcp_indexer.search_state import InvalidSearchCursor, SearchAdvanceError, SearchSessionStore
+from mcp_indexer.search_state import InvalidSearchCursor, SearchAdvanceError, SearchSession, SearchSessionStore
 
 
 def doc(name, score=0.9):
@@ -65,9 +65,9 @@ class Harness:
             raise batch
         return NativeSearchBatch(batch, pos + 1, kwargs["chunk_offset"])
 
-    async def fetch_chunk(self, document_id, metadata, scope):
-        self.calls.append(("fetch", document_id, dict(metadata), scope))
-        return f"{document_id}:{metadata['o']}"
+    async def fetch_chunk(self, document_id, metadata, scope, offset=None, length=None):
+        self.calls.append(("fetch", document_id, dict(metadata), scope, offset, length))
+        return f"{document_id}:{offset}"
 
     async def score(self, query, texts, top_n):
         self.calls.append(("score", query, list(texts), top_n))
@@ -111,10 +111,46 @@ def names(page):
     return [document.document_id for document, _ in page.results]
 
 
+@pytest.mark.asyncio
+async def test_span_containment_dedup_rule():
+    # Same metadata dict, contained spans are duplicates; disjoint spans are
+    # not. The first-encountered hit wins.
+    store = SearchSessionStore(clock=lambda: 0)
+    session = SearchSession("q", None, "q", 4, 4, 0.7, 0.5, None)
+    store.add(session)
+
+    base = {"b": 0, "e": 100}
+    coarse = ChunkHit("a", dict(base), 1, None, 0, 50)
+    fine = ChunkHit("a", dict(base), 1, "a?c=0", 10, 20)
+    sibling = ChunkHit("a", dict(base), 1, "a?c=1", 30, 30)
+    other_doc = ChunkHit("b", dict(base), 1, None, 10, 20)
+    base_key = searching._hit_key(coarse)
+
+    searching._accept_hits(session, [coarse], [])
+    first_key = next(iter(session.records))
+    searching._accept_hits(session, [fine], [])
+    searching._accept_hits(session, [sibling], [])
+    searching._accept_hits(session, [other_doc], [])
+    searching._accept_hits(session, [coarse], [])  # repeat: still a dup
+    # coarse kept; fine [10,30) contained in coarse [0,50) -> dropped;
+    # sibling [30,60) overlaps but is not contained in [0,50) -> kept in
+    # its own nested span record; other_doc is a different document -> kept.
+    assert set(session.records) == {
+        (base_key, 0, 50),
+        (base_key, 30, 30),
+        (searching._hit_key(other_doc), 10, 20),
+    }
+    assert first_key == (base_key, 0, 50)
+    assert session.records[first_key].hit.document_id == "a"
+    assert (session.records[first_key].hit.embedding_offset,
+            session.records[first_key].hit.embedding_length) == (0, 50)
+    store.close()
+
+
 @pytest.mark.parametrize("rerank", [False, True])
 async def test_all_streams_resume_and_documents_return_once(harness, rerank):
     h = harness(documents=[doc("a"), doc("b"), doc("c")],
-                chunks=[ChunkHit("a", {"o": 0}, 0.9), ChunkHit("d", {"o": 0}, 0.9)],
+                chunks=[ChunkHit("a", {}, 0.9, None, 0, 1), ChunkHit("d", {}, 0.9, None, 0, 1)],
                 native=[[doc("a")], [], [doc("e")], [doc("f")]], rerank=rerank)
     page = await h.search("query", limit=2, document_candidate_limit=1, chunk_candidate_limit=1)
     found = names(page)
@@ -136,7 +172,7 @@ async def test_all_streams_resume_and_documents_return_once(harness, rerank):
 
 async def test_rejected_summary_later_chunk_and_pending_competition(harness):
     h = harness(documents=[doc("a"), doc("b"), doc("c")],
-                native=[[], [ChunkHit("c", {"o": 0}, 1)], [ChunkHit("a", {"o": 0}, 1)]])
+                native=[[], [ChunkHit("c", {}, 1, None, 0, 1)], [ChunkHit("a", {}, 1, None, 0, 1)]])
     h.scores = {"a": 0.9, "b": 0.8, "c": 0.4, "c:0": 0.95}
     first = await h.search("q", limit=1, document_candidate_limit=3, chunk_candidate_limit=1)
     assert names(first) == ["a"]
@@ -150,9 +186,9 @@ async def test_rejected_summary_later_chunk_and_pending_competition(harness):
 
 async def test_chunk_identity_and_distinct_document_limit(harness):
     h = harness(documents=[doc("a"), doc("b")],
-                chunks=[ChunkHit("a", {"o": 0, "s": 1}, 1, "a?c=0"),
-                        ChunkHit("a", {"o": 1, "s": 1}, 1, "a?c=1")],
-                native=[[doc("a"), ChunkHit("a", {"s": 1, "o": 0}, 1)]])
+                chunks=[ChunkHit("a", {}, 1, "a?c=0", 0, 1),
+                        ChunkHit("a", {}, 1, "a?c=1", 1, 1)],
+                native=[[doc("a"), ChunkHit("a", {}, 1, None, 0, 1)]])
     first = await h.search("q", limit=2)
     assert names(first) == ["a", "b"]
     assert len(first.results[0][1]) == 2
@@ -302,7 +338,7 @@ async def test_all_discovery_failures_do_not_rotate_cursor(harness, monkeypatch)
 
 
 async def test_preparation_and_assembly_have_bounded_retries(harness):
-    h = harness(documents=[doc("bad"), doc("good")], chunks=[ChunkHit("missing", {"o": 0}, 1)])
+    h = harness(documents=[doc("bad"), doc("good")], chunks=[ChunkHit("missing", {}, 1, None, 0, 1)])
     async def missing(*args, **kwargs):
         raise OSError("gone")
     h.source.fetch_chunk = missing
@@ -373,7 +409,7 @@ async def test_uneven_native_offsets_are_source_owned(harness):
         if len(positions) == 1:
             return NativeSearchBatch([], 17, 0)
         if len(positions) == 2:
-            return NativeSearchBatch([ChunkHit("a", {"o": 0}, 1)], 17, 33)
+            return NativeSearchBatch([ChunkHit("a", {}, 1, None, 0, 1)], 17, 33)
         return None
     h.source.native_search = native
     page = await h.search("q")
@@ -464,8 +500,9 @@ async def test_replay_copies_real_detached_orm_graph(harness, monkeypatch):
                                    summary_span=0, summary="passage")
             chunk = DocumentChunk(collection_id="test", document_id=hit.document_id,
                                    chunk_id=hit.document_id + "?c=0", order=0,
-                                   metadata_str='{"o":0}', embedding=[1.0], summary_span=None,
-                                   semantic_chunk_id=0, semantic_length=None,
+                                   metadata_str="{}", embedding=[1.0], summary_span=None,
+                                   semantic_chunk_id=0, embedding_offset=0,
+                                   semantic_length=None,
                                    embedding_length=None, summary=summary)
             document.chunks = [chunk]
             results.append((document, [chunk]))

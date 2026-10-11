@@ -197,24 +197,30 @@ async def core_fetch_document(
         "summary": document.summary,
     }
 
-    # Compute total semantic length across all chunks.
+    # Compute total semantic length across the document's semantic chunks.
+    # semantic_length is denormalized across every row of a semantic chunk,
+    # so count only the root row (order == semantic_chunk_id) of each.
     total_semantic_length = 0
     for chunk in document.chunks:
-        semantic_len = chunk.semantic_length
-        if semantic_len is not None:
-            total_semantic_length += semantic_len
+        if chunk.is_semantic_chunk:
+            total_semantic_length += chunk.semantic_length or 0
 
-    # If the document fits within FULL_DOCUMENT_LENGTH, return the full concatenated text.
+    # If the document fits within FULL_DOCUMENT_LENGTH, return the full
+    # concatenated text: fetch each semantic chunk once, in order.
     if total_semantic_length < FULL_DOCUMENT_LENGTH:
         full_text_parts: list[str] = []
+        current_semantic_id: int | None = None
         for chunk in document.chunks:
-            meta = dict(chunk.metadata_dict)
-            part = await source.fetch_chunk(
-                document_id=document.document_id,
-                chunk_metadata=meta,
-                scope="semantic",
-            )
-            full_text_parts.append(part)
+            if chunk.semantic_chunk_id != current_semantic_id:
+                current_semantic_id = chunk.semantic_chunk_id
+                part = await source.fetch_chunk(
+                    document_id=document.document_id,
+                    chunk_metadata=dict(chunk.metadata_dict),
+                    scope="semantic",
+                    offset=chunk.embedding_offset,
+                    length=chunk.embedding_length,
+                )
+                full_text_parts.append(part)
         result["full_text"] = "".join(full_text_parts)
     else:
         # Otherwise group the chunks into semantic chunks. document.chunks is
@@ -293,7 +299,13 @@ async def core_fetch_chunk(
         )
 
     chunk_metadata = dict(chunk.metadata_dict)
-    text = await source.fetch_chunk(document_id=document_id, chunk_metadata=chunk_metadata, scope=scope)
+    text = await source.fetch_chunk(
+        document_id=document_id,
+        chunk_metadata=chunk_metadata,
+        scope=scope,
+        offset=chunk.embedding_offset,
+        length=chunk.embedding_length,
+    )
 
     return {
         "document_id": _document_ref(collection_id, document_id),

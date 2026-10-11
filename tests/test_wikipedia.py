@@ -47,9 +47,15 @@ async def test_wikipedia_raw_text_round_trip(tmp_path, monkeypatch):
     assert len(semantic) == 2
     assert "".join("".join(parts) for _, parts in semantic) == text
     for meta, parts in semantic:
-        assert "".join(await pointer.fetch_chunk(meta)) == "".join(parts)
-        for embedding_meta, embedding_text in create_embedding_chunks(meta, parts, 1, 8):
-            assert await source.fetch_chunk(pointer.document_id, embedding_meta, "embedding") == embedding_text
+        assert await pointer.fetch_chunk(meta) == "".join(parts)
+        semantic_text = "".join(parts)
+        offset = 0
+        for embedding_text in create_embedding_chunks(parts, 1, 8):
+            assert await source.fetch_chunk(
+                pointer.document_id, meta, "embedding",
+                offset=offset, length=len(embedding_text),
+            ) == embedding_text
+            offset += len(embedding_text)
 
 
 async def test_missing_fetch_and_missing_root_are_distinct(tmp_path):

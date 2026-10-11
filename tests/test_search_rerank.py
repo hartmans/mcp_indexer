@@ -278,8 +278,9 @@ async def test_min_cosine_distance_excludes_far_hits_in_database(test_context):
         collection_id="vec", document_id="far", order=0,
         chunk_id="far?c=0", text="chunk", embedding=_unit(0.3),
         summary_span=None, semantic_chunk_id=0,
+        embedding_offset=0,
         semantic_length=None, embedding_length=1,
-        metadata_str='{"o": 0, "s": 1}',
+        metadata_str="{}",
     )
     async with test_context.session_factory() as session:
         for doc in docs:

@@ -21,11 +21,11 @@ class MockDocumentPointer(DocumentPointer):
         for metadata, text_list in self.chunks_data:
             yield metadata, text_list
 
-    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> list[str]:
+    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> str:
         search_meta = {k: v for k, v in chunk_metadata.items() if k not in ("o", "s")}
         for metadata, text_list in self.chunks_data:
             if metadata == search_meta:
-                return text_list
+                return "".join(text_list)
         raise ValueError("Chunk not found")
 
 
@@ -42,15 +42,13 @@ class MockDocumentSource(DocumentSource):
 
 
 def test_create_embedding_chunks_basic():
-    results = create_embedding_chunks({"id": "1"}, ["Hello ", "world!"], 10, 20)
-    assert results == [({"id": "1", "o": 0, "s": 12}, "Hello world!")]
+    results = create_embedding_chunks(["Hello ", "world!"], 10, 20)
+    assert results == ["Hello world!"]
 
 
 def test_create_embedding_chunks_multiple_small_items():
-    results = create_embedding_chunks({"id": "1"}, ["A"] * 15, 10, 20)
-    assert len(results) == 1
-    assert results[0][0]["s"] == 15
-    assert results[0][1] == "A" * 15
+    results = create_embedding_chunks(["A"] * 15, 10, 20)
+    assert results == ["A" * 15]
 
 
 def test_create_embedding_chunks_hard_slice():
@@ -58,39 +56,33 @@ def test_create_embedding_chunks_hard_slice():
     # Single candidate, no internal boundaries: hard-sliced at max_size.
     # The 8-char remainder cannot merge (20 + 8 > max_size=20), so it is
     # emitted as an undersized tail chunk.
-    results = create_embedding_chunks({"id": "1"}, [text], 10, 20)
+    results = create_embedding_chunks([text], 10, 20)
 
-    assert len(results) == 3
-    assert [meta["s"] for meta, _ in results] == [20, 20, 8]
-    assert [meta["o"] for meta, _ in results] == [0, 20, 40]
-    assert "".join(chunk for _, chunk in results) == text
+    assert [len(chunk) for chunk in results] == [20, 20, 8]
+    assert "".join(results) == text
 
 
 def test_create_embedding_chunks_boundary_flush():
     text = "ShortMediumLengthLongerThanMax"
-    # Cut at the largest candidate boundary within max_size: the 17-char
+    # Cut at the first candidate boundary reaching min_size: the 17-char
     # boundary (Short+MediumLength) rather than a hard cut at 20.
-    results = create_embedding_chunks({"id": "1"}, ["Short", "MediumLength", "LongerThanMax"], 10, 20)
+    results = create_embedding_chunks(["Short", "MediumLength", "LongerThanMax"], 10, 20)
 
-    assert len(results) == 2
-    assert [meta["s"] for meta, _ in results] == [17, 13]
-    assert [meta["o"] for meta, _ in results] == [0, 17]
-    assert "".join(chunk for _, chunk in results) == text
+    assert [len(chunk) for chunk in results] == [17, 13]
+    assert "".join(results) == text
 
 
 def test_create_embedding_chunks_small_tail():
-    results = create_embedding_chunks({"id": "1"}, ["Short"], 10, 20)
-    assert len(results) == 1
-    assert results[0] == ({"id": "1", "o": 0, "s": 5}, "Short")
+    results = create_embedding_chunks(["Short"], 10, 20)
+    assert results == ["Short"]
 
 
 def test_create_embedding_chunks_tail_merges_when_it_fits():
     # 25-char text, max_size=30: the whole thing fits, but the single
     # candidate is split by a boundary into 20 + 5. The 5-char tail is
     # undersized and merges into the previous chunk (20 + 5 <= 30).
-    results = create_embedding_chunks({"id": "1"}, ["a" * 20, "b" * 5], 10, 30)
-    assert len(results) == 1
-    assert results[0] == ({"id": "1", "o": 0, "s": 25}, "a" * 20 + "b" * 5)
+    results = create_embedding_chunks(["a" * 20, "b" * 5], 10, 30)
+    assert results == ["a" * 20 + "b" * 5]
 
 
 def test_create_embedding_chunks_oversized_candidate_realigned():
@@ -98,32 +90,21 @@ def test_create_embedding_chunks_oversized_candidate_realigned():
     # boundaries, so it is hard-sliced at max_size; the next cut finds the
     # candidate boundary again and lands on it, re-aligning the output with
     # the source's boundaries.
-    results = create_embedding_chunks({"id": "1"}, ["x" * 35, "y" * 20], 10, 30)
+    results = create_embedding_chunks(["x" * 35, "y" * 20], 10, 30)
     # Cut 1: hard cut at 30 (no boundary within [0, 30]).
     # Cut 2: the candidate boundary at 55 is within [30, 60] and yields
     # 25 >= min_size, so the cut lands exactly on it.
-    assert [meta["s"] for meta, _ in results] == [30, 25]
-    assert [meta["o"] for meta, _ in results] == [0, 30]
-    assert "".join(chunk for _, chunk in results) == "x" * 35 + "y" * 20
+    assert [len(chunk) for chunk in results] == [30, 25]
+    assert "".join(results) == "x" * 35 + "y" * 20
 
 
 def test_create_embedding_chunks_candidates_are_a_hint():
     # Cut at the first boundary that yields >= min_size: the boundary after
     # "a"*20 (chunk of exactly min_size), absorbing nothing before it. The
     # following chunk then runs from that boundary to the next one.
-    results = create_embedding_chunks({"id": "1"}, ["a" * 20, "b" * 5, "c" * 20], 10, 30)
-    assert [meta["s"] for meta, _ in results] == [20, 25]
-    assert [meta["o"] for meta, _ in results] == [0, 20]
-    assert "".join(chunk for _, chunk in results) == "a" * 20 + "b" * 5 + "c" * 20
-
-
-def test_document_source_chunk_lengths_for_semantic_chunk():
-    source = MockDocumentSource("col1", object(), object(), {})
-
-    semantic_length, embedding_length = source.chunk_lengths({"b": 10, "e": 42})
-
-    assert semantic_length == 32
-    assert embedding_length is None
+    results = create_embedding_chunks(["a" * 20, "b" * 5, "c" * 20], 10, 30)
+    assert [len(chunk) for chunk in results] == [20, 25]
+    assert "".join(results) == "a" * 20 + "b" * 5 + "c" * 20
 
 
 def test_document_source_reranker_defaults_to_none_and_can_be_supplied():
@@ -139,15 +120,6 @@ def test_document_source_reranker_defaults_to_none_and_can_be_supplied():
 
     assert default_source.reranker is None
     assert reranked_source.reranker is reranker
-
-
-def test_document_source_chunk_lengths_for_embedding_chunk():
-    source = MockDocumentSource("col1", object(), object(), {})
-
-    semantic_length, embedding_length = source.chunk_lengths({"b": 10, "e": 42, "o": 5, "s": 11})
-
-    assert semantic_length == 32
-    assert embedding_length == 11
 
 
 def test_result_info_includes_chunk_lengths():
@@ -173,7 +145,8 @@ def test_result_info_includes_chunk_lengths():
         semantic_chunk_id=0,
         semantic_length=32,
         embedding_length=11,
-        metadata_str=json.dumps({"b": 10, "e": 42, "o": 5, "s": 11}),
+        metadata_str=json.dumps({"b": 10, "e": 42}),
+        embedding_offset=5,
     )
 
     formatted = result_info([(document, [chunk])])
@@ -208,8 +181,8 @@ async def test_document_source_fetch_chunk(test_context):
     # Note: The new Context doesn't have a fetch_chunk method
     # This test verifies the MockDocumentSource works correctly
     chunk = source.fetch_document("doc1")
-    text_list = await chunk.fetch_chunk({"meta1": "val1"})
-    assert text_list == ["Hello ", "World"]
+    text = await chunk.fetch_chunk({"meta1": "val1"})
+    assert text == "Hello World"
 
 
 @pytest.mark.asyncio

@@ -35,20 +35,33 @@ class DocumentPointer:
         ...
 
     async def get_chunks(self, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
+        """Yield (metadata, candidate_text) per semantic chunk.
+
+        The candidates form a partition of the semantic chunk's text:
+        contiguous, non-overlapping, and ``"".join(candidates)`` equals
+        exactly what ``fetch_chunk`` returns at semantic scope. This
+        invariant is untestable across the interface (candidates carry no
+        offsets) and the chunker, stored offsets, and search dedup all
+        rely on it: a source must not yield overlapping pieces.
+        """
         ...
 
-    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> list[str]:
+    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> str:
+        """Return the text of the semantic chunk identified by metadata.
+
+        The bytes-to-text boundary is this method: the pointer decodes the
+        stored span in the source's encoding and the app never sees bytes.
+        """
         ...
 
 
 def create_embedding_chunks(
-    metadata: dict,
     text_list: list[str],
     min_size: int,
     max_size: int,
-) -> List[tuple[dict, str]]:
+) -> List[str]:
     """
-    Processes a single semantic chunk into embedding-sized chunks.
+    Sizes a single semantic chunk's candidate embedding chunks.
 
     ``text_list`` is the list of candidate embedding chunks proposed by the
     source (at its embedding boundaries). The candidates are a hint: each
@@ -58,14 +71,15 @@ def create_embedding_chunks(
     ``max_size`` binds only when no usable boundary appears. Where none
     does, a hard cut is made at ``max_size``; after such a slice the next
     cut resumes at the next candidate boundary, so chunks re-align with the
-    source's boundaries as soon as the remainder allows. ``max_size`` is a
-    constraint (no output chunk exceeds it); ``min_size`` is a hint
+    source's boundaries as soon as the remainder allows. ``max_size``
+    is a constraint (no output chunk exceeds it); ``min_size`` is a hint
     (undersized chunks are emitted only when a boundary cut or tail would
     otherwise violate ``max_size``).
 
-    Returns a list of (metadata, text) tuples. Each result metadata is a
-    copy of the semantic metadata with ``o`` (offset into the semantic
-    text) and ``s`` (length) added, set at emit time.
+    The output chunks partition the input text: they are contiguous,
+    non-overlapping, and rejoin to the input. Offsets within the semantic
+    text are the caller's bookkeeping (the indexer stores them in
+    ``embedding_offset``); this function reports sizes only.
     """
     text = "".join(text_list)
     text_len = len(text)
@@ -77,7 +91,7 @@ def create_embedding_chunks(
         pos += len(piece)
         boundaries.append(pos)
 
-    results: List[tuple[dict, str]] = []
+    results: List[str] = []
     offset = 0
     while offset < text_len:
         # First candidate boundary at which the chunk reaches min_size.
@@ -89,16 +103,15 @@ def create_embedding_chunks(
             cut = min(offset + max_size, text_len)
         else:
             cut = b
-        results.append(({**metadata, "o": offset, "s": cut - offset}, text[offset:cut]))
+        results.append(text[offset:cut])
         offset = cut
 
     # Tail: merge an undersized final chunk into the previous one if it
     # fits without exceeding max_size; otherwise emit it as-is.
-    if len(results) >= 2 and results[-1][0]["s"] < min_size:
-        if results[-2][0]["s"] + results[-1][0]["s"] <= max_size:
-            last_meta, last_text = results.pop()
-            prev_meta, prev_text = results[-1]
-            results[-1] = ({**prev_meta, "s": prev_meta["s"] + last_meta["s"]}, prev_text + last_text)
+    if len(results) >= 2 and len(results[-1]) < min_size:
+        if len(results[-2]) + len(results[-1]) <= max_size:
+            results[-1] = results[-2] + results[-1]
+            results.pop(-2)
 
     return results
 
@@ -170,41 +183,31 @@ class DocumentSource(Generic[p]):
         """
         return None
 
-    def chunk_lengths(
-        self, chunk_metadata: dict[str, Any]
-    ) -> tuple[int | None, int | None]:
-        semantic_length: int | None = None
-        if "e" in chunk_metadata:
-            # XXX refactoring needed: b/e is currently a FileSource-specific
-            # semantic-span convention, not a DocumentSource abstraction.
-            # A truly generic semantic_length likely requires fetching the
-            # semantic chunk text (or storing/memoizing the length in schema).
-            semantic_start = int(chunk_metadata.get("b", 0))
-            semantic_end = int(chunk_metadata["e"])
-            semantic_length = semantic_end - semantic_start
-
-        embedding_length = (
-            int(chunk_metadata["s"]) if "s" in chunk_metadata else None
-        )
-
-        if semantic_length is None:
-            semantic_length = embedding_length
-
-        return semantic_length, embedding_length
-
     async def fetch_chunk(
-        self, document_id: str, chunk_metadata: dict[str, Any], scope: Literal["semantic", "embedding"]
+        self, document_id: str, chunk_metadata: dict[str, Any],
+        scope: Literal["semantic", "embedding"],
+        offset: int | None = None, length: int | None = None,
     ) -> str:
+        """Fetch one chunk's text.
+
+        ``scope="semantic"`` returns the whole semantic chunk; the
+        chunk-level ``offset``/``length`` are ignored (callers may still
+        supply them, e.g. copied from a database row, for uniformity).
+        ``scope="embedding"`` returns the slice
+        ``semantic_text[offset:offset + length]``; both are required, in
+        characters, and an embedding fetch without them is an error.
+        """
         pointer = self.fetch_document(document_id)
-        semantic_chunk_list = await pointer.fetch_chunk(chunk_metadata)
-        full_text = "".join(semantic_chunk_list)
+        full_text = await pointer.fetch_chunk(chunk_metadata)
 
         if scope == "semantic":
             return full_text
 
-        offset = chunk_metadata.get("o", 0)
-        span = chunk_metadata.get("s", len(full_text))
-        return full_text[offset : offset + span]
+        if offset is None or length is None:
+            raise ValueError(
+                "Embedding-scope fetch_chunk requires offset and length"
+            )
+        return full_text[offset:offset + length]
 
     def document_id(self, chunk_id: str) -> str:
         return chunk_id.rsplit("?", 1)[0]

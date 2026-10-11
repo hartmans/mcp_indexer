@@ -62,7 +62,7 @@ async def test_text_source_config_resolution(temp_text_env, mock_context):
 
 @pytest.mark.asyncio
 async def test_markdown_semantic_boundaries(mock_context):
-    text = b"Intro text\n\n# Header 1\nContent 1\n\n# Header 2\nContent 2"
+    text = "Intro text\n\n# Header 1\nContent 1\n\n# Header 2\nContent 2"
 
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 
@@ -71,12 +71,12 @@ async def test_markdown_semantic_boundaries(mock_context):
         results.append(chunk)
 
     assert len(results) == 3
-    assert b"# Header 1" in "".join(results[1][1]).encode("utf-8")
+    assert "# Header 1" in "".join(results[1][1])
 
 
 @pytest.mark.asyncio
 async def test_rst_semantic_boundaries(mock_context):
-    text = b"Title\n=======\n\nSection 1\n----------\n\nContent"
+    text = "Title\n=======\n\nSection 1\n----------\n\nContent"
 
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 

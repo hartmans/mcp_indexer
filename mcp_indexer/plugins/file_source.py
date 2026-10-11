@@ -12,6 +12,9 @@ class FileSourceConfig(BaseModel):
     directory: Path
     include: List[str] = Field(default_factory=list, description="Glob patterns to include")
     exclude: List[str] = Field(default_factory=list, description="Glob patterns to exclude")
+    # Text encoding of the source's files. b/e metadata and chunk decoding
+    # are byte-based; everything else in the pipeline is char-based.
+    encoding: str = "utf-8"
 
 class FileSourcePointer(DocumentPointer):
     """
@@ -32,7 +35,9 @@ class FileSourcePointer(DocumentPointer):
             "last_modified": str(self.last_modified)
         }
 
-    async def fetch_semantic_chunk(self, chunk_metadata: dict[str, Any]) -> list[str]:
+    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> str:
+        """Return the text of the semantic chunk, decoded in the source's
+        encoding. This is the bytes-to-text boundary for file sources."""
         b = chunk_metadata.get('b', 0)
         e = chunk_metadata.get('e')
         if e is None:
@@ -45,19 +50,16 @@ class FileSourcePointer(DocumentPointer):
         except FileNotFoundError as exc:
             self.source._check_root()
             raise DocumentNotFoundError(self.document_id) from exc
-        return [chunk_bytes.decode('utf-8', errors='replace')]
+        return chunk_bytes.decode(self.source.source_config.encoding, errors='replace')
 
     async def get_chunks(self, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
         try:
-            text_bytes = self.path.read_bytes()
+            text = self.path.read_text(encoding=self.source.source_config.encoding)
         except FileNotFoundError as exc:
             self.source._check_root()
             raise DocumentNotFoundError(self.document_id) from exc
-        async for chunk_info in self.source.split_text({}, text_bytes, min_size, max_size):
+        async for chunk_info in self.source.split_text({}, text, min_size, max_size):
             yield chunk_info
-
-    async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> list[str]:
-        return await self.fetch_semantic_chunk(chunk_metadata)
 
 P = TypeVar("P", bound=DocumentPointer)
 
@@ -66,8 +68,8 @@ class FileSource(DocumentSource[P]):
     An abstract DocumentSource for files on disk.
     """
     safe_document_path_chars = "/-_.!@+[]()"
-    semantic_boundary_regexps: tuple[bytes, ...] = ()
-    embedding_boundary_regexps: tuple[bytes, ...] = (rb"\n\s*\n",)
+    semantic_boundary_regexps: tuple[str, ...] = ()
+    embedding_boundary_regexps: tuple[str, ...] = (r"\n\s*\n",)
 
     def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
         super().__init__(
@@ -119,35 +121,47 @@ class FileSource(DocumentSource[P]):
                     full_doc_id = encoded_path
                     yield self.fetch_document(full_doc_id)
 
-    async def split_text(self, metadata: dict[str, Any], text_bytes: bytes, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
-        if not bytes(text_bytes):
+    async def split_text(self, metadata: dict[str, Any], text: str, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
+        """Split a document into semantic chunks of candidate embedding
+        chunks, as (metadata, candidate_text) pairs.
+
+        Operates on text: all boundary matching and candidate slicing are
+        char-based, so a cut never lands mid-character. The metadata is
+        enriched with ``b``/``e`` byte offsets into the encoded file
+        (computed by encoding each piece in the source's encoding), which
+        are the source's own retrieval coordinates, not the app's.
+        """
+        if not text:
             return
         semantic_chunks = []
         start = 0
         matches = []
         for pattern in self.semantic_boundary_regexps:
-            for m in re.finditer(pattern, text_bytes):
+            for m in re.finditer(pattern, text):
                 matches.append(m.start())
         matches.sort()
         for pos in matches:
             if pos <= start:
                 continue
-            chunk = text_bytes[start:pos]
+            chunk = text[start:pos]
             if len(chunk) >= min_size:
                 semantic_chunks.append(chunk)
                 start = pos
-        final_chunk = text_bytes[start:]
+        final_chunk = text[start:]
         if final_chunk:
             if semantic_chunks and len(final_chunk) < min_size:
                 semantic_chunks[-1] += final_chunk
             else:
                 semantic_chunks.append(final_chunk)
 
-        current_semantic_start = 0
+        encoding = self.source_config.encoding
+        current_byte_start = 0
         for s_chunk in semantic_chunks:
-            current_semantic_end = current_semantic_start + len(s_chunk)
-            # Candidate embedding chunks at the embedding boundaries, with no
-            # sizing: min_size/max_size enforcement is the
+            # Byte offsets for the source's own retrieval (b/e): encoded
+            # piece length, cumulative from the start of the file.
+            byte_len = len(s_chunk.encode(encoding))
+            # Candidate embedding chunks at the embedding boundaries, with
+            # no sizing: min_size/max_size enforcement is the
             # create_embedding_chunks step's job, which gets the list of
             # candidates as a hint.
             e_chunks = []
@@ -166,9 +180,10 @@ class FileSource(DocumentSource[P]):
             if remnant:
                 e_chunks.append(remnant)
             if e_chunks:
-                chunk_metadata = {**metadata, 'b': current_semantic_start, 'e': current_semantic_end}
-                yield chunk_metadata, [c.decode('utf-8', errors='replace') for c in e_chunks]
-            current_semantic_start = current_semantic_end
+                chunk_metadata = {**metadata, 'b': current_byte_start,
+                                  'e': current_byte_start + byte_len}
+                yield chunk_metadata, e_chunks
+            current_byte_start += byte_len
 
     def fetch_document(self, document_id: str) -> P:
         absolute_path = self._document_path(document_id)

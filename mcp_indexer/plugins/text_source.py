@@ -4,8 +4,7 @@ from mcp_indexer.plugins.base import DocumentNotFoundError
 class TextFileSourceConfig(FileSourceConfig):
     """Configuration for the TextFileSource plugin."""
     # We can add specific text-plugin settings here if needed, 
-    # e.g., custom encoding or specific parsing flags.
-    encoding: str = "utf-8"
+    # e.g. custom encoding or specific parsing flags.
     summary_length: int = 65536
 
 class TextFilePointer(FileSourcePointer):
@@ -33,17 +32,17 @@ class TextFileSource(FileSource[TextFilePointer]):
     # 3. Large gaps of whitespace (though handled by embedding boundaries, 
     #    we might want them as semantic breaks)
     semantic_boundary_regexps = (
-        rb"\n={3,}\n",           # RST Level 1
-        rb"\n-{3,}\n",           # RST Level 2
-        rb"\n\s*#{1,6}\s+.*",    # Markdown Headers
+        r"\n={3,}\n",           # RST Level 1
+        r"\n-{3,}\n",           # RST Level 2
+        r"\n\s*#{1,6}\s+.*",    # Markdown Headers
     )
 
     # Embedding boundaries:
     # 1. Double newlines (paragraphs)
     # 2. Horizontal rules
     embedding_boundary_regexps = (
-        rb"\n\s*\n",             # Paragraphs
-        rb"\n\s*-{3,}\s*\n",     # MD/RST Horizontal rules
+        r"\n\s*\n",             # Paragraphs
+        r"\n\s*-{3,}\s*\n",     # MD/RST Horizontal rules
     )
 
     def __init__(self, collection_id: str, *, context, collection_config, reranker=None):

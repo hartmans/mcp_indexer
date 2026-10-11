@@ -58,7 +58,10 @@ def monitor_time() -> float:
 
 @dataclass
 class SemanticChunkPlan:
-    embedding_chunks: list[tuple[dict[str, Any], str]]
+    # Sized embedding chunks for this semantic chunk, in order. The
+    # join equals the semantic chunk's text; each chunk's char offset
+    # within it is cumulative over the list.
+    embedding_chunks: list[str]
 
 
 @dataclass
@@ -526,10 +529,11 @@ class Indexer:
 
     async def index_document(self, pointer, stats: DocumentIndexingStats):
         source = pointer.source
-        embedding_chunks: list[tuple[dict[str, Any], str]] = []
+        embedding_texts: list[str] = []
+        embedding_offsets: list[int] = []
+        embedding_metadata: list[dict[str, Any]] = []
         semantic_chunk_ids: list[int] = []
-        semantic_lengths: list[int | None] = []
-        embedding_lengths: list[int | None] = []
+        semantic_lengths: list[int] = []
         async for meta, text_list in pointer.get_chunks(
             self.server_config.min_size, self.server_config.max_size
         ):
@@ -543,29 +547,35 @@ class Indexer:
             stats.embedding_chunks += len(plan.embedding_chunks)
             # The first embedding chunk of this semantic chunk is the next
             # global row; every embedding chunk in the chunk points back to it.
-            first_order = len(embedding_chunks)
-            # Denormalized semantic length: the length of the semantic chunk's
-            # text, duplicated across every embedding chunk in the chunk.
+            first_order = len(embedding_texts)
+            # Denormalized semantic length: the length of the semantic
+            # chunk's text, duplicated across every embedding chunk in it.
             semantic_length = len("".join(text_list))
-            for e_meta, e_text in plan.embedding_chunks:
-                embedding_chunks.append((e_meta, e_text))
+            offset = 0
+            for e_text in plan.embedding_chunks:
+                embedding_texts.append(e_text)
+                embedding_offsets.append(offset)
+                embedding_metadata.append(meta)
+                offset += len(e_text)
                 semantic_chunk_ids.append(first_order)
                 semantic_lengths.append(semantic_length)
-                embedding_lengths.append(len(e_text))
 
         batch_embeddings = (
-            await self._embed_batch([text for _, text in embedding_chunks])
-            if embedding_chunks
+            await self._embed_batch(embedding_texts)
+            if embedding_texts
             else []
         )
-        if len(batch_embeddings) != len(embedding_chunks):
+        if len(batch_embeddings) != len(embedding_texts):
             raise ValueError(
-                f"Embedding batch returned {len(batch_embeddings)} vectors for {len(embedding_chunks)} chunks"
+                f"Embedding batch returned {len(batch_embeddings)} vectors for {len(embedding_texts)} chunks"
             )
 
         all_chunks = []
-        for order, ((e_meta, _e_text), embedding, semantic_chunk_id, semantic_length, embedding_length) in enumerate(
-            zip(embedding_chunks, batch_embeddings, semantic_chunk_ids, semantic_lengths, embedding_lengths, strict=True)
+        for order, (e_text, embedding_offset, e_meta, embedding,
+                    semantic_chunk_id, semantic_length) in enumerate(
+            zip(embedding_texts, embedding_offsets, embedding_metadata,
+                batch_embeddings, semantic_chunk_ids, semantic_lengths,
+                strict=True),
         ):
             all_chunks.append(
                 DocumentChunk(
@@ -576,8 +586,9 @@ class Indexer:
                     embedding=embedding,
                     summary_span=None,
                     semantic_chunk_id=semantic_chunk_id,
+                    embedding_offset=embedding_offset,
                     semantic_length=semantic_length,
-                    embedding_length=embedding_length,
+                    embedding_length=len(e_text),
                     metadata_str=json.dumps(e_meta),
                 )
             )
@@ -780,18 +791,19 @@ class Indexer:
 
         document_rows.sort(key=lambda row: row.order)
 
-        grouped_rows: dict[str, list[DocumentChunk]] = {}
-        grouped_metadata: dict[str, dict[str, Any]] = {}
+        grouped_rows: dict[int, list[DocumentChunk]] = {}
+        grouped_metadata: dict[int, dict[str, Any]] = {}
         for row in document_rows:
-            embedding_metadata = self._deserialize_metadata(row.metadata_str)
-            semantic_metadata = {
-                key: value
-                for key, value in embedding_metadata.items()
-                if key not in ("o", "s")
-            }
-            key = self._metadata_identity(semantic_metadata)
+            key = row.semantic_chunk_id
             grouped_rows.setdefault(key, []).append(row)
-            grouped_metadata.setdefault(key, semantic_metadata)
+            if key not in grouped_metadata:
+                # Every row in a semantic chunk carries the same source
+                # metadata; strip any chunk-level offsets from legacy rows.
+                grouped_metadata[key] = {
+                    k: v
+                    for k, v in self._deserialize_metadata(row.metadata_str).items()
+                    if k not in ("o", "s")
+                }
 
         semantic_chunks = [
             ReconstructedSemanticChunk(
@@ -822,7 +834,7 @@ class Indexer:
     ) -> SemanticChunkPlan:
         return SemanticChunkPlan(
             embedding_chunks=create_embedding_chunks(
-                metadata, text_list, min_size, max_size
+                text_list, min_size, max_size
             ),
         )
 
@@ -850,9 +862,7 @@ class Indexer:
             text = semantic_chunk.text
             rows = sorted(
                 semantic_chunk.rows,
-                key=lambda r: int(
-                    self._deserialize_metadata(r.metadata_str).get("o", 0)
-                ),
+                key=lambda r: r.embedding_offset,
             )
 
             # Group whole embedding chunks under the budget; a chunk that
@@ -861,7 +871,7 @@ class Indexer:
             current: list[str] = []
             chunk_span: list[int] = []
             for row in rows:
-                o = int(self._deserialize_metadata(row.metadata_str).get("o", 0))
+                o = row.embedding_offset
                 s = row.embedding_length or 0
                 if current and size_of(current) + s > max_to_summarize:
                     spans.append(current)
@@ -879,9 +889,6 @@ class Indexer:
 
     async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
         return await self.context.embedding(texts)
-
-    def _metadata_identity(self, metadata: dict[str, Any]) -> str:
-        return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
 
     def _deserialize_metadata(self, metadata_str: str | None) -> dict[str, Any]:
         if metadata_str is None:
