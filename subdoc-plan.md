@@ -1,264 +1,204 @@
-# Subdocument/plugin design checkpoint
+# Document plugins and subdocuments
 
-This checkpoint distinguishes the implemented baseline, accepted design direction, and the next proposed implementation spike. Updating this plan does not authorize code changes. architecture.md remains deferred to a separate future spike.
+This plan describes the target architecture and the next implementation spike. It is a coherent design, not a chronological record of proposals. Updating it does not authorize implementation. Changes to architecture.md remain a separate task.
 
-## Context and scope
+## Scope and implemented baseline
 
-- The user reports substantial recent changes to MCP, search, and chunking. Discard earlier assumptions about those implementations. Inspect current code when implementation requires it; this checkpoint does not depend on old code shapes.
-- The current focus is document handlers, subdocument discovery, and content access—not changing search, MCP retrieval, or chunking now.
-- EPUB is the motivating implementation. ZIP and notmuch are design probes; implementing ZipDocument or NotmuchMailSource is not currently requested.
-- Naming remains provisional where noted. Do not turn assistant suggestions recorded as open questions into accepted requirements.
+DocumentHandle, async document acquisition, ContentBridge/FileBridge, DocumentPlugin and its registry, code-defined extension policies, TextDocument, and WikipediaDocument are implemented. FileSource registers as `file`; the separate TextFileSource layer has been removed. The database already has a parent-document relationship.
 
-## Document identities and hierarchy
+Subdocument resolution and indexing, retained-text write/read paths, document metadata persistence, and the handle cache described below are target work, not claims about the current implementation. The current source-level fetch_chunk wrapper is replaced by the shared retrieval helper in this design.
 
-Documents remain in one collection; cross-collection parenting/movement is not an intended operation. Sources/handlers assign subdocument IDs, probably using a prefix obtained from the parent. Exact ID encoding and routing are undecided.
+PDF is the next format to design; EPUB remains another motivating format. ZIP and notmuch are responsibility-boundary probes, not implementation requests. Format-specific decisions stay separate from the common infrastructure.
 
-Earlier discussion established the desired database behavior:
+## Identity and hierarchy
 
-- A document can reference a parent in the same collection via `(collection_id, parent_document_id) -> (collection_id, document_id)`.
-- Removing an existing child during a successful parent rescan should delete that child's whole subtree.
-- ORM `all, delete-orphan` and a database `ON DELETE CASCADE` were explored for this behavior.
-- A model patch was made earlier in the conversation. Its current implementation must be inspected before further work; earlier mapping examples and test claims are not an authoritative specification of the current code.
-- No reparenting workflow is anticipated.
+Database rows, source methods, and handles use collection-local document IDs. External/tool IDs prefix these with `collection_id:`. The prefix identifies a collection, not a source type.
 
-Discovery failure must not be confused with authoritative absence. A partially enumerated child set does not establish that unseen children disappeared. Completed child indexing need not be rolled back merely because parent access or later enumeration failed. Exact reconciliation and completion tracking remain undesigned.
+Literal `:` within a collection-local document ID separates subdocument levels. For example:
 
-## Bound documents and acquisition
+```text
+collection:foo/bar/baz.pdf:picture_1
+```
 
-**DocumentHandle** is the implemented bound-document interface. “Handler” below describes that role, not an additional wrapper class.
+Here the handle's document_id is `foo/bar/baz.pdf:picture_1`, and its parent's ID is `foo/bar/baz.pdf`. Nested subdocuments add further colon-separated components. Literal colons are not accepted as path-component content; filenames containing colons remain representable with percent encoding (`%3A`). Split hierarchy delimiters before decoding path components. Chunk IDs continue to append `?c=...` to the full collection-local document ID.
 
-A handler is a bound document object: for example, EpubDocument represents a particular EPUB, not the abstract EPUB format. There is no present need for a separate unbound EpubDocumentType object. The registry can select classes or factories without introducing such an object.
+The rightmost `rpartition(':')` separates a child from its parent. Sources and handlers assign complete child IDs using the parent identity. The handle-level child-resolution entry point receives the **full collection-local ID**, not merely `picture_1`; the resulting handle retains that full ID and uses it to identify its own descendants. The method name (`fetch_document` or `fetch_sub_document`) is an implementation naming choice, not a different identity contract.
 
-DocumentHandle retains document identity and association with the originating DocumentSource/collection. Its document-facing operations include metadata, chunk enumeration/retrieval, and subdocument enumeration. Exact signatures beyond the agreed shapes below are not settled.
+Documents remain in one collection. The parent relationship is `(collection_id, parent_document_id) -> (collection_id, document_id)`. Deleting a document deletes its subtree; successful parent enumeration reconciles removed children and their pending work. Partial or failed enumeration never establishes absence. Reparenting and cross-collection movement are not intended workflows.
+
+## Bound handles, resolution, and caching
+
+A DocumentHandle is a bound document, not an unbound format descriptor. It retains its source, full collection-local document_id, and last_modified. Its operations cover metadata, semantic chunk enumeration/retrieval, document summaries, immediate-subdocument enumeration, and direct child resolution.
 
 - `get_sub_documents` is an async generator yielding DocumentHandles, parallel to `get_chunks`.
-- Future subdocument orchestration will call both chunk and subdocument enumeration; it is not implemented in the current structural migration. Do not enforce exclusive leaf/container categories in orchestration or the base interface.
-- Most initial formats may yield only chunks or only subdocuments, but messages are already a concrete case yielding both.
-- Future `source.fetch_document(subdocument_id)` must resolve subdocuments, not just roots.
-- `fetch_document` is an **async factory returning a DocumentHandle**, not a context manager: `handle = await source.fetch_document(document_id)`. Async acquisition and context-bound lifetime are separate decisions. Resolution may require expensive asynchronous preparation or existence checks; returned handles remain usable independently of the acquisition call.
+- `source.fetch_document(document_id)` resolves roots and nested subdocuments. Resolution can acquire ancestors and delegate to their handle-level resolution entry points.
+- Acquisition is an async factory returning a durable handle, not a context manager. Handles remain usable independently of acquisition and enumeration.
+- Direct addressability does not promise physically independent or cheap access to a child.
+- Missing documents raise DocumentNotFoundError; unavailable sources remain distinct access failures.
 
-Direct subdocument resolution may internally reopen and prepare ancestors. Independent addressability does not promise cheap or physically independent access.
+Document shapes are combinations of operations, not exclusive leaf/container types. Support chunks plus subdocuments, chunks only, and summary-only documents such as images. A handle may enumerate no chunks or no children; orchestration must not assume every document has textual chunks. Subdocument-only containers also fit the interface. Summary-only documents still receive document summaries and summary embeddings.
 
-## Sources, plugins, and policy
+### Process-local handle cache
 
-DocumentSource owns collection-level discovery and resolution. FileSource remains a source; TextSource/TextFileSource is removed in the next spike, rather than retained as a text-specific source wrapper.
+Each source owns an in-memory cache keyed by full collection-local document_id. Fetching an already cached document reuses its handle. Root enumeration, direct acquisition, and subdocument enumeration populate the cache. A public source operation allows child enumeration to register handles; `cache_document(handle)` is a provisional name.
 
-The accepted hierarchy for the next spike is:
+This cache replaces the need for a document-bound chunk-reader object or caller-managed handle caches in retrieval. Text retained in the database can be returned without acquiring a handle at all.
+
+Cache eviction, expiration, resource-cost tuning, and concurrent-miss coordination are deferred until PDF/EPUB preparation requirements are understood. There is no refresh flag, freshness probe, or invalidation protocol required now. Stale handles during a process lifetime are accepted; discovering changes only after process restart is acceptable. This is not a snapshot guarantee for mutable underlying bytes. The existing maintenance path is not a constraint on this design and is not being redesigned here.
+
+## Sources, plugins, and interpretation policy
+
+DocumentSource owns collection-level discovery and resolution. FileSource acquires file-backed content and selects interpretation through code-defined extension policies.
 
 ```text
 DocumentHandle
     DocumentPlugin
         TextDocument
             WikipediaDocument
+        PdfDocument (to be designed)
         EpubDocument (future)
 ```
 
-DocumentPlugin is a DocumentHandle that participates in discovery. It consumes a ContentBridge and has a handler-name registry similar to DocumentSource's source registry. Threads and messages in the notmuch probe need not be DocumentPlugins.
+DocumentPlugin is a discoverable DocumentHandle consuming a ContentBridge. Its common constructor inputs are `document_id`, `source`, `bridge`, `policy`, `last_modified`, and `metadata`.
 
-The common constructor inputs are `document_id`, `source`, `bridge`, `policy`, `last_modified`, and `metadata`.
+- Metadata describes the document. Construction shallow-copies it; each get_metadata call returns a fresh shallow copy. Nested values are not isolated.
+- The constructor's last_modified wins over a value in incoming metadata; get_metadata reports the handle's value.
+- Policy describes interpretation, including boundary regexps and future decomposition/delegation choices. It is read-only by convention, may be shared, and retains its `handler` key.
+- The handler-name registry is separate from extension-to-policy mappings. Registration uses `handler_name`, falling back to the lowercased class name; first registration wins, matching source-registry behavior.
+- TextDocument reads encoding and summary_length from the source configuration. These, title, and boundary regexps are not separate plugin constructor arguments.
+- A handler that knows a child or delegate's type may construct it directly. Registry dispatch is not a mandatory conversion pipeline.
+- WikipediaSource directly constructs WikipediaDocument with specialized policy, preserving native search and article-specific interpretation without adding an Xapian dependency to ordinary FileSource discovery.
 
-- Metadata describes this document, including its title. The constructor makes a shallow copy because the document may modify it. Each get_metadata call returns a fresh shallow copy of the document's metadata; nested values are not isolated by these copies.
-- Policy describes interpretation, including text boundary regexps and future behavioral choices such as EPUB decomposition versus delegation.
-- Title, boundary regexps, encoding, and summary_length are not separate plugin constructor arguments. TextDocument reads encoding and summary_length from the source's config. Move the text configuration into FileSourceConfig when removing TextFileSourceConfig; encoding already lives there.
-- Policy contains a string `handler`, for example `"text"`. Discovery resolves it through the DocumentPlugin registry and passes the whole policy to the constructor without popping that key.
-- Extension-to-policy mappings live entirely in code initially. They are separate from the handler-name registry. MIME detection is not required for this spike.
-- Markdown, RST, HTML, and plain text can use the same TextDocument with different boundary policies. Do not introduce conversion between these textual formats merely for LLM consumption.
-- A handler that knows its child/delegate type can construct it directly with an appropriate policy; registry selection is not a mandatory conversion pipeline.
-- Wikipedia retains its known boundaries and article-specific interpretation. EPUB will supply the text policy appropriate to its pandoc output, whether delegating or constructing subdocuments.
+### Existing text policies
 
-### Initial extension policies
+Extension lookup is case-insensitive. `.md`/`.markdown` share Markdown policy, `.html`/`.htm` share HTML policy, and `.rst` uses RST policy. Unknown extensions and extensionless files use the text fallback. Textual markup is preserved, not converted solely for LLM consumption.
 
-The initial code-defined mapping selects TextDocument (`handler="text"`) with these policies:
+Markdown semantic boundaries use level-1/2 ATX and Setext headings; HTML uses h1/h2. RST recognizes `=` and `-` title adornments as a convention, not inferred document-relative heading levels. The text fallback uses common separator-punctuation lines. Embedding candidates use paragraph breaks for textual formats and paragraph/block endings for HTML. These rules live in policy definitions; tests pin the contracts rather than exact rule-driven chunk counts.
 
-- `.md` and `.markdown` share one Markdown policy. Semantic boundaries are level-1 and level-2 headings: ATX `#`/`##` and Setext headings. Deeper ATX headings are not semantic boundaries.
-- `.html` and `.htm` share one HTML policy. Semantic boundaries are `h1` and `h2`, not `h3` through `h6`. Preserve the markup; no text conversion is introduced.
-- `.rst` uses an RST policy recognizing `=` and `-` title adornments as semantic-boundary hints. RST assigns hierarchy by order of adornment styles, not fixed characters; this adopts the documented section/subsection convention, not a claim to infer actual heading levels. See the [Sphinx RST primer](https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html#sections).
-- Unknown extensions and extensionless files use the default text fallback. No additional explicit extension mappings are required for this spike.
+Configurable policy overrides/supplements, collection-wide boundary configuration, MIME detection, named profiles, policy inheritance, and generalized configuration merging remain deferred. Future EPUB configuration belongs in that shared policy mechanism, not a separate advance-built configuration path.
 
-Settled during implementation: embedding candidates are paragraph breaks for textual formats and paragraph/block endings for HTML. The plain-text fallback treats a line of common separator punctuation (three or more of ``- = * _ +``, with optional trailing whitespace) as its sole semantic boundary. Suffix lookup is case-insensitive.
+## Document metadata and tool presentation
 
-FileSource registers as `file`; migrate the old text-source configuration to that name. WikipediaSource directly constructs WikipediaDocument with its specialized policy rather than selecting it through the general extension mapping.
+Persist get_metadata's JSON-compatible contents on Document. Work from a copy, popping title and keywords into their existing dedicated fields when present; retain the remaining metadata in a dictionary. The Python ORM attribute must avoid SQLAlchemy's reserved `metadata` name; `metadata_dict` is an appropriate name.
 
-### Configuration deliberately deferred
+Tool fetch_document responses and document search results include metadata fields that do not conflict with tool-defined response fields. Tool fields take precedence; metadata must not replace document identity, summaries, chunks, or subdocument information. Metadata persistence supports structured values, not only strings, for EPUB/PDF authorship and other format metadata.
 
-There are no existing boundary-regexp config fields to preserve, and none are being added now. Earlier discussion of collection-wide supplementary text boundaries is a future possibility, not part of the next spike. Supplementation is expected to cover many cases; replacement can be designed when needed.
+The MCP fetch_document tool exposes direct `sub_documents`, so children are discoverable rather than merely addressable through guessed IDs. Detailed child-entry formatting and binary/image delivery belong to the tool/format implementation design. Summary-only documents remain useful without invented text chunks.
 
-Config overrides/supplements for policy and discovery mappings are deferred together. A future collection-specific EPUB delegation/decomposition choice belongs in that mechanism; do not add a separate EPUB config mechanism in advance. No named-profile system, policy inheritance, or generalized configuration merge semantics are required now.
+## Chunk text retention and retrieval
 
-## Notmuch design probe
+Semantic chunks remain the handle-facing retrieval unit. get_chunks yields metadata and candidate texts whose concatenation exactly matches handle.fetch_chunk for that semantic chunk. Embedding chunks partition that text; embedding offsets and lengths are character offsets, distinct from bridge byte offsets.
 
-Use this only to test responsibility boundaries, not to launch a notmuch implementation:
+`DocumentHandle.save_text` controls persistence of each embedding chunk's exact text in `DocumentChunk.text`. This is output retention, independent of input bridge capabilities: a file-backed converted document can still need saved text for reproducibility and to avoid conversion work.
+
+The text column is deferred by default in ORM loads. Most consumers need chunk identity, metadata, lengths, and summaries, not its text.
+
+### Shared retrieval helper
+
+Replace DocumentSource.fetch_chunk with a shared application-level helper usable by search, the indexer, and MCP retrieval. Its intended interface is:
+
+```text
+fetch_chunk(source, chunk_id, *, scope="semantic") -> str
+```
+
+The helper operates on a stored chunk ID, not a DocumentChunk object or a native-search metadata-only hit. Its module location is an implementation detail; it does not belong to a format plugin.
+
+- Embedding scope explicitly selects the requested embedding row's text.
+- Semantic scope selects the embedding rows belonging to the requested row's semantic chunk, ordered for reconstruction.
+- Each scope can obtain the relevant text and fallback information in one SQL statement; semantic scope need not first load an ORM row to discover its group.
+- If retained text is available, return it without calling fetch_document.
+- Otherwise, acquire the document through the source cache and call handle.fetch_chunk with semantic metadata. Embedding scope applies the stored character slice itself.
+- A missing row is distinct from a row whose text is NULL. Empty retained text is not the same as NULL. Do not silently assemble incomplete retained text or mix it with a different source version.
+
+Callers already holding a DocumentChunk pass its chunk_id; they need not load its deferred text or carry handles between retrieval calls. Semantic scope works when the supplied chunk ID is not the semantic root, while MCP can retain its existing root-reference reporting behavior.
+
+### Reranker hits
+
+A populated ChunkHit.chunk_id means the chunk is in the database. Reranker preparation sends such IDs to the shared helper. Hits without chunk_id are handled directly by `_prepare_hit`: acquire the handle, fetch the semantic text from hit metadata, and slice the requested embedding span. This path does not require indexing the candidate merely to rerank it.
+
+No native-versus-database origin flag is required. The distinction is whether the hit has a stored chunk identity. Source.fetch_chunk is removed rather than retained as a parallel retrieval API.
+
+## Indexing, durable child work, and failures
+
+Indexing a document processes its own chunks and enumerates its immediate subdocuments. Child modification times cascade from their ancestors, allowing existing timestamp comparisons to detect changed indexed children after fresh acquisition.
+
+The parent document, its own chunk rows, and `indexing_work` entries for discovered child IDs are committed together. A work entry records a full collection-local target document ID and its parent in the same collection. Its target need not have a Document row yet; its parent does. The work table records pending work, not a saved handle or a frozen source revision.
+
+Complete immediate-child enumeration permits reconciliation of removed children and their subtrees. Failure to finish enumeration does not authorize deletion. A parent commit does not claim its entire subtree is indexed, and indexing does not require one whole-subtree transaction.
+
+Child work acquires the document through source.fetch_document, benefiting from the process-local handle cache. On success, commit the child and work for its children while retiring completed work atomically. Interrupted work remains recoverable. Handled failures are recorded in FailedDocument rather than kept in an automatic retry loop. Parents may create indexing_work entries even for failed IDs: index_collection continues to exclude FailedDocument entries when selecting work.
+
+### Scheduling
+
+Process pending indexing_work first when index_collection restarts, then proceed to source discovery. Do not interleave work-table queries into the discovery loop or complicate semaphore handling to implement fairness between the two streams. No same-run queue-draining guarantee is added by this scheduling decision.
+
+### Direct requests for descendants
+
+`ensure_document_indexed` may be asked for a child before its ancestors have database rows, for example through native search or an explicit caller. It indexes from the necessary parent/ancestor down to the requested child, establishing parent rows before child rows. This does not require completing every sibling subtree first; ordinary discovered child work remains represented through indexing_work.
+
+### Consistency scope
+
+Do not add parent generations, subtree revision tokens, or special refresh coordination now. Work refers to an ID resolved through the normal acquisition path; it does not promise an old source version. Disappeared children are reconciled by successful parent enumeration. Existing source-change-during-indexing limitations and process-lifetime handle staleness are accepted. Maintenance redesign is deferred.
+
+## Content bridges and delegation
+
+All ContentBridges provide:
+
+- `read_bytes()`: async full-content read.
+- `read_byte_range(start, end)`: async half-open byte-range read.
+- `path()`: async context manager exposing a path valid during that context.
+
+Each bridge adapts its content to these operations. No capability ladder, external TemporaryFileBridge adaptation layer, or mandatory handle-wide close/aclose protocol is required.
+
+FileBridge reads real files and exposes their paths without copying. Reads own their file lifetimes. Text reads use bytes followed by decoding, preserving LF, CRLF, and CR byte offsets rather than applying universal-newline translation.
+
+A future AttachmentBridge can hold decoded attachment bytes, serve slices, and materialize a temporary path for scoped access. A future StreamBridge takes a producer coroutine, defers production until first content access, and retains output for reuse; production runs at most once per bridge instance. Pandoc output motivates this design. Exact producer result type, failure/cancellation semantics, concurrent production, and overlapping temporary-path lifetimes remain bridge implementation questions, not additional settled requirements.
+
+Keeping content in memory plus swap is accepted initially. Large real-file archives can remain file-backed; hypothetical nested archives do not justify a more complex streaming architecture now. Future bridges retaining live resources must define cleanup without invalidating handles when enumeration ends.
+
+### EPUB delegation
+
+For a non-chaptered EPUB, EpubDocument consumes its input bridge, converts via pandoc, and delegates text interpretation to a TextDocument with the **same document ID** and an output bridge over the converted text. The delegate receives policy appropriate to that output. It is not a subdocument and adds no hierarchy or summary level. Retained embedding text provides access to the indexed conversion output across later acquisitions or converter changes.
+
+Whether EPUB chapters are subdocuments or semantic chunks remains format-specific. Independent chapter lifecycle and agent access to a whole named chapter are different needs; opaque reconstruction metadata alone does not provide a public chapter retrieval interface.
+
+### Notmuch responsibility probe
 
 ```text
 NotmuchMailSource
     ThreadDocument
         MessageDocument
-            attachment interpreted by an appropriate DocumentPlugin
+            attachment interpreted by a DocumentPlugin
 ```
 
-- Threads and messages do not need registry dispatch. Their bridge to their underlying content is inherent in their implementation.
-- A message yields body chunks and attachment subdocuments.
-- Ordinary non-attachment MIME parts need not become subdocuments; that would add needless summarization and retrieval levels.
-- There is no AttachmentDocument wrapper in the chosen direction.
-- AttachmentBridge supplies decoded attachment content to the selected plugin, such as EpubDocument.
-- The resulting plugin handler carries the attachment's document identity and collection association.
+Threads/messages need not participate in plugin discovery. A message can yield body chunks and attachment subdocuments. Ordinary non-attachment MIME parts need not become documents. AttachmentBridge supplies decoded content directly to the selected plugin; there is no AttachmentDocument wrapper.
 
-## EPUB and interpretation versus document structure
+## Next implementation spike: common subdocument infrastructure
 
-Whether chapters should be subdocuments or semantic chunks remains unresolved. The concrete bridge design currently uses a non-chaptered EPUB as its example.
+This is proposed implementation scope, not authorization to implement during this plan update. PdfDocument design is the next format discussion; no PDF extraction or image policy is implied by this infrastructure spike.
 
-For that case:
+### Scope
 
-```text
-EpubDocument (document ID X)
-    input: FileBridge or AttachmentBridge
-    conversion: pandoc produces text/Markdown
-    delegate: TextDocument (same document ID X)
-        content access refers to conversion output, not EPUB input
-        configured with appropriate boundary regexps
-```
-
-The delegated TextDocument is not a child returned by get_sub_documents. Conversion stages do not create extra document identities, hierarchy levels, or summaries. EPUB can directly construct its text delegate without redispatching through the registry.
-
-EpubDocument recommends preserving semantic chunk text in the database for both performance and reproducibility: converter versions may produce different output. The user reports an existing text column but no mechanism to request its population yet. The request mechanism is still to be designed and must be checked against current code.
-
-Text retention is an output-persistence concern, separate from input bridge capabilities. A file-backed EPUB can still need retained output text.
-
-Without caching, the conceptual text access could rerun conversion. Under the latest bridge proposal, conversion runs at most once per bridge instance; a new document acquisition may create a new bridge and rerun it.
-
-### Chapter identity remains open
-
-Discussion identified two different needs:
-
-- Independent document search identity/lifecycle for chapters.
-- Agent access to a complete named chapter spanning multiple semantic chunks.
-
-The second could be supported by subdocuments or by a public addressable-section abstraction; merely storing headings in opaque reconstruction metadata is insufficient. Do not assume current MCP/search behavior from earlier conversation: those implementations have changed. No chapter/section interface has been chosen.
-
-## Content access and future bridges
-
-The user proposed simplifying away the earlier stream/seekable/path capability hierarchy and explicit temporary-file adaptation.
-
-All bridges offer:
-
-- `read_bytes`: async full-content read.
-- `read_byte_range`: async byte-range read.
-- `path`: async context manager exposing a filesystem path.
-
-The implemented range method is `read_byte_range(start, end)`, using half-open byte offsets `[start, end)`. `path()` returns an async context manager.
-
-Handlers request whichever operation they need. Each bridge performs its own adaptation. Under this proposal, handler capability declarations and externally inserted TemporaryFileBridge wrappers are unnecessary for now.
-
-### FileBridge
-
-Represents a real filesystem object, used by FileSource or potentially WikipediaSource.
-
-- Full reads use the existing file.
-- Range reads can seek directly without materializing the whole file.
-- Path access exposes the existing path without copying it.
-
-This preserves efficient access to large filesystem archives if ZIP support is later implemented.
-
-### AttachmentBridge (future)
-
-Likely takes already-decoded bytes at construction.
-
-- Full reads return the held bytes.
-- Range reads slice those bytes.
-- Path access writes a temporary file, e.g. using NamedTemporaryFile, and scopes its availability appropriately.
-
-Memoizing base64-decoded attachment content is desirable; decoding need not recur for each range or path access.
-
-### StreamBridge (future)
-
-Has/takes a `stream_producer` coroutine. Its exact return type is not yet specified.
-
-- Production is deferred until the first full read, range read, or path request.
-- The producer callback is called at most once per bridge instance.
-- Produced content is retained and reused for subsequent operations.
-- Path requests materialize the content into a temporary file.
-
-Pandoc command output is a motivating producer. Earlier names included StdoutBridge and CommandBridge; a command-specific wrapper may still be useful, but no separate class is required by the current discussion.
-
-The earlier reopening discussion established that recreating command output depends on reacquiring its input. All contemplated inputs can be reopened, although that may be expensive. The latest memoizing design avoids repeated production within one bridge; it does not promise identical output across new bridge instances.
-
-### Accepted scope/performance assumption
-
-The user explicitly accepts keeping content in memory plus swap for the initial design, consistent with other full-text handling in the project. Do not reintroduce a complex streaming/capability system just to solve hypothetical large nested archives.
-
-Large real-file ZIPs can remain file-backed through FileBridge.path. Nested ZIPs are already expensive and are not an implementation target now. Optimize further when concrete needs justify it.
-
-## Bridge details suggested but not yet resolved
-
-The assistant suggested these semantics after the user's bridge proposal. They are considerations for the next design pass, not all independently accepted decisions:
-
-- Concurrent first accesses share one production rather than invoking the callback twice.
-- Decide whether at-most-once includes failed production, with retries requiring a new bridge.
-- Specify cancellation behavior for shared in-flight production and cleanup.
-- For command producers, check successful process exit before publishing cached output; partial stdout must not silently become successful content.
-- Define temporary-path lifetime and overlapping path contexts. Creating a temporary file per context is a possible initial implementation; persistent temporary-file memoization is optional.
-- Range offsets address the particular bridge's bytes. Text character offsets are not automatically byte offsets, especially for UTF-8.
-- FileBridge is not inherently a snapshot if the underlying file changes; decide what stability the surrounding acquisition assumes rather than silently copying every file.
-
-## Implemented baseline and invariants
-
-The first structural migration is complete: DocumentHandle, async factory acquisition, ContentBridge/FileBridge, text interpretation in TextDocument, and WikipediaDocument specialization. Document summaries are handle operations; source-level fetch_chunk remains an async delegating wrapper. TextFileSource still exists in this baseline and is removed by the next spike.
-
-- Handles remain usable independently of acquisition and enumeration. No mandatory close/aclose or acquisition context is introduced.
-- FileBridge opens/closes files within reads; its path context exposes the existing file without copying or owning it.
-- Text reads use bytes plus decoding, preserving newline conventions and reconstruction byte offsets. Character offsets remain distinct.
-- Missing documents remain distinct from unavailable sources: maintenance deletes on DocumentNotFoundError, not on a source outage.
-- Current handles yield no subdocuments; actual recursive indexing and reconciliation remain future work.
-- Only save_text=False is supported. Retained-text write/read paths remain future work.
-- The parent-document schema exists; successful-rescan reconciliation is not thereby implemented.
-
-## Next implementation spike: DocumentPlugin and code-defined discovery
-
-This is the next proposed code change, not authorization to implement it during this documentation update. Resolve the immediate questions below before implementation.
-
-### Implementation scope
-
-1. Add DocumentPlugin as a DocumentHandle subclass with the common constructor and a separate handler-name registry. Preserve the general DocumentHandle interface for handles outside discovery.
-2. Store the bridge and policy; shallow-copy incoming metadata and return a fresh shallow copy from get_metadata. Provide the metadata behavior needed for documents to retain and enrich source-supplied fields. Keep policy['handler'] intact.
-3. Make TextDocument a DocumentPlugin registered as `text`. Read boundary settings from policy, encoding and summary_length from source config, with text configuration moved into FileSourceConfig. Remove the separate text-specific constructor arguments.
-4. Introduce code-defined extension-to-policy discovery. FileSource supplies identity, FileBridge, mtime, and initial metadata and constructs the selected plugin through its registry. Enumeration and direct fetch must select consistently.
-5. Remove TextFileSource/TextSource and its now-redundant construction layer. Register FileSource as `file` and update text-source configuration references to `source_config.type="file"`.
-6. Adapt WikipediaSource to FileSource and WikipediaDocument to the common plugin contract. Preserve native search, metadata/keywords, source filtering, indexing defaults, boundaries, and lead summaries. WikipediaSource directly constructs its document with the specialized policy, so ordinary FileSource discovery does not acquire Wikipedia's Xapian dependency.
-7. Update callers, imports, config examples, and tests to the new contract. Do not preserve superseded APIs merely to satisfy old tests. Keep architecture.md untouched.
+1. Implement reserved-colon identity routing, full-ID handle-level child resolution, and the per-source process-local handle cache with a public insertion operation for enumeration.
+2. Implement save_text writes, defer DocumentChunk.text by default, and add the chunk-ID-based shared retrieval helper. Replace all source.fetch_chunk consumers, including MCP, indexer reconstruction, and reranker preparation; keep metadata-only hits local to `_prepare_hit`.
+3. Persist document metadata separately from title/keywords and expose nonconflicting fields in tool document responses/results. Add direct sub_documents to MCP fetch_document.
+4. Add durable indexing_work storage and parent/child orchestration: atomic parent/work publication, successful-enumeration reconciliation, failure exclusion, pending-work-first scheduling on restart, and ensure_document_indexed traversal from missing ancestors to a requested descendant.
+5. Support chunk-plus-child, chunk-only, and summary-only handles without format-specific orchestration. Preserve summary embeddings for documents without chunks.
+6. Supply schema migration steps for new storage and preserve existing source filtering, text policies, Wikipedia behavior, and byte/character offset distinctions. Inspect current callers and tests before changing signatures. Required base-interface changes belong to this explicit scope and require implementation approval under repository rules.
 
 ### Verification
 
-- Exercise all five mapped extensions plus unknown and extensionless files; verify shared policies for aliases, text fallback, and consistent direct fetch versus enumeration. Boundary-rule behavior (for example, Markdown/HTML level-1/2 boundaries excluding deeper headings and the RST adornment heuristic) is settled by the policy definitions and was spot-checked with a script; it is not encoded in the test suite.
-- Construct two documents from a reused policy and incoming metadata. Verify top-level metadata isolation on construction and on repeated get_metadata calls, with the documented shallow-copy semantics, and that construction leaves the policy and handler key unchanged.
-- Exercise a TextDocument with a test-only non-file ContentBridge and supplied policy, proving text interpretation does not require filesystem access.
-- Verify encoding and summary-setting access through the agreed config contract, plus byte-range round trips for multibyte text and LF/CRLF/CR content.
-- Preserve Wikipedia metadata, lead-summary, native-search, and missing-document versus source-outage tests.
-- Test the chosen unknown-extension, missing-handler, and source-registration behaviors explicitly.
-- Run the full pytest suite, audit the diff against this plan, and report deviations before declaring completion.
+- Establish a green pytest baseline before implementation; use synthetic handles/bridges and pytest monkeypatch rather than requiring a PDF library for common infrastructure tests.
+- Verify nested full-ID resolution, root/child cache population and reuse, and encoded-colon paths without confusing collection prefixes, hierarchy separators, or chunk suffixes.
+- Verify retained embedding and semantic retrieval (including a non-root embedding ID), deferred ordinary text loading, a single retrieval statement per scope, and no handle acquisition on the retained-text path. Verify unretained fallback, correct character slicing, and missing-row versus NULL-text behavior.
+- Verify reranking of stored chunk IDs and metadata-only hits without adding an origin flag or forcing indexing for the latter.
+- Verify JSON-compatible metadata persistence, title/keyword separation, response-field precedence, and direct-child visibility through MCP.
+- Verify parent/work atomicity, restart recovery, failure exclusion even after work recreation, descendant indexing with missing ancestors, and subtree removal only after complete enumeration. Verify the pending-work-first scheduling contract without interleaved polling.
+- Verify all supported document shapes, including summary-only searchability, and preserve newline/multibyte round trips and missing-document versus source-outage distinctions.
+- Run the full suite with `~/ai/venv/bin/python -m pytest -q`. Audit the diff against this plan and report consequential choices or deviations rather than silently expanding scope.
 
-### Implementation decisions (settled during implementation)
+### Non-goals and next format decisions
 
-- Extension lookup normalizes uppercase suffixes (``path.suffix.lower()``). The embedding-boundary and plain-text fallback defaults are as settled above.
-- The constructor's ``last_modified`` argument wins over any ``last_modified`` carried in incoming metadata; ``get_metadata`` reports the handle's own value.
-- Plugins register under a ``handler_name`` class attribute (falling back to the lowercased class name, mirroring ``source_prefix``); the first registration wins and a duplicate name does not replace the original.
-- Policy is read-only input by convention, not enforced: construction leaves the policy and its ``handler`` key unchanged, and one policy may be shared across documents.
-- DocumentPlugin and the handler registry live in a new ``plugins/plugin.py`` module; ``plugins/base.py`` is unchanged.
+No architecture.md rewrite, maintenance redesign, cache freshness/eviction policy, whole-subtree transaction, generation-token system, configurable policy machinery, ZIP/notmuch implementation, or generalized streaming framework.
 
-### Out of scope
-
-No EPUB implementation, new bridges, actual subdocument indexing, retained-text support, MIME detection, collection boundary fields, configurable discovery/policy overrides, or architecture.md rewrite.
-
-## Future lifecycle and hierarchy questions
-
-- How does source-level subdocument resolution route IDs and retain access to nested ancestors?
-- Which owner closes preparation resources and delegated handlers if future bridges retain external resources between operations?
-- Future child handles must retain enough state to survive enumeration. Temporary paths/processes require scoped cleanup; cached bytes and live resources are different concerns.
-- How do retained semantic text write/read paths use save_text=True?
-- How are discovery completion and per-child indexing status represented? A document row need not necessarily imply that all its chunks exist.
-- How does a successful enumeration reconcile removed children without treating partial discovery as deletion?
-
-## Continuation guidance
-
-Implement the DocumentPlugin/discovery spike only after authorization and resolution of its immediate questions. Keep later format, hierarchy, and configurable-policy work separate. Do not reintroduce mandatory acquisition contexts, capability ladders, AttachmentDocument wrappers, or unbound document-type objects without a concrete need.
-
-Tests pin contracts (policy selection, enumeration-versus-fetch consistency, offset and partition invariants, metadata and policy isolation, registration behavior), not specific boundary rules; rule behavior is settled by the policy definitions and verified by script.
+PdfDocument design will determine extraction and semantic boundaries, image selection and identity (embedded object versus page occurrence), image summarization, parent-summary use of child summaries, and any image-content delivery. EPUB chapter structure and concrete future-bridge lifecycle details remain deferred to their respective format work.
