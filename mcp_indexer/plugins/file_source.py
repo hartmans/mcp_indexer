@@ -54,7 +54,10 @@ class FileSourcePointer(DocumentPointer):
 
     async def get_chunks(self, min_size: int, max_size: int) -> AsyncGenerator[ChunkInfo, None]:
         try:
-            text = self.path.read_text(encoding=self.source.source_config.encoding)
+            # read_bytes + decode, not read_text: text-mode newline
+            # translation would make the decoded string (and the byte
+            # offsets computed from it) disagree with the file.
+            text = self.path.read_bytes().decode(self.source.source_config.encoding)
         except FileNotFoundError as exc:
             self.source._check_root()
             raise DocumentNotFoundError(self.document_id) from exc

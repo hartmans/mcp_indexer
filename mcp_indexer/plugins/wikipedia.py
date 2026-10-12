@@ -58,9 +58,10 @@ class WikipediaSource(TextFileSource):
         """
         pointer = self.fetch_document(document_id)
         try:
-            wikitext = pointer.path.read_text(
-                encoding=self.source_config.encoding,
-                errors="replace",
+            # read_bytes + decode, not read_text: text-mode newline
+            # translation would change the content relative to the file.
+            wikitext = pointer.path.read_bytes().decode(
+                self.source_config.encoding, errors="replace",
             )
         except FileNotFoundError as exc:
             self._check_root()
