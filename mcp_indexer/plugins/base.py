@@ -1,6 +1,8 @@
 import bisect
 import dataclasses
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Generic, List, Literal, TypeVar
 
 from ..context import SOURCE_REGISTRY
@@ -23,13 +25,55 @@ class DocumentNotFoundError(LookupError):
         super().__init__(f"{message}: {document_id}")
 
 
+class ContentBridge:
+    """How a :class:`DocumentHandle` reaches a document's underlying bytes.
+
+    A bridge is a durable description of *how* to acquire content, not an
+    already-open resource. Concrete bridges may read from the filesystem,
+    hold decoded bytes, or produce the bytes (for example from a conversion
+    command). All access is async, and ``path`` exposes a filesystem path
+    that is only valid for the duration of its context.
+    """
+
+    async def read_bytes(self) -> bytes:
+        """Return the full content of the document."""
+        ...
+
+    async def read_byte_range(self, start: int, end: int) -> bytes:
+        """Return the bytes in the half-open range ``[start, end)``."""
+        ...
+
+    def path(self) -> AbstractAsyncContextManager[Path]:
+        """Return an async context manager yielding a path to the content.
+
+        The yielded path is valid only for the duration of the context.
+        Concrete bridges implement this by decorating an async generator
+        with ``@asynccontextmanager``.
+        """
+        ...
+
+
 @dataclasses.dataclass
-class DocumentPointer:
-    """A document to be indexed, returned from DocumentSource."""
+class DocumentHandle:
+    """A bound document returned from a :class:`DocumentSource`.
+
+    A handle is a durable description of access: it may be retained and used
+    independently of the call that produced it.
+    """
 
     source: "DocumentSource"
     document_id: str
     last_modified: datetime
+
+    @property
+    def save_text(self) -> bool:
+        """Whether the indexer should persist chunk text to the database.
+
+        Only ``False`` is supported today; enabling retention requires work
+        in both the write path (populating the text column) and the read path
+        (retrieving from it).
+        """
+        return False
 
     async def get_metadata(self) -> dict[str, str]:
         ...
@@ -49,9 +93,17 @@ class DocumentPointer:
     async def fetch_chunk(self, chunk_metadata: dict[str, Any]) -> str:
         """Return the text of the semantic chunk identified by metadata.
 
-        The bytes-to-text boundary is this method: the pointer decodes the
+        The bytes-to-text boundary is this method: the handle decodes the
         stored span in the source's encoding and the app never sees bytes.
         """
+        ...
+
+    async def get_sub_documents(self) -> AsyncGenerator["DocumentHandle", None]:
+        """Yield this document's subdocuments; leaf documents yield nothing."""
+        return
+        yield
+
+    async def get_document_summary(self) -> str:
         ...
 
 
@@ -116,7 +168,7 @@ def create_embedding_chunks(
     return results
 
 
-p = TypeVar("p", bound=DocumentPointer)
+p = TypeVar("p", bound=DocumentHandle)
 
 
 class DocumentSource(Generic[p]):
@@ -154,12 +206,15 @@ class DocumentSource(Generic[p]):
     async def get_documents(self, last_modified: datetime | None = None) -> AsyncGenerator[p, None]:
         ...
 
-    def fetch_document(self, document_id: str) -> p:
-        """Resolve a local ID with current mtime; raise DocumentNotFoundError if absent."""
-        ...
+    async def fetch_document(self, document_id: str) -> p:
+        """Resolve a local ID with current mtime; raise DocumentNotFoundError if absent.
 
-    async def get_document_summary(self, document_id: str) -> str:
-        return ""
+        Acquisition is async: resolving an ID may require asynchronous work
+        (for example, preparing content to establish that a subdocument
+        exists). The returned handle is durable and may be retained
+        independently of this call.
+        """
+        ...
 
     async def native_search(
         self, query: str, *, document_limit: int, chunk_limit: int,
@@ -197,8 +252,8 @@ class DocumentSource(Generic[p]):
         ``semantic_text[offset:offset + length]``; both are required, in
         characters, and an embedding fetch without them is an error.
         """
-        pointer = self.fetch_document(document_id)
-        full_text = await pointer.fetch_chunk(chunk_metadata)
+        handle = await self.fetch_document(document_id)
+        full_text = await handle.fetch_chunk(chunk_metadata)
 
         if scope == "semantic":
             return full_text

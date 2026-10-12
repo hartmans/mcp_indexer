@@ -5,7 +5,7 @@ from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.indexer import Indexer
 from mcp_indexer.search import search
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.plugins.text_source import TextFileSource
+from mcp_indexer.plugins.text_document import TextFileSource
 from sqlalchemy import select
 
 

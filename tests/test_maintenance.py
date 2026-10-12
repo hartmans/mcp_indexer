@@ -39,7 +39,7 @@ async def test_maintenance_refreshes_changed_and_deletes_immediately(monkeypatch
     async def session():
         yield Session()
 
-    def fetch(document_id):
+    async def fetch(document_id):
         if document_id == "denied":
             # The missing document must already have been deleted and committed.
             assert events == [("fetch", "absent"), ("delete", "document", "absent"),
@@ -164,18 +164,18 @@ async def test_stale_summary_cannot_restore_replaced_or_deleted_document(deleted
 
     async def get_metadata():
         return {"title": "Article"}
-    pointer = SimpleNamespace(get_metadata=get_metadata)
-
-    def fetch(document_id):
-        return pointer
-    async def get_document_summary(document_id):
+    async def get_document_summary():
         return "A summary."
+    pointer = SimpleNamespace(get_metadata=get_metadata,
+                              get_document_summary=get_document_summary)
+
+    async def fetch(document_id):
+        return pointer
 
     async def embedding(texts):
         return [[0.1]]
 
     context = context_for(session)
     context.embedding = embedding
-    source = SimpleNamespace(id="wiki", fetch_document=fetch,
-                             get_document_summary=get_document_summary)
+    source = SimpleNamespace(id="wiki", fetch_document=fetch)
     assert not await Indexer(context).summarize_document(source, "article")

@@ -13,7 +13,7 @@ from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.indexer import Indexer, DocumentIndexingStats
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.models import Document, DocumentChunk, ChunkSummary, FailedDocument
-from mcp_indexer.plugins.text_source import TextFileSource
+from mcp_indexer.plugins.text_document import TextFileSource
 
 
 def make_indexer(test_context, tmp_path):
@@ -57,7 +57,7 @@ async def test_refresh_failure_and_deletion_are_atomic(test_context, tmp_path, m
         raise RuntimeError("embedding failed")
     monkeypatch.setattr(indexer, "_embed_batch", fail)
     with pytest.raises(RuntimeError, match="embedding failed"):
-        await indexer.index_document(source.fetch_document(path.name),
+        await indexer.index_document(await source.fetch_document(path.name),
                                      DocumentIndexingStats(path.name, "refresh", source=source))
     async with source.context.get_session() as session:
         kept = await session.get(Document, (source.id, path.name))
@@ -68,7 +68,7 @@ async def test_refresh_failure_and_deletion_are_atomic(test_context, tmp_path, m
     await indexer.wait_for_idle()
     async with source.context.get_session() as session:
         current = await session.get(Document, (source.id, path.name))
-        assert current.last_modified == source.fetch_document(path.name).last_modified
+        assert current.last_modified == (await source.fetch_document(path.name)).last_modified
         assert current.summary == ""
         assert not (await session.execute(select(ChunkSummary))).scalars().all()
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
@@ -129,7 +129,7 @@ async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_p
 async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, monkeypatch):
     indexer, source = make_indexer(test_context, tmp_path)
     (tmp_path / "article.txt").write_text("Article")
-    pointer = source.fetch_document("article.txt")
+    pointer = await source.fetch_document("article.txt")
 
     async def metadata():
         return {"title": "Article", "keywords": ["Good_Key", "bad keyword", "GOOD_KEY"]}

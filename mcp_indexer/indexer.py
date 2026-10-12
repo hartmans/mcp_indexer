@@ -221,7 +221,7 @@ class Indexer:
                 return
             for document_id, last_modified in rows:
                 try:
-                    pointer = source.fetch_document(document_id)
+                    pointer = await source.fetch_document(document_id)
                 except DocumentNotFoundError:
                     async with self.context.get_session() as session:
                         await session.execute(delete(Document).where(
@@ -257,7 +257,7 @@ class Indexer:
                 raise RuntimeError(f"Previously failed document {document_id}: {failure.failure_reason}")
         try:
             await self.index_document(
-                source.fetch_document(document_id),
+                await source.fetch_document(document_id),
                 DocumentIndexingStats(document_id, "index", source=source),
             )
         except Exception as exc:
@@ -679,10 +679,10 @@ class Indexer:
         if doc is None:
             return False
         expected_mtime = doc.last_modified
-        pointer = source.fetch_document(document_id)
+        pointer = await source.fetch_document(document_id)
         metadata_dict = await pointer.get_metadata()
 
-        doc_summary = await source.get_document_summary(document_id)
+        doc_summary = await pointer.get_document_summary()
         if not doc_summary:
             span_summaries = [s.summary for s in sorted(
                 doc.summaries, key=lambda s: s.summary_span

@@ -1,3 +1,3 @@
 from . import base
-from . import text_source
+from . import text_document
 from . import wikipedia

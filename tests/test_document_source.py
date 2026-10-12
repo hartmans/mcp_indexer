@@ -6,11 +6,11 @@ import pytest
 
 from mcp_indexer.models import Document, DocumentChunk
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.plugins.base import ChunkInfo, DocumentPointer, DocumentSource, create_embedding_chunks
+from mcp_indexer.plugins.base import ChunkInfo, DocumentHandle, DocumentSource, create_embedding_chunks
 from mcp_indexer.server import result_info
 
 
-class MockDocumentPointer(DocumentPointer):
+class MockDocumentHandle(DocumentHandle):
     def __init__(self, source, document_id, title, chunks_data):
         super().__init__(source=source, document_id=document_id, last_modified=datetime.now())
         self.title = title
@@ -34,11 +34,11 @@ class MockDocumentSource(DocumentSource):
         super().__init__(collection_id, context=context, collection_config=collection_config)
         self.documents_data = documents_data
 
-    def fetch_document(self, document_id: str) -> MockDocumentPointer:
+    async def fetch_document(self, document_id: str) -> MockDocumentHandle:
         if document_id not in self.documents_data:
             raise ValueError("Document not found")
         title, chunks_data = self.documents_data[document_id]
-        return MockDocumentPointer(self, document_id, title, chunks_data)
+        return MockDocumentHandle(self, document_id, title, chunks_data)
 
 
 def test_create_embedding_chunks_basic():
@@ -180,7 +180,7 @@ async def test_document_source_fetch_chunk(test_context):
 
     # Note: The new Context doesn't have a fetch_chunk method
     # This test verifies the MockDocumentSource works correctly
-    chunk = source.fetch_document("doc1")
+    chunk = await source.fetch_document("doc1")
     text = await chunk.fetch_chunk({"meta1": "val1"})
     assert text == "Hello World"
 

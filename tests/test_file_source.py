@@ -3,17 +3,25 @@ from pathlib import Path
 import pytest
 
 from mcp_indexer.context import Context
-from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileSourcePointer
+from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileBridge
+from mcp_indexer.plugins.text_document import TextDocument, split_text
 
 
 class ConcreteFileSource(FileSource):
     semantic_boundary_regexps = (r"\n={3,}\n",)
     embedding_boundary_regexps = (r"\n\s*\n",)
 
-    def fetch_document(self, document_id: str) -> FileSourcePointer:
-        relative_path_str = self.decode_document_path(document_id)
-        absolute_path = self.source_config.directory / relative_path_str
-        return FileSourcePointer(self, document_id, absolute_path)
+    def make_document(self, document_id, mtime, path):
+        return TextDocument(
+            source=self,
+            document_id=document_id,
+            last_modified=mtime,
+            bridge=FileBridge(self, path),
+            title=path.name,
+            encoding=self.source_config.encoding,
+            semantic_boundary_regexps=self.semantic_boundary_regexps,
+            embedding_boundary_regexps=self.embedding_boundary_regexps,
+        )
 
 
 class SimpleCfg:
@@ -55,15 +63,17 @@ async def test_split_text_rst_headers(mock_context):
 
     source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 
-    results = []
-    async for chunk in source.split_text({}, text, min_size=1, max_size=1000):
-        results.append(chunk)
+    results = split_text(
+        text, "utf-8", source.semantic_boundary_regexps,
+        source.embedding_boundary_regexps, min_size=1,
+    )
 
     assert len(results) >= 2
 
-    results_large = []
-    async for chunk in source.split_text({}, text, min_size=50, max_size=1000):
-        results_large.append(chunk)
+    results_large = split_text(
+        text, "utf-8", source.semantic_boundary_regexps,
+        source.embedding_boundary_regexps, min_size=50,
+    )
 
     assert len(results_large) < len(results)
 
@@ -76,7 +86,7 @@ async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
     source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
     source.source_config = FileSourceConfig(directory=temp_file_env)
 
-    pointer = source.fetch_document("doc1.txt")
+    pointer = await source.fetch_document("doc1.txt")
 
     chunks = []
     async for chunk_info in pointer.get_chunks(min_size=1, max_size=100):
@@ -104,7 +114,7 @@ async def test_byte_offsets_hold_across_newline_conventions(tmp_path, mock_conte
     source = ConcreteFileSource(
         "col", context=mock_context, collection_config=SimpleCfg(tmp_path),
     )
-    pointer = source.fetch_document("nl.txt")
+    pointer = await source.fetch_document("nl.txt")
 
     chunks = []
     async for meta, cands in pointer.get_chunks(min_size=1, max_size=10_000):
@@ -150,5 +160,6 @@ async def test_file_source_document_id_escapes_unsafe_path_characters(tmp_path, 
     assert "%3F" in document_id
     assert "team%27s%20notes/alpha%3F.txt" in document_id
 
-    pointer = source.fetch_document(document_id)
-    assert pointer.path == weird_path
+    pointer = await source.fetch_document(document_id)
+    async with pointer.bridge.path() as resolved:
+        assert resolved == weird_path

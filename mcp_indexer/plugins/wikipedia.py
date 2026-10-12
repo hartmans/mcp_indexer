@@ -2,10 +2,12 @@
 import asyncio
 import hashlib
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .text_source import TextFileSource, TextFileSourceConfig, TextFilePointer
+from .text_document import TextDocument, TextFileSource, TextFileSourceConfig
+from .file_source import FileBridge
 from .base import DocumentNotFoundError
 from ..search import DocumentHit, NativeSearchBatch
 
@@ -14,9 +16,9 @@ class WikipediaSourceConfig(TextFileSourceConfig):
     xapian_directory: Path
 
 
-class WikipediaPointer(TextFilePointer):
+class WikipediaDocument(TextDocument):
     async def get_metadata(self) -> dict[str, Any]:
-        title = self.path.stem
+        title = self.title
         keywords = await asyncio.to_thread(self.source._xapian_keywords, title)
         return {
             **await super().get_metadata(),
@@ -25,29 +27,7 @@ class WikipediaPointer(TextFilePointer):
             "keywords": keywords,
         }
 
-
-class WikipediaSource(TextFileSource):
-    source_prefix = "wikipedia"
-    pointer_type = WikipediaPointer
-    default_indexing_mode = "indexed"
-    separate_rerank = True
-    # Semantic boundaries: MediaWiki section headings. The ``== Heading ==``
-    # form covers all six levels (2-6 equals signs, closing run optional).
-    # HTML <h1>-<h6> headings are also valid MediaWiki markup.
-    semantic_boundary_regexps = (
-        r"(?m)^={2,6}[^=\n]+?={2,6}[\t ]*$",
-        r"(?m)^</?[Hh][1-6][^>]*>.*$",
-    )
-    # Embedding boundaries: blank lines between paragraphs. There is no
-    # finer structural boundary worth splitting on in raw wikitext.
-    embedding_boundary_regexps = (r"\n\s*\n",)
-
-    def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
-        super().__init__(collection_id, context=context,
-                         collection_config=collection_config, reranker=reranker)
-        self.source_config = collection_config.resolve_source_config(WikipediaSourceConfig)
-
-    async def get_document_summary(self, document_id: str) -> str:
+    async def get_document_summary(self) -> str:
         """Return the article's introductory lead as a plain-text summary.
 
         Wikipedia's lead section is written to be a standalone overview of
@@ -56,16 +36,7 @@ class WikipediaSource(TextFileSource):
         heading and render it to plain text (wikilinks become their display
         text, templates and markup are dropped).
         """
-        pointer = self.fetch_document(document_id)
-        try:
-            # read_bytes + decode, not read_text: text-mode newline
-            # translation would change the content relative to the file.
-            wikitext = pointer.path.read_bytes().decode(
-                self.source_config.encoding, errors="replace",
-            )
-        except FileNotFoundError as exc:
-            self._check_root()
-            raise DocumentNotFoundError(document_id) from exc
+        wikitext = await self._text(errors="replace")
         return await asyncio.to_thread(self._lead_summary, wikitext)
 
     def _lead_summary(self, wikitext: str) -> str:
@@ -108,6 +79,40 @@ class WikipediaSource(TextFileSource):
         # The lead may consist only of markup/comments; require at least one
         # word of actual prose.
         return text if re.search(r"\w", text) else ""
+
+
+class WikipediaSource(TextFileSource):
+    source_prefix = "wikipedia"
+    default_indexing_mode = "indexed"
+    separate_rerank = True
+    # Semantic boundaries: MediaWiki section headings. The ``== Heading ==``
+    # form covers all six levels (2-6 equals signs, closing run optional).
+    # HTML <h1>-<h6> headings are also valid MediaWiki markup.
+    semantic_boundary_regexps = (
+        r"(?m)^={2,6}[^=\n]+?={2,6}[\t ]*$",
+        r"(?m)^</?[Hh][1-6][^>]*>.*$",
+    )
+    # Embedding boundaries: blank lines between paragraphs. There is no
+    # finer structural boundary worth splitting on in raw wikitext.
+    embedding_boundary_regexps = (r"\n\s*\n",)
+
+    def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
+        super().__init__(collection_id, context=context,
+                         collection_config=collection_config, reranker=reranker)
+        self.source_config = collection_config.resolve_source_config(WikipediaSourceConfig)
+
+    def make_document(self, document_id: str, mtime: datetime, path: Path) -> WikipediaDocument:
+        return WikipediaDocument(
+            source=self,
+            document_id=document_id,
+            last_modified=mtime,
+            bridge=FileBridge(self, path),
+            title=path.stem,
+            encoding=self.source_config.encoding,
+            semantic_boundary_regexps=self.semantic_boundary_regexps,
+            embedding_boundary_regexps=self.embedding_boundary_regexps,
+            summary_length=self.source_config.summary_length,
+        )
 
     def _is_included(self, path: Path) -> bool:
         return path.suffix == ".mediawiki" and super()._is_included(path)

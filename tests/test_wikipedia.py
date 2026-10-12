@@ -4,8 +4,8 @@ import pytest
 
 from mcp_indexer.config import CollectionConfig
 from mcp_indexer.plugins.base import DocumentNotFoundError, create_embedding_chunks
-from mcp_indexer.plugins.text_source import TextFileSource
-from mcp_indexer.plugins.wikipedia import WikipediaPointer, WikipediaSource
+from mcp_indexer.plugins.text_document import TextFileSource
+from mcp_indexer.plugins.wikipedia import WikipediaDocument, WikipediaSource
 
 
 def source_for(tmp_path, **config_values):
@@ -37,7 +37,7 @@ async def test_wikipedia_raw_text_round_trip(tmp_path, monkeypatch):
     pointers = [p async for p in source.get_documents()]
     assert len(pointers) == 1
     pointer = pointers[0]
-    assert isinstance(pointer, WikipediaPointer)
+    assert isinstance(pointer, WikipediaDocument)
     assert pointer.document_id == source.encode_document_path(filename)
     metadata = await pointer.get_metadata()
     assert metadata["title"] == "100% Élan"
@@ -61,22 +61,22 @@ async def test_wikipedia_raw_text_round_trip(tmp_path, monkeypatch):
 async def test_missing_fetch_and_missing_root_are_distinct(tmp_path):
     source = source_for(tmp_path)
     with pytest.raises(DocumentNotFoundError):
-        source.fetch_document("absent.mediawiki")
+        await source.fetch_document("absent.mediawiki")
     path = tmp_path / "present.mediawiki"
     path.write_text("present")
-    pointer = source.fetch_document(path.name)
+    pointer = await source.fetch_document(path.name)
     path.unlink()
     with pytest.raises(DocumentNotFoundError):
         await pointer.fetch_chunk({"b": 0, "e": 7})
     source.source_config.directory = tmp_path / "unmounted"
     with pytest.raises(OSError):
-        source.fetch_document("absent.mediawiki")
+        await source.fetch_document("absent.mediawiki")
 
 
 def test_path_escape_is_rejected(tmp_path):
     source = source_for(tmp_path)
     with pytest.raises(ValueError):
-        source.fetch_document("..%2Fescape.mediawiki")
+        source._document_path("..%2Fescape.mediawiki")
 
 
 async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypatch):
@@ -99,7 +99,8 @@ async def test_native_search_maps_ids_without_fetching_files(tmp_path, monkeypat
     finally:
         database.close()
     (tmp_path / "100% Élan.mediawiki").write_text("Article")
-    metadata = await source.fetch_document("100%25%20%C3%89lan.mediawiki").get_metadata()
+    handle = await source.fetch_document("100%25%20%C3%89lan.mediawiki")
+    metadata = await handle.get_metadata()
     assert metadata["keywords"] == ["physics"]
     def unexpected_fetch(*args):
         raise AssertionError("Native discovery must not probe article presence")
@@ -213,7 +214,7 @@ async def test_wikipedia_summary_is_structural_lead(tmp_path):
     pytest.importorskip("mwparserfromhell")
     (tmp_path / "Test article.mediawiki").write_text(_lead_wikitext(), encoding="utf-8")
     source = source_for(tmp_path)
-    summary = await source.get_document_summary("Test%20article.mediawiki")
+    summary = await (await source.fetch_document("Test%20article.mediawiki")).get_document_summary()
 
     # The lead renders to plain text: prose survives, wikilinks become their
     # display text, and nothing after the first heading does.
@@ -233,11 +234,12 @@ async def test_wikipedia_summary_empty_without_prose(tmp_path):
         encoding="utf-8",
     )
     source = source_for(tmp_path)
-    assert await source.get_document_summary("Empty.mediawiki") == ""
+    handle = await source.fetch_document("Empty.mediawiki")
+    assert await handle.get_document_summary() == ""
 
 
 async def test_wikipedia_summary_missing_document(tmp_path):
     pytest.importorskip("mwparserfromhell")
     source = source_for(tmp_path)
     with pytest.raises(DocumentNotFoundError):
-        await source.get_document_summary("absent.mediawiki")
+        await source.fetch_document("absent.mediawiki")

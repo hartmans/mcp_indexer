@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from mcp_indexer.context import Context
-from mcp_indexer.plugins.text_source import TextFilePointer, TextFileSource, TextFileSourceConfig
+from mcp_indexer.plugins.text_document import TextDocument, TextFileSource, TextFileSourceConfig, split_text
 
 
 class SimpleCfg:
@@ -66,9 +66,10 @@ async def test_markdown_semantic_boundaries(mock_context):
 
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 
-    results = []
-    async for chunk in source.split_text({}, text, min_size=1, max_size=1000):
-        results.append(chunk)
+    results = split_text(
+        text, "utf-8", source.semantic_boundary_regexps,
+        source.embedding_boundary_regexps, min_size=1,
+    )
 
     assert len(results) == 3
     assert "# Header 1" in "".join(results[1][1])
@@ -80,9 +81,10 @@ async def test_rst_semantic_boundaries(mock_context):
 
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
 
-    results = []
-    async for chunk in source.split_text({}, text, min_size=1, max_size=1000):
-        results.append(chunk)
+    results = split_text(
+        text, "utf-8", source.semantic_boundary_regexps,
+        source.embedding_boundary_regexps, min_size=1,
+    )
 
     assert len(results) == 3
 
@@ -95,8 +97,8 @@ async def test_text_file_pointer_retrieval(temp_text_env, mock_context):
     source = TextFileSource("col", context=mock_context, collection_config=SimpleCfg(temp_text_env))
     source.source_config = TextFileSourceConfig(directory=temp_text_env)
 
-    pointer = source.fetch_document("test.md")
-    assert isinstance(pointer, TextFilePointer)
+    pointer = await source.fetch_document("test.md")
+    assert isinstance(pointer, TextDocument)
 
     meta = await pointer.get_metadata()
     assert meta["title"] == "test.md"
@@ -119,9 +121,9 @@ async def test_text_file_source_get_document_summary_summarizes_small_documents(
     context = Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=100))
 
-    pointer = source.fetch_document("small.txt")
+    pointer = await source.fetch_document("small.txt")
     meta = await pointer.get_metadata()
-    summary = await source.get_document_summary(pointer.document_id)
+    summary = await pointer.get_document_summary()
 
     assert meta["title"] == "small.txt"
     assert "summary" not in meta
@@ -138,7 +140,8 @@ async def test_text_file_pointer_get_metadata_skips_summary_for_large_documents(
     context = Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=llm, config=None)
     source = TextFileSource("col", context=context, collection_config=SimpleCfg(tmp_path, summary_length=10))
 
-    meta = await source.fetch_document("large.txt").get_metadata()
+    pointer = await source.fetch_document("large.txt")
+    meta = await pointer.get_metadata()
 
     assert "summary" not in meta
     assert llm.calls == []
