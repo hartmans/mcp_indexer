@@ -6,26 +6,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .text_document import TextDocument, TextFileSource, TextFileSourceConfig
-from .file_source import FileBridge
+from .text_document import TextDocument
+from .file_source import FileBridge, FileSource, FileSourceConfig
 from .base import DocumentNotFoundError
 from ..search import DocumentHit, NativeSearchBatch
 
 
-class WikipediaSourceConfig(TextFileSourceConfig):
+class WikipediaSourceConfig(FileSourceConfig):
     xapian_directory: Path
 
 
 class WikipediaDocument(TextDocument):
+    """A MediaWiki article: text interpretation plus Xapian keywords and a
+    structurally extracted lead summary."""
+
+    handler_name = "wikipedia"
+
     async def get_metadata(self) -> dict[str, Any]:
-        title = self.title
-        keywords = await asyncio.to_thread(self.source._xapian_keywords, title)
-        return {
-            **await super().get_metadata(),
-            "title": title,
-            "title_strength": 10,
-            "keywords": keywords,
-        }
+        metadata = await super().get_metadata()
+        metadata["title_strength"] = 10
+        metadata["keywords"] = await asyncio.to_thread(
+            self.source._xapian_keywords, metadata["title"],  # type: ignore[reportAttributeAccessIssue]
+        )
+        return metadata
 
     async def get_document_summary(self) -> str:
         """Return the article's introductory lead as a plain-text summary.
@@ -81,7 +84,11 @@ class WikipediaDocument(TextDocument):
         return text if re.search(r"\w", text) else ""
 
 
-class WikipediaSource(TextFileSource):
+class WikipediaSource(FileSource):
+    """A FileSource for an extracted MediaWiki corpus, with Xapian native
+    search. Constructs its documents directly with the article-specific
+    policy (its known boundaries), so ordinary FileSource discovery does
+    not acquire Wikipedia's Xapian dependency."""
     source_prefix = "wikipedia"
     default_indexing_mode = "indexed"
     separate_rerank = True
@@ -102,16 +109,21 @@ class WikipediaSource(TextFileSource):
         self.source_config = collection_config.resolve_source_config(WikipediaSourceConfig)
 
     def make_document(self, document_id: str, mtime: datetime, path: Path) -> WikipediaDocument:
+        """Construct the article's document directly with the specialized
+        policy, bypassing the general extension-to-policy mapping and the
+        handler registry."""
+        policy = {
+            "handler": "wikipedia",
+            "semantic_boundary_regexps": self.semantic_boundary_regexps,
+            "embedding_boundary_regexps": self.embedding_boundary_regexps,
+        }
         return WikipediaDocument(
+            document_id,
             source=self,
-            document_id=document_id,
-            last_modified=mtime,
             bridge=FileBridge(self, path),
-            title=path.stem,
-            encoding=self.source_config.encoding,
-            semantic_boundary_regexps=self.semantic_boundary_regexps,
-            embedding_boundary_regexps=self.embedding_boundary_regexps,
-            summary_length=self.source_config.summary_length,
+            policy=policy,
+            last_modified=mtime,
+            metadata={"title": path.stem},
         )
 
     def _is_included(self, path: Path) -> bool:

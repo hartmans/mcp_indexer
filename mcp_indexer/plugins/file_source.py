@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import AsyncGenerator, List, Optional, TypeVar
+from typing import Any, AsyncGenerator, List, Optional, TypeVar
 from urllib.parse import quote, unquote
 from pydantic import BaseModel, Field
 from mcp_indexer.plugins.base import (
@@ -11,16 +11,22 @@ from mcp_indexer.plugins.base import (
     DocumentNotFoundError,
     DocumentSource,
 )
+from mcp_indexer.plugins.plugin import DocumentPlugin, HANDLER_REGISTRY
 
 
 class FileSourceConfig(BaseModel):
-    """Base configuration for directory-based sources."""
+    """Base configuration for directory-based sources.
+
+    Carries the source-level text settings: the encoding of the source's
+    files and ``summary_length``, the size cap below which a document
+    summary may be generated. b/e metadata and chunk decoding are
+    byte-based; everything else in the pipeline is char-based.
+    """
     directory: Path
     include: List[str] = Field(default_factory=list, description="Glob patterns to include")
     exclude: List[str] = Field(default_factory=list, description="Glob patterns to exclude")
-    # Text encoding of the source's files. b/e metadata and chunk decoding
-    # are byte-based; everything else in the pipeline is char-based.
     encoding: str = "utf-8"
+    summary_length: int = 65536
 
 
 class FileBridge(ContentBridge):
@@ -61,18 +67,97 @@ class FileBridge(ContentBridge):
         yield self._path
 
 
-P = TypeVar("P", bound=DocumentHandle)
+# ---------------------------------------------------------------------------
+# Code-defined extension-to-policy discovery.
+#
+# The extension picks a policy; the policy's ``handler`` name picks the
+# plugin class. These mappings are separate from the handler-name registry.
+# Suffixes compare case-insensitively; unknown extensions and extensionless
+# files fall back to :data:`TEXT_POLICY`.
+# ---------------------------------------------------------------------------
+
+# Markdown (``.md``, ``.markdown``): semantic boundaries are level-1 and
+# level-2 headings -- ATX ``#``/``##`` and Setext underlines. Deeper ATX
+# headings are not semantic boundaries.
+MARKDOWN_POLICY: dict[str, Any] = {
+    "handler": "text",
+    "semantic_boundary_regexps": (
+        r"(?m)^#{1,2}[ \t]+\S",
+        r"(?m)^={3,}[ \t]*\r?$",
+        r"(?m)^-{3,}[ \t]*\r?$",
+    ),
+    "embedding_boundary_regexps": (r"\n\s*\n",),
+}
+
+# HTML (``.html``, ``.htm``): semantic boundaries are h1 and h2 elements,
+# not h3 through h6. The markup is preserved; no conversion is introduced.
+HTML_POLICY: dict[str, Any] = {
+    "handler": "text",
+    "semantic_boundary_regexps": (
+        r"(?im)^<h[12][\s>].*$",
+    ),
+    "embedding_boundary_regexps": (
+        r"(?im)</(?:p|div|section|article|li|h[1-6])>\s*",
+    ),
+}
+
+# RST (``.rst``): ``=`` and ``-`` title adornments are semantic-boundary
+# hints, adopting the documented section/subsection convention (Sphinx RST
+# primer). RST assigns hierarchy by order of adornment styles, not fixed
+# characters; this does not claim to infer actual heading levels.
+RST_POLICY: dict[str, Any] = {
+    "handler": "text",
+    "semantic_boundary_regexps": (
+        r"(?m)^={3,}[ \t]*\r?$",
+        r"(?m)^-{3,}[ \t]*\r?$",
+    ),
+    "embedding_boundary_regexps": (r"\n\s*\n",),
+}
+
+# Default text fallback: a line of common separator punctuation (three or
+# more of ``-``/``=``/``*``/``_``/``+``) is a semantic boundary; paragraph
+# breaks are the embedding boundaries.
+TEXT_POLICY: dict[str, Any] = {
+    "handler": "text",
+    "semantic_boundary_regexps": (
+        r"(?m)^[-=*+_]{3,}[ \t]*\r?$",
+    ),
+    "embedding_boundary_regexps": (r"\n\s*\n",),
+}
+
+_EXTENSION_POLICIES: dict[str, dict[str, Any]] = {
+    ".md": MARKDOWN_POLICY,
+    ".markdown": MARKDOWN_POLICY,
+    ".html": HTML_POLICY,
+    ".htm": HTML_POLICY,
+    ".rst": RST_POLICY,
+}
+
+
+def extension_policy(path: Path) -> dict[str, Any]:
+    """Select the interpretation policy for a file by its extension.
+
+    Code-defined mapping: unknown extensions and extensionless files fall
+    back to :data:`TEXT_POLICY`. The suffix is compared case-insensitively,
+    so ``NOTES.MD`` selects the Markdown policy.
+    """
+    return _EXTENSION_POLICIES.get(path.suffix.lower(), TEXT_POLICY)
+
+
+P = TypeVar("P", bound=DocumentPlugin)
 
 
 class FileSource(DocumentSource[P]):
+    """An DocumentSource for files on disk.
+
+    Discovery maps each file's extension to an interpretation policy
+    (code-defined) and constructs the selected plugin through the
+    handler-name registry, so enumeration and direct fetch select
+    consistently. The document's encoding and summary length come from the
+    source's config, not per-document arguments.
     """
-    An abstract DocumentSource for files on disk.
-    """
+    source_prefix = "file"
     safe_document_path_chars = "/-_.!@+[]()"
-    # Default chunking boundaries for the plain-text document a FileSource
-    # produces by default. Concrete sources override these.
-    semantic_boundary_regexps: tuple[str, ...] = ()
-    embedding_boundary_regexps: tuple[str, ...] = (r"\n\s*\n",)
 
     def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
         super().__init__(
@@ -112,6 +197,15 @@ class FileSource(DocumentSource[P]):
             raise DocumentNotFoundError(document_id, "Document excluded from collection")
         return path
 
+    def policy_for_path(self, path: Path) -> dict[str, Any]:
+        """Choose the interpretation policy for a file.
+
+        The default is the code-defined extension-to-policy mapping; a
+        source that interprets its files specially may override this (or
+        :meth:`make_document` directly).
+        """
+        return extension_policy(path)
+
     async def get_documents(self, last_modified: Optional[datetime] = None) -> AsyncGenerator[P, None]:
         root = self.source_config.directory
         self._check_root()
@@ -139,10 +233,29 @@ class FileSource(DocumentSource[P]):
         return await asyncio.to_thread(self._fetch_document, document_id)
 
     def make_document(self, document_id: str, mtime: datetime, path: Path) -> P:
-        """Construct this source's document handle for a resolved path.
+        """Construct the selected plugin for a resolved path.
 
-        ``_fetch_document`` and ``get_documents`` both go through this hook
-        so subclasses can substitute their own document class without
-        duplicating path/mtime resolution.
+        The policy comes from :meth:`policy_for_path`; its ``handler`` name
+        is resolved through the handler-name registry, and the source
+        supplies identity, the file bridge, the mtime, and the initial
+        metadata. Enumeration (via ``get_documents``) and direct fetch (via
+        ``fetch_document``) both go through this hook, so they select
+        consistently. A source that knows its document type may override
+        this and construct it directly with a specialized policy.
         """
-        ...
+        policy = self.policy_for_path(path)
+        handler = policy.get("handler")
+        cls = HANDLER_REGISTRY.get(handler) if handler is not None else None
+        if cls is None:
+            raise ValueError(
+                f"No document plugin registered for handler {handler!r} "
+                f"(file {path.name!r})"
+            )
+        return cls(
+            document_id,
+            source=self,
+            bridge=FileBridge(self, path),
+            policy=policy,
+            last_modified=mtime,
+            metadata={"title": path.name},
+        )

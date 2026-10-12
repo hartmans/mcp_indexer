@@ -4,7 +4,7 @@ import pytest
 
 from mcp_indexer.config import CollectionConfig
 from mcp_indexer.plugins.base import DocumentNotFoundError, create_embedding_chunks
-from mcp_indexer.plugins.text_document import TextFileSource
+from mcp_indexer.plugins.file_source import FileSource
 from mcp_indexer.plugins.wikipedia import WikipediaDocument, WikipediaSource
 
 
@@ -21,7 +21,7 @@ def test_source_default_can_be_overridden(tmp_path):
     assert wiki.indexing_mode == "indexed"
     assert wiki.separate_rerank
     assert source_for(tmp_path, indexing_mode="full").indexing_mode == "full"
-    text = TextFileSource("wiki", context=wiki.context, collection_config=wiki.config)
+    text = FileSource("wiki", context=wiki.context, collection_config=wiki.config)
     assert text.indexing_mode == "full"
     assert not text.separate_rerank
 

@@ -1,42 +1,24 @@
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from mcp_indexer.context import Context
-from mcp_indexer.plugins.file_source import FileSource, FileSourceConfig, FileBridge
+from mcp_indexer.context import Context, SOURCE_REGISTRY
+from mcp_indexer.plugins.file_source import (
+    FileSource, FileSourceConfig,
+    MARKDOWN_POLICY, HTML_POLICY, RST_POLICY, TEXT_POLICY, extension_policy,
+)
+from mcp_indexer.plugins.plugin import HANDLER_REGISTRY
 from mcp_indexer.plugins.text_document import TextDocument, split_text
-
-
-class ConcreteFileSource(FileSource):
-    semantic_boundary_regexps = (r"\n={3,}\n",)
-    embedding_boundary_regexps = (r"\n\s*\n",)
-
-    def make_document(self, document_id, mtime, path):
-        return TextDocument(
-            source=self,
-            document_id=document_id,
-            last_modified=mtime,
-            bridge=FileBridge(self, path),
-            title=path.name,
-            encoding=self.source_config.encoding,
-            semantic_boundary_regexps=self.semantic_boundary_regexps,
-            embedding_boundary_regexps=self.embedding_boundary_regexps,
-        )
+from mcp_indexer.plugins.wikipedia import WikipediaDocument
 
 
 class SimpleCfg:
-    def __init__(self, directory):
-        self.source_blob = {"directory": directory}
+    def __init__(self, directory, **kwargs):
+        self.source_blob = {"directory": directory, **kwargs}
 
     def resolve_source_config(self, model):
         return model.model_validate(self.source_blob)
-
-
-@pytest.fixture
-def temp_file_env(tmp_path):
-    (tmp_path / "doc1.txt").write_text("Title 1\n=======\n\nParagraph 1\n\nParagraph 2", encoding="utf-8")
-    (tmp_path / "doc2.txt").write_text("Title 2\n-------\n\nSubtitle\n-----\n\nParagraph 1", encoding="utf-8")
-    return tmp_path
 
 
 @pytest.fixture
@@ -44,58 +26,180 @@ def mock_context(test_context):
     return Context(engine=test_context.engine, session_factory=test_context.session_factory, embedding=None, llm=None, config=None)
 
 
+@pytest.fixture
+def temp_file_env(tmp_path):
+    (tmp_path / "a.md").write_text("# Title\n\nParagraph", encoding="utf-8")
+    (tmp_path / "b.markdown").write_text("## Sub\n\nParagraph", encoding="utf-8")
+    (tmp_path / "c.html").write_text("<h1>T</h1>\n<p>Paragraph</p>", encoding="utf-8")
+    (tmp_path / "d.htm").write_text("<h2>T</h2>\n<p>Paragraph</p>", encoding="utf-8")
+    (tmp_path / "e.rst").write_text("Title\n=======\n\nParagraph", encoding="utf-8")
+    (tmp_path / "f.txt").write_text("Plain paragraph.", encoding="utf-8")
+    (tmp_path / "g.foobar").write_text("Unknown format.", encoding="utf-8")
+    (tmp_path / "noext").write_text("No extension.", encoding="utf-8")
+    (tmp_path / "UPPER.MD").write_text("# Upper\n\nParagraph", encoding="utf-8")
+    return tmp_path
+
+
+def test_registered_names():
+    # FileSource registers as "file"; the removed text source is gone.
+    assert SOURCE_REGISTRY["file"] is FileSource
+    assert "text" not in SOURCE_REGISTRY
+    # Handler-name registry is separate and names the plugin classes.
+    assert HANDLER_REGISTRY["text"] is TextDocument
+    assert HANDLER_REGISTRY["wikipedia"] is WikipediaDocument
+
+
+def test_extension_policies_are_code_defined():
+    assert extension_policy(Path("a.md")) is MARKDOWN_POLICY
+    # Alias extensions share the same policy object.
+    assert extension_policy(Path("a.markdown")) is MARKDOWN_POLICY
+    assert extension_policy(Path("a.html")) is HTML_POLICY
+    assert extension_policy(Path("a.htm")) is HTML_POLICY
+    assert extension_policy(Path("a.rst")) is RST_POLICY
+    # Suffix lookup normalizes case.
+    assert extension_policy(Path("A.MD")) is MARKDOWN_POLICY
+    assert extension_policy(Path("A.HTML")) is HTML_POLICY
+    # Unknown and extensionless files fall back to the default text policy.
+    assert extension_policy(Path("a.unknownext")) is TEXT_POLICY
+    assert extension_policy(Path("noext")) is TEXT_POLICY
+    # Every policy names a handler; the handler key is intact.
+    for policy in (MARKDOWN_POLICY, HTML_POLICY, RST_POLICY, TEXT_POLICY):
+        assert policy["handler"] == "text"
+    # The plain-text fallback treats a line of separator punctuation as its
+    # only semantic boundary.
+    assert len(TEXT_POLICY["semantic_boundary_regexps"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_selects_plugins_by_extension(temp_file_env, mock_context):
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+
+    docs = {doc.document_id: doc async for doc in source.get_documents()}
+
+    assert set(docs) == {
+        "a.md", "b.markdown", "c.html", "d.htm", "e.rst",
+        "f.txt", "g.foobar", "noext", "UPPER.MD",
+    }
+    for doc in docs.values():
+        assert isinstance(doc, TextDocument)
+    # The extension picked the policy for each file.
+    assert docs["a.md"].policy is MARKDOWN_POLICY
+    assert docs["b.markdown"].policy is docs["a.md"].policy  # alias shares it
+    assert docs["UPPER.MD"].policy is MARKDOWN_POLICY        # case normalized
+    assert docs["c.html"].policy is HTML_POLICY
+    assert docs["d.htm"].policy is HTML_POLICY
+    assert docs["e.rst"].policy is RST_POLICY
+    assert docs["f.txt"].policy is TEXT_POLICY
+    assert docs["g.foobar"].policy is TEXT_POLICY
+    assert docs["noext"].policy is TEXT_POLICY
+
+
+@pytest.mark.asyncio
+async def test_direct_fetch_matches_enumeration(temp_file_env, mock_context):
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+
+    direct = await source.fetch_document("a.md")
+    docs = [doc async for doc in source.get_documents()]
+    enumerated = next(doc for doc in docs if doc.document_id == "a.md")
+
+    assert type(direct) is type(enumerated) is TextDocument
+    assert direct.policy is enumerated.policy is MARKDOWN_POLICY
+    assert direct.document_id == enumerated.document_id
+    assert await direct.get_metadata() == await enumerated.get_metadata()
+
+
+@pytest.mark.asyncio
+async def test_missing_handler_is_an_error(temp_file_env, mock_context):
+    class NoHandlerSource(FileSource):
+        def policy_for_path(self, path):
+            return {"handler": "nope"}
+
+    source = NoHandlerSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    with pytest.raises(ValueError, match="nope"):
+        await source.fetch_document("f.txt")
+
+    class NoHandlerKeySource(FileSource):
+        def policy_for_path(self, path):
+            return {"semantic_boundary_regexps": ()}
+
+    bare = NoHandlerKeySource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    with pytest.raises(ValueError):
+        await bare.fetch_document("f.txt")
+
+
+@pytest.mark.asyncio
+async def test_metadata_isolation_with_reused_policy_and_metadata(temp_file_env, mock_context):
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    policy = MARKDOWN_POLICY
+    incoming = {"title": "shared", "custom": "original"}
+    mtime = datetime.now()
+
+    # No content access happens here, so a placeholder bridge suffices.
+    stub = object()
+    doc_a = TextDocument("a.md", source, stub, policy, mtime, metadata=incoming)  # type: ignore[arg-type]
+    doc_b = TextDocument("b.md", source, stub, policy, mtime, metadata=incoming)  # type: ignore[arg-type]
+
+    # The constructor shallow-copies incoming metadata: mutating the
+    # original dict after construction does not affect the documents.
+    incoming["custom"] = "mutated"
+    incoming["late"] = "added"
+    assert (await doc_a.get_metadata())["custom"] == "original"
+    assert "late" not in await doc_a.get_metadata()
+    assert (await doc_b.get_metadata())["custom"] == "original"
+
+    # Repeated get_metadata calls return fresh copies: mutating one result
+    # does not leak into the document or into other results.
+    first = await doc_a.get_metadata()
+    first["custom"] = "tampered"
+    first["injected"] = "x"
+    assert (await doc_a.get_metadata())["custom"] == "original"
+    assert "injected" not in await doc_a.get_metadata()
+    assert (await doc_b.get_metadata())["custom"] == "original"
+
+    # A document may enrich its retained metadata; get_metadata reflects it.
+    doc_a.metadata["custom"] = "enriched"
+    assert (await doc_a.get_metadata())["custom"] == "enriched"
+    assert (await doc_b.get_metadata())["custom"] == "original"
+
+    # Construction leaves the policy and handler key unchanged, even with
+    # a policy shared between documents.
+    assert policy["handler"] == "text"
+    assert set(policy) == {"handler", "semantic_boundary_regexps", "embedding_boundary_regexps"}
+    assert doc_a.policy is doc_b.policy is policy
+
+
+@pytest.mark.asyncio
+async def test_policy_from_source_is_read_only_input(temp_file_env, mock_context):
+    original = dict(MARKDOWN_POLICY, semantic_boundary_regexps=tuple(MARKDOWN_POLICY["semantic_boundary_regexps"]))
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    doc = await source.fetch_document("a.md")
+    # The construction did not add, drop, or rewrite any policy key.
+    assert doc.policy == original
+    assert doc.policy["handler"] == "text"
+    assert MARKDOWN_POLICY == original
+
+
+@pytest.mark.asyncio
+async def test_encoding_and_summary_length_come_from_source_config(temp_file_env, mock_context):
+    source = FileSource(
+        "col", context=mock_context,
+        collection_config=SimpleCfg(temp_file_env, summary_length=123, encoding="utf-8"),
+    )
+    doc = await source.fetch_document("f.txt")
+    assert doc.encoding == "utf-8"
+    assert doc.summary_length == 123
+    # The document reads the live source config, not a construction snapshot.
+    source.source_config = FileSourceConfig(directory=temp_file_env, summary_length=456)
+    assert doc.summary_length == 456
+
+
 @pytest.mark.asyncio
 async def test_file_source_discovery(temp_file_env, mock_context):
-    source = ConcreteFileSource("test_col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    source = FileSource("test_col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
 
-    docs = []
-    async for doc in source.get_documents():
-        docs.append(doc)
+    docs = [doc async for doc in source.get_documents()]
 
-    assert len(docs) == 2
-    assert any("doc1.txt" in doc.document_id for doc in docs)
-    assert any("doc2.txt" in doc.document_id for doc in docs)
-
-
-@pytest.mark.asyncio
-async def test_split_text_rst_headers(mock_context):
-    text = "Title\n=======\nSubtitle\n--------\nParagraph"
-
-    source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(Path(".")))
-
-    results = split_text(
-        text, "utf-8", source.semantic_boundary_regexps,
-        source.embedding_boundary_regexps, min_size=1,
-    )
-
-    assert len(results) >= 2
-
-    results_large = split_text(
-        text, "utf-8", source.semantic_boundary_regexps,
-        source.embedding_boundary_regexps, min_size=50,
-    )
-
-    assert len(results_large) < len(results)
-
-
-@pytest.mark.asyncio
-async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
-    path = temp_file_env / "doc1.txt"
-    path.write_text("Semantic 1\n\nSemantic 2", encoding="utf-8")
-
-    source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
-    source.source_config = FileSourceConfig(directory=temp_file_env)
-
-    pointer = await source.fetch_document("doc1.txt")
-
-    chunks = []
-    async for chunk_info in pointer.get_chunks(min_size=1, max_size=100):
-        chunks.append(chunk_info)
-
-    assert len(chunks) == 1
-    meta, _ = chunks[0]
-    text = await pointer.fetch_chunk(meta)
-    assert "Semantic 1" in text
+    assert len(docs) == 9
 
 
 @pytest.mark.asyncio
@@ -107,14 +211,12 @@ async def test_byte_offsets_hold_across_newline_conventions(tmp_path, mock_conte
     translation (CRLF/CR -> LF) would make the decoded text -- and hence
     the offsets computed from it -- disagree with the raw file bytes.
     """
-    lines = [b"A one", b"===", b"B two", b"===", b"C three"]
+    lines = [b"RST title", b"===", b"Body one", b"---", b"Body two"]
     content = line_ending.join(lines)
-    (tmp_path / "nl.txt").write_bytes(content)
+    (tmp_path / "nl.rst").write_bytes(content)
 
-    source = ConcreteFileSource(
-        "col", context=mock_context, collection_config=SimpleCfg(tmp_path),
-    )
-    pointer = await source.fetch_document("nl.txt")
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(tmp_path))
+    pointer = await source.fetch_document("nl.rst")
 
     chunks = []
     async for meta, cands in pointer.get_chunks(min_size=1, max_size=10_000):
@@ -144,13 +246,58 @@ async def test_byte_offsets_hold_across_newline_conventions(tmp_path, mock_conte
 
 
 @pytest.mark.asyncio
+async def test_multibyte_byte_offsets_round_trip(tmp_path, mock_context):
+    """b/e are byte offsets: for multibyte UTF-8 text they must address
+    bytes, not characters."""
+    text = "# Café\n\nÉlan and 中文 content.\n\nMore text."
+    (tmp_path / "multi.md").write_text(text, encoding="utf-8")
+    raw = (tmp_path / "multi.md").read_bytes()
+    assert len(raw) != len(text)  # guard: the content is actually multibyte
+
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(tmp_path))
+    pointer = await source.fetch_document("multi.md")
+
+    chunks = []
+    async for meta, cands in pointer.get_chunks(min_size=1, max_size=10_000):
+        chunks.append((meta, cands))
+    assert chunks
+    assert "".join("".join(cands) for _m, cands in chunks) == text
+    for meta, cands in chunks:
+        assert raw[meta["b"]:meta["e"]].decode("utf-8") == "".join(cands)
+        assert await pointer.fetch_chunk(dict(meta)) == "".join(cands)
+
+
+@pytest.mark.asyncio
+async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
+    path = temp_file_env / "f.txt"
+    path.write_text("Semantic 1\n\nSemantic 2", encoding="utf-8")
+
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env))
+    source.source_config = FileSourceConfig(directory=temp_file_env)
+
+    pointer = await source.fetch_document("f.txt")
+    assert isinstance(pointer, TextDocument)
+
+    chunks = []
+    async for chunk_info in pointer.get_chunks(min_size=1, max_size=100):
+        chunks.append(chunk_info)
+
+    assert len(chunks) == 1
+    meta, _ = chunks[0]
+    text = await pointer.fetch_chunk(meta)
+    assert "Semantic 1" in text
+    meta_dict = await pointer.get_metadata()
+    assert meta_dict["title"] == "f.txt"
+
+
+@pytest.mark.asyncio
 async def test_file_source_document_id_escapes_unsafe_path_characters(tmp_path, mock_context):
     nested_dir = tmp_path / "team's notes"
     nested_dir.mkdir()
     weird_path = nested_dir / "alpha?.txt"
     weird_path.write_text("Encoded path doc", encoding="utf-8")
 
-    source = ConcreteFileSource("col", context=mock_context, collection_config=SimpleCfg(tmp_path))
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(tmp_path))
 
     docs = [doc async for doc in source.get_documents()]
 

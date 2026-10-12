@@ -5,7 +5,7 @@ from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.indexer import Indexer
 from mcp_indexer.search import search
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.plugins.text_document import TextFileSource
+from mcp_indexer.plugins.file_source import FileSource
 from sqlalchemy import select
 
 
@@ -99,7 +99,7 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -116,7 +116,7 @@ async def test_indexer_indexes_text_documents_end_to_end(test_context, tmp_path)
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -178,7 +178,7 @@ async def test_fetch_chunk_semantic_returns_first_chunk_with_warning(test_contex
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -194,7 +194,7 @@ async def test_fetch_chunk_semantic_returns_first_chunk_with_warning(test_contex
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -253,7 +253,7 @@ async def test_fetch_document_full_text_is_not_duplicated_per_embedding_row(
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -269,7 +269,7 @@ async def test_fetch_document_full_text_is_not_duplicated_per_embedding_row(
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -326,7 +326,7 @@ async def test_fetch_document_groups_semantic_chunks_with_span_summaries(
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     # Small max_to_summarize so each semantic chunk splits across several
     # summary spans.
@@ -345,7 +345,7 @@ async def test_fetch_document_groups_semantic_chunks_with_span_summaries(
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -397,7 +397,7 @@ async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(test_co
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir), "summary_length": 10},
+        "source_blob": {"type": "file", "directory": str(docs_dir), "summary_length": 10},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -414,7 +414,7 @@ async def test_indexer_splits_oversized_semantic_chunks_for_summary_only(test_co
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -445,7 +445,7 @@ async def test_indexer_uses_escaped_file_paths_in_document_ids(test_context, tmp
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -462,7 +462,7 @@ async def test_indexer_uses_escaped_file_paths_in_document_ids(test_context, tmp
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -494,7 +494,7 @@ async def test_failed_document_tracking(test_context, tmp_path):
         "description": "Test notes collection",
         "doc_summary_prompt": "Summarize the document",
         "chunk_summary_prompt": "Summarize the chunk",
-        "source_blob": {"type": "text", "directory": str(docs_dir)},
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
     })
     server_config = ServerConfig.model_validate({
         "db_uri": "postgresql://test",
@@ -529,7 +529,7 @@ async def test_failed_document_tracking(test_context, tmp_path):
         llm=FakeLlm(),
         config=config_manager,
     )
-    source = TextFileSource("notes", context=context, collection_config=collection_config)
+    source = FileSource("notes", context=context, collection_config=collection_config)
     context.collections["notes"] = source
 
     indexer = Indexer(context)
@@ -554,7 +554,7 @@ async def test_failed_document_tracking(test_context, tmp_path):
         llm=FakeLlm(),
         config=config_manager,
     )
-    working_source = TextFileSource("notes", context=working_context, collection_config=collection_config)
+    working_source = FileSource("notes", context=working_context, collection_config=collection_config)
     working_context.collections["notes"] = working_source
 
     working_indexer = Indexer(working_context)

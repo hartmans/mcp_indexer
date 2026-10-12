@@ -1,15 +1,8 @@
 import re
-from datetime import datetime
-from pathlib import Path
 from typing import Any, AsyncGenerator
 
-from mcp_indexer.plugins.base import (
-    ChunkInfo,
-    ContentBridge,
-    DocumentHandle,
-    DocumentSource,
-)
-from mcp_indexer.plugins.file_source import FileBridge, FileSource, FileSourceConfig
+from mcp_indexer.plugins.base import ChunkInfo
+from mcp_indexer.plugins.plugin import DocumentPlugin
 
 
 def split_text(
@@ -90,41 +83,35 @@ def split_text(
     return results
 
 
-class TextDocument(DocumentHandle):
+class TextDocument(DocumentPlugin):
     """A document whose content is text.
 
-    Text interpretation (semantic/embedding boundaries, encoding, summary
-    limits) is supplied at construction so a document can be built from any
-    content access, not only a :class:`FileSource`.
+    Interpretation is driven by the construction policy: the boundary
+    regexps come from ``policy`` and the encoding and summary settings
+    come from the source's config (``source.source_config``, a
+    FileSourceConfig). The content bridge may be any ContentBridge, so
+    text interpretation does not require filesystem access.
     """
 
-    def __init__(
-        self,
-        source: DocumentSource,
-        document_id: str,
-        last_modified: datetime,
-        bridge: ContentBridge,
-        *,
-        title: str,
-        encoding: str = "utf-8",
-        semantic_boundary_regexps: tuple[str, ...] = (),
-        embedding_boundary_regexps: tuple[str, ...] = (r"\n\s*\n",),
-        summary_length: int = 65536,
-    ):
-        super().__init__(source, document_id, last_modified)
-        self.bridge = bridge
-        self.title = title
-        self.encoding = encoding
-        self.semantic_boundary_regexps = semantic_boundary_regexps
-        self.embedding_boundary_regexps = embedding_boundary_regexps
-        self.summary_length = summary_length
+    handler_name = "text"
 
-    async def get_metadata(self) -> dict[str, str]:
-        """Title from the source; last_modified from the resolved mtime."""
-        return {
-            "title": self.title,
-            "last_modified": str(self.last_modified),
-        }
+    @property
+    def encoding(self) -> str:
+        # source_config is set by every FileSource-family source in its
+        # __init__ (FileSourceConfig, which carries the text settings).
+        return self.source.source_config.encoding  # type: ignore[reportAttributeAccessIssue]
+
+    @property
+    def summary_length(self) -> int:
+        return self.source.source_config.summary_length  # type: ignore[reportAttributeAccessIssue]
+
+    @property
+    def semantic_boundary_regexps(self) -> tuple[str, ...]:
+        return self.policy.get("semantic_boundary_regexps", ())
+
+    @property
+    def embedding_boundary_regexps(self) -> tuple[str, ...]:
+        return self.policy.get("embedding_boundary_regexps", (r"\n\s*\n",))
 
     async def _text(self, errors: str | None = None) -> str:
         """Read the content bytes and decode them.
@@ -173,58 +160,3 @@ class TextDocument(DocumentHandle):
             summaries = await llm([prompt])
             return summaries[0]
         return ""
-
-
-class TextFileSourceConfig(FileSourceConfig):
-    """Configuration for the TextFileSource plugin."""
-    summary_length: int = 65536
-
-
-class TextFileSource(FileSource[TextDocument]):
-    """
-    A concrete FileSource for handling simple text files (Markdown, RST, TXT).
-    """
-
-    source_prefix = "text"
-
-    # Semantic boundaries:
-    # 1. RST style headers (underline of = or -)
-    # 2. Markdown style headers (# Header)
-    # 3. Large gaps of whitespace (though handled by embedding boundaries,
-    #    we might want them as semantic breaks)
-    semantic_boundary_regexps = (
-        r"\n={3,}\n",           # RST Level 1
-        r"\n-{3,}\n",           # RST Level 2
-        r"\n\s*#{1,6}\s+.*",    # Markdown Headers
-    )
-
-    # Embedding boundaries:
-    # 1. Double newlines (paragraphs)
-    # 2. Horizontal rules
-    embedding_boundary_regexps = (
-        r"\n\s*\n",             # Paragraphs
-        r"\n\s*-{3,}\s*\n",     # MD/RST Horizontal rules
-    )
-
-    def __init__(self, collection_id: str, *, context, collection_config, reranker=None):
-        super().__init__(
-            collection_id,
-            context=context,
-            collection_config=collection_config,
-            reranker=reranker,
-        )
-        # Resolve the specific TextFileSourceConfig
-        self.source_config = collection_config.resolve_source_config(TextFileSourceConfig)
-
-    def make_document(self, document_id: str, mtime: datetime, path: Path) -> TextDocument:
-        return TextDocument(
-            source=self,
-            document_id=document_id,
-            last_modified=mtime,
-            bridge=FileBridge(self, path),
-            title=path.name,
-            encoding=self.source_config.encoding,
-            semantic_boundary_regexps=self.semantic_boundary_regexps,
-            embedding_boundary_regexps=self.embedding_boundary_regexps,
-            summary_length=self.source_config.summary_length,
-        )

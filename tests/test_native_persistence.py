@@ -13,7 +13,7 @@ from mcp_indexer.config import CollectionConfig, ServerConfig
 from mcp_indexer.indexer import Indexer, DocumentIndexingStats
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.models import Document, DocumentChunk, ChunkSummary, FailedDocument
-from mcp_indexer.plugins.text_document import TextFileSource
+from mcp_indexer.plugins.file_source import FileSource
 
 
 def make_indexer(test_context, tmp_path):
@@ -31,7 +31,7 @@ def make_indexer(test_context, tmp_path):
     )
     config = CollectionConfig(collection_id="wiki", tool_prefix="wiki", indexing_mode="indexed",
                               source_blob={"directory": str(tmp_path)})
-    source = TextFileSource("wiki", context=context, collection_config=config)
+    source = FileSource("wiki", context=context, collection_config=config)
     context.collections = {"wiki": source}
     return Indexer(context), source
 
@@ -103,9 +103,9 @@ async def test_collection_rename_preserves_local_ids(test_context, tmp_path):
 
 async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_path, monkeypatch):
     indexer, source = make_indexer(test_context, tmp_path)
-    (tmp_path / "article.txt").write_text("First section.\n\n# Second\nSecond section.")
-    await indexer.ensure_document_indexed(source, "article.txt")
-    chunks = await indexer._reconstruct_semantic_chunks(source, "article.txt")
+    (tmp_path / "article.md").write_text("First section.\n\n# Second\nSecond section.")
+    await indexer.ensure_document_indexed(source, "article.md")
+    chunks = await indexer._reconstruct_semantic_chunks(source, "article.md")
     assert len(chunks) == 2
     started = []
     ready = asyncio.Event()
@@ -118,7 +118,7 @@ async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_p
         return "Summary: " + text
 
     monkeypatch.setattr(indexer, "_summarize_text", summarize)
-    await asyncio.wait_for(indexer.summarize_document_chunks(source, "article.txt"), 5)
+    await asyncio.wait_for(indexer.summarize_document_chunks(source, "article.md"), 5)
     async with source.context.get_session() as session:
         summaries = (await session.execute(
             select(ChunkSummary).order_by(ChunkSummary.summary_span)
