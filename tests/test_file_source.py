@@ -89,6 +89,51 @@ async def test_file_source_pointer_retrieval(temp_file_env, mock_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"])
+async def test_byte_offsets_hold_across_newline_conventions(tmp_path, mock_context, line_ending):
+    """b/e are byte offsets into the file, so they must hold regardless of
+    the file's newline convention. This is the guard for reading via
+    read_bytes().decode() rather than read_text(): universal-newline
+    translation (CRLF/CR -> LF) would make the decoded text -- and hence
+    the offsets computed from it -- disagree with the raw file bytes.
+    """
+    lines = [b"A one", b"===", b"B two", b"===", b"C three"]
+    content = line_ending.join(lines)
+    (tmp_path / "nl.txt").write_bytes(content)
+
+    source = ConcreteFileSource(
+        "col", context=mock_context, collection_config=SimpleCfg(tmp_path),
+    )
+    pointer = source.fetch_document("nl.txt")
+
+    chunks = []
+    async for meta, cands in pointer.get_chunks(min_size=1, max_size=10_000):
+        chunks.append((meta, cands))
+    assert chunks, "expected at least one semantic chunk"
+
+    # Whole-document round-trip: the decoded candidates must reproduce the
+    # file byte-for-byte. A read_text() with newline translation would
+    # shorten CRLF/CR content and fail this.
+    assert "".join("".join(cands) for _m, cands in chunks) == content.decode()
+
+    # Per chunk: the stored b/e must select exactly this chunk's text from
+    # the raw file bytes.
+    for meta, cands in chunks:
+        assert content[meta["b"]:meta["e"]].decode() == "".join(cands)
+
+    # Contiguity: the chunks partition the file with no gaps or overlaps.
+    ordered = sorted(chunks, key=lambda c: c[0]["b"])
+    assert ordered[0][0]["b"] == 0
+    for prev, cur in zip(ordered, ordered[1:]):
+        assert prev[0]["e"] == cur[0]["b"]
+    assert ordered[-1][0]["e"] == len(content)
+
+    # fetch_chunk reads the stored byte span and must return the same text.
+    for meta, cands in chunks:
+        assert await pointer.fetch_chunk(dict(meta)) == "".join(cands)
+
+
+@pytest.mark.asyncio
 async def test_file_source_document_id_escapes_unsafe_path_characters(tmp_path, mock_context):
     nested_dir = tmp_path / "team's notes"
     nested_dir.mkdir()
