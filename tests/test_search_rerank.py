@@ -151,25 +151,18 @@ async def test_reranker_prepares_candidates_concurrently(monkeypatch):
     assert [hit.document_id for hit in result] == ["first", "second"]
 
 
-async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):
+async def test_assembly_hydrates_after_summary_and_merges_chunks():
     events = []
     chunk = SimpleNamespace(chunk_id="doc?c=0", summary=SimpleNamespace(summary="chunk summary"))
     document = SimpleNamespace(summary="", chunks=[chunk])
 
-    async def ensure(*args):
-        events.append("index")
-
-    async def summary(*args):
-        events.append("summary")
-        document.summary = "fresh summary"
-        return document.summary
-
     async def summarize_results(*args):
-        events.append("chunks")
+        events.append("converge")
+        document.summary = "fresh summary"
 
     class Session:
         async def execute(self, statement):
-            assert events == ["index", "summary", "chunks"]
+            assert events == ["converge"]
             return SimpleNamespace(scalar_one=lambda: document)
 
     @asynccontextmanager
@@ -178,8 +171,6 @@ async def test_assembly_hydrates_after_summary_and_merges_chunks(monkeypatch):
 
     indexer = SimpleNamespace(context=SimpleNamespace(get_session=session),
                               summarize_results=summarize_results)
-    monkeypatch.setattr(searching, "_ensure_indexed", ensure)
-    monkeypatch.setattr(searching, "_document_summary", summary)
     hit = ChunkHit("doc", {}, 1, "doc?c=0")
     result = await searching.assemble_hits(indexer, SimpleNamespace(id="test"),
                                            [DocumentHit("doc", 1), hit, hit])
@@ -191,13 +182,11 @@ async def test_assembly_processes_documents_concurrently(monkeypatch):
     started = set()
     both_started = asyncio.Event()
 
-    async def ensure(indexer, collection, document_id):
+    async def summary(indexer, collection, document_id):
         started.add(document_id)
         if len(started) == 2:
             both_started.set()
         await both_started.wait()
-
-    async def summary(*args):
         return "summary"
 
     class Session:
@@ -209,7 +198,6 @@ async def test_assembly_processes_documents_concurrently(monkeypatch):
     async def session():
         yield Session()
 
-    monkeypatch.setattr(searching, "_ensure_indexed", ensure)
     monkeypatch.setattr(searching, "_document_summary", summary)
     indexer = SimpleNamespace(context=SimpleNamespace(get_session=session))
     results = await asyncio.wait_for(searching.assemble_hits(

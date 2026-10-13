@@ -157,10 +157,6 @@ async def vector_search_hits(
             if not isinstance(outcome, Exception) for hit in outcome]
 
 
-async def _ensure_indexed(indexer: Indexer, source: DocumentSource, document_id: str) -> None:
-    await indexer.ensure_document_indexed(source, document_id)
-
-
 async def _document_summary(indexer: Indexer, source: DocumentSource, document_id: str) -> str:
     async def read():
         async with indexer.context.get_session() as session:
@@ -170,12 +166,12 @@ async def _document_summary(indexer: Indexer, source: DocumentSource, document_i
 
     summary = await read()
     if not summary:
-        await _ensure_indexed(indexer, source, document_id)
-        # The source's existing summary interface is tried before generating
-        # span summaries for sources that need the generic fallback.
-        if not await indexer.summarize_document(source, document_id):
-            await indexer.summarize_document_chunks(source, document_id)
-            await indexer.summarize_document(source, document_id)
+        # Bring the document's summary tree to summarized state: indexing it,
+        # converging its children's subtrees bottom-up, summarizing its own
+        # chunks (the generic span fallback), and its document summary (which
+        # incorporates the source's own summary interface and child
+        # summaries).
+        await indexer.summarize_results(source.id, [document_id])
         summary = await read()
     if not summary:
         raise ValueError(f"No summary available for {document_id}")
@@ -266,10 +262,14 @@ async def assemble_hits(
     async def assemble_document(
         document_id: str, chunk_hits: list[ChunkHit],
     ) -> tuple[Document, list[DocumentChunk]]:
-        await _ensure_indexed(indexer, collection, document_id)
-        await _document_summary(indexer, collection, document_id)
+        # Chunk hits need span summaries even when the document summary
+        # already exists, so converge the document's summary tree (which
+        # also lands the document summary itself); a bare document hit
+        # needs only the document summary.
         if chunk_hits:
             await indexer.summarize_results(collection.id, [document_id])
+        else:
+            await _document_summary(indexer, collection, document_id)
         async with indexer.context.get_session() as session:
             document = (await session.execute(
                 select(Document).where(
