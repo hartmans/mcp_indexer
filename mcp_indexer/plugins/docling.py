@@ -12,11 +12,18 @@ subdocument IDs when the mapping is unambiguous.
 Docling is an optional dependency: importing and registering this module
 works without it, but instantiating :class:`DoclingDocument` raises an
 informative :class:`ImportError`.
+
+A single Docling converter is shared across documents so each conversion
+does not pay the pipeline startup cost (OCR model loading, torch
+initialization) again.  The converter — and the accelerator memory its
+pipelines hold — is released :data:`DOCLING_IDLE_TIMEOUT` seconds after
+the last conversion so an idle GPU does not hold memory indefinitely.
 """
 import asyncio
 import hashlib
 import io
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -87,6 +94,109 @@ def _import_docling():
     }
 
 
+# Seconds without a conversion before the shared converter (and the
+# accelerator memory its pipelines hold) is released.
+DOCLING_IDLE_TIMEOUT = 120.0
+
+# Extensions this plugin can convert; validation happens before the shared
+# converter is touched.
+_DOC_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".rtf", ".ppt", ".pptx", ".odt", ".ods",
+}
+
+# Shared-converter state.  Conversions run in worker threads, so the lock
+# is a threading lock; the idle-release timer lives on the event loop.
+_shared_converter: Any | None = None
+_converter_lock = threading.Lock()
+_idle_release_task: asyncio.Task[None] | None = None
+
+
+def _build_shared_converter() -> Any:
+    """Build a converter preconfigured for every supported format.
+
+    Docling builds pipelines lazily per format on first use, so building
+    the converter is cheap; the first PDF conversion pays for the OCR
+    pipeline.
+    """
+    imports = _import_docling()
+    input_format = imports["InputFormat"]
+    pdf_options = imports["PdfPipelineOptions"](
+        do_ocr=True,
+        ocr_options=imports["RapidOcrOptions"](backend="torch"),
+        generate_page_images=False,
+        generate_picture_images=True,
+        do_picture_classification=False,
+        do_picture_description=False,
+        do_table_structure=True,
+    )
+    format_options: dict[Any, Any] = {
+        input_format.PDF: imports["PdfFormatOption"](pipeline_options=pdf_options),
+        input_format.DOC: imports["WordFormatOption"](),
+        input_format.DOCX: imports["WordFormatOption"](),
+        input_format.RTF: imports["WordFormatOption"](),
+        input_format.PPT: imports["PowerpointFormatOption"](),
+        input_format.PPTX: imports["PowerpointFormatOption"](),
+        input_format.ODT: imports["OdtFormatOption"](),
+        input_format.ODS: imports["OdsFormatOption"](),
+    }
+    return imports["DocumentConverter"](format_options=format_options)
+
+
+def _shared_convert(path: str) -> Any:
+    """Convert under the shared converter (blocking; call from a thread).
+
+    Conversions are serialized: the Docling pipelines are not documented
+    as thread-safe, and serializing keeps the idle-release semantics
+    simple (a conversion in flight cannot race the release).
+    """
+    global _shared_converter
+    with _converter_lock:
+        converter = _shared_converter
+        if converter is None:
+            converter = _shared_converter = _build_shared_converter()
+        return converter.convert(path)
+
+
+def _free_device_cache() -> None:
+    """Return accelerator memory still held after the pipeline is dropped."""
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _cancel_idle_release() -> None:
+    global _idle_release_task
+    if _idle_release_task is not None and not _idle_release_task.done():
+        _idle_release_task.cancel()
+    _idle_release_task = None
+
+
+def _schedule_idle_release() -> None:
+    """Release the shared converter after an idle gap of no conversions."""
+    global _idle_release_task
+
+    async def release_after_idle() -> None:
+        global _shared_converter
+        await asyncio.sleep(DOCLING_IDLE_TIMEOUT)
+        with _converter_lock:
+            _shared_converter = None
+        _free_device_cache()
+
+    _cancel_idle_release()
+    _idle_release_task = asyncio.get_running_loop().create_task(release_after_idle())
+
+
+def _reset_shared_state() -> None:
+    """Drop the shared converter and any pending idle release (test hook)."""
+    global _shared_converter
+    _cancel_idle_release()
+    with _converter_lock:
+        _shared_converter = None
+
+
 def _map_image_references(markdown: str, figures: list[dict[str, Any]]) -> str:
     """Map embedded data-URI image references to figure subdocument IDs.
 
@@ -143,14 +253,23 @@ class DoclingDocument(DocumentPlugin):
     # ── conversion ────────────────────────────────────────────────────────
 
     async def _ensure_converted(self) -> TextDocument:
-        """Convert the source file on first use; return the delegate."""
+        """Convert the source file on first use; return the delegate.
+
+        The idle release is scheduled in a ``finally`` so a failed
+        conversion cannot strand the shared converter — and the memory
+        its pipelines hold — without an idle timer.
+        """
         if self._delegate is not None:
             return self._delegate
         async with self._conversion_lock:
             if self._delegate is not None:
                 return self._delegate
-            async with self.bridge.path() as path:
-                result = await asyncio.to_thread(self._convert_sync, path)
+            _cancel_idle_release()
+            try:
+                async with self.bridge.path() as path:
+                    result = await asyncio.to_thread(self._convert_sync, path)
+            finally:
+                _schedule_idle_release()
             doc = result.document
             if result.status.value not in ("success", "partial_success"):
                 raise RuntimeError(
@@ -191,38 +310,10 @@ class DoclingDocument(DocumentPlugin):
 
     def _convert_sync(self, path: Path) -> Any:
         """Run the Docling conversion for this file's format (blocking)."""
-        imports = _import_docling()
-        converter_cls = imports["DocumentConverter"]
-        input_format = imports["InputFormat"]
         suffix = path.suffix.lower()
-        format_options: dict[Any, Any] = {}
-        if suffix == ".pdf":
-            options = imports["PdfPipelineOptions"](
-                do_ocr=True,
-                ocr_options=imports["RapidOcrOptions"](backend="torch"),
-                generate_page_images=False,
-                generate_picture_images=True,
-                do_picture_classification=False,
-                do_picture_description=False,
-                do_table_structure=True,
-            )
-            format_options[input_format.PDF] = imports["PdfFormatOption"](
-                pipeline_options=options
-            )
-        elif suffix in {".doc", ".docx", ".rtf"}:
-            format_options[input_format.DOC] = imports["WordFormatOption"]()
-            format_options[input_format.DOCX] = imports["WordFormatOption"]()
-            format_options[input_format.RTF] = imports["WordFormatOption"]()
-        elif suffix in {".ppt", ".pptx"}:
-            format_options[input_format.PPT] = imports["PowerpointFormatOption"]()
-            format_options[input_format.PPTX] = imports["PowerpointFormatOption"]()
-        elif suffix == ".odt":
-            format_options[input_format.ODT] = imports["OdtFormatOption"]()
-        elif suffix == ".ods":
-            format_options[input_format.ODS] = imports["OdsFormatOption"]()
-        else:
+        if suffix not in _DOC_EXTENSIONS:
             raise ValueError(f"Unsupported Docling extension: {suffix}")
-        return converter_cls(format_options=format_options).convert(str(path))
+        return _shared_convert(str(path))
 
     # ── delegated text interpretation ─────────────────────────────────────
 

@@ -6,6 +6,7 @@ dependency) runs without Docling. Real conversion tests use the checked-in
 short fixtures under ``tests/fixtures`` and are skipped only when Docling
 itself is unavailable.
 """
+import asyncio
 import base64
 import re
 from datetime import datetime
@@ -199,6 +200,21 @@ async def test_image_document_summarizes_without_chunks(tmp_path):
     assert [c async for c in image.get_sub_documents()] == []
 
 
+def test_unsupported_extension_raises_before_conversion(monkeypatch):
+    import mcp_indexer.plugins.docling as docling_module
+
+    monkeypatch.setattr(docling_module, "docling_available", lambda: True)
+    doc = DoclingDocument(
+        "sample.txt",
+        source=None,
+        bridge=None,
+        policy=DOCLING_POLICY,
+        last_modified=datetime(2026, 1, 1),
+    )
+    with pytest.raises(ValueError, match="Unsupported Docling extension"):
+        doc._convert_sync(Path("sample.txt"))
+
+
 # ── real conversion (requires Docling) ────────────────────────────────────
 
 
@@ -282,6 +298,70 @@ async def test_repeat_processing_yields_consistent_enumeration(tmp_path):
     )
     fresh_children = [c.document_id async for c in fresh.get_sub_documents()]
     assert fresh_children == first_children
+
+
+@requires_docling
+@pytest.mark.asyncio
+async def test_shared_converter_reused_across_documents(tmp_path, monkeypatch):
+    import mcp_indexer.plugins.docling as docling_module
+
+    docling_module._reset_shared_state()
+    built = []
+    real_build = docling_module._build_shared_converter
+
+    def counting_build():
+        converter = real_build()
+        built.append(converter)
+        return converter
+
+    monkeypatch.setattr(docling_module, "_build_shared_converter", counting_build)
+
+    source = make_source(tmp_path)
+    for name in ("sample.pdf", "sample.docx"):
+        doc = await source.fetch_document(name)
+        assert await full_text(doc)
+
+    # One converter served both formats; its pipelines were built once.
+    assert len(built) == 1
+    assert docling_module._shared_converter is built[0]
+    docling_module._reset_shared_state()
+
+
+@requires_docling
+@pytest.mark.asyncio
+async def test_shared_converter_released_after_idle_timeout(tmp_path, monkeypatch):
+    import mcp_indexer.plugins.docling as docling_module
+
+    docling_module._reset_shared_state()
+    assert docling_module.DOCLING_IDLE_TIMEOUT == 120.0
+    monkeypatch.setattr(docling_module, "DOCLING_IDLE_TIMEOUT", 0.3)
+
+    source = make_source(tmp_path)
+    doc = await source.fetch_document("sample.pdf")
+    assert await full_text(doc)
+    converter = docling_module._shared_converter
+    assert converter is not None
+
+    # After the idle timeout the shared converter is dropped.
+    await asyncio.sleep(0.6)
+    assert docling_module._shared_converter is None
+
+    # The next conversion rebuilds a fresh converter. The source's handle
+    # cache returns the same already-converted document, so construct a
+    # fresh handle directly (as the repeat-processing test does) to force
+    # a real second conversion.
+    again = DoclingDocument(
+        "sample.pdf",
+        source=source,
+        bridge=doc.bridge,
+        policy=DOCLING_POLICY,
+        last_modified=doc.last_modified,
+        metadata={"title": "sample.pdf"},
+    )
+    assert await full_text(again)
+    assert docling_module._shared_converter is not None
+    assert docling_module._shared_converter is not converter
+    docling_module._reset_shared_state()
 
 
 @requires_docling
