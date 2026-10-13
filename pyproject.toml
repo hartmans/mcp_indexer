@@ -29,6 +29,14 @@ rerank = [
     "torch",
     "transformers>=4.51",
 ]
+# Optional: real conversion of PDF and office formats, with OCR.
+# RapidOCR runs on the PyTorch backend, so torch/torchvision are required.
+docling = [
+    "docling>=2.138.0",
+    "rapidocr>=3.10.0",
+    "torch",
+    "torchvision",
+]
 test = [
     "pytest",
     "pytest-asyncio",

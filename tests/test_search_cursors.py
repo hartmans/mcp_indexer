@@ -34,12 +34,13 @@ class Harness:
             id="test", _search_sessions=self.store,
             config=SimpleNamespace(min_cosine_distance=0.7, min_rerank_score=0.5),
             reranker=self if rerank else None, native_search=self.native_search,
-            fetch_chunk=self.fetch_chunk,
+            fetch_document=self.fetch_document,
             context=SimpleNamespace(embedding=SimpleNamespace(query=self.embed)),
         )
         self.indexer = SimpleNamespace(context=SimpleNamespace(collections={"test": self.source}))
         monkeypatch.setattr(searching, "vector_search_batch", self.vector)
         monkeypatch.setattr(searching, "assemble_hits", self.assemble)
+        monkeypatch.setattr(searching, "fetch_chunk", self.helper_fetch)
 
     async def setup(self):
         self.calls.append(("setup",))
@@ -65,9 +66,20 @@ class Harness:
             raise batch
         return NativeSearchBatch(batch, pos + 1, kwargs["chunk_offset"])
 
-    async def fetch_chunk(self, document_id, metadata, scope, offset=None, length=None):
-        self.calls.append(("fetch", document_id, dict(metadata), scope, offset, length))
-        return f"{document_id}:{offset}"
+    async def helper_fetch(self, source, chunk_id, *, scope="semantic"):
+        document_id = chunk_id.rsplit("?", 1)[0]
+        self.calls.append(("fetch", document_id, scope))
+        return f"{document_id}:{chunk_id.rsplit('?', 1)[1].split('=')[-1]}"
+
+    async def fetch_document(self, document_id):
+        self.calls.append(("fetch_doc", document_id))
+
+        async def fetch_chunk(metadata):
+            self.calls.append(("fetch", document_id, "semantic"))
+            # The requested embedding span is sliced from this semantic text.
+            return f"{document_id}:0" + "z" * 64
+
+        return SimpleNamespace(document_id=document_id, fetch_chunk=fetch_chunk)
 
     async def score(self, query, texts, top_n):
         self.calls.append(("score", query, list(texts), top_n))
@@ -150,7 +162,7 @@ async def test_span_containment_dedup_rule():
 @pytest.mark.parametrize("rerank", [False, True])
 async def test_all_streams_resume_and_documents_return_once(harness, rerank):
     h = harness(documents=[doc("a"), doc("b"), doc("c")],
-                chunks=[ChunkHit("a", {}, 0.9, None, 0, 1), ChunkHit("d", {}, 0.9, None, 0, 1)],
+                chunks=[ChunkHit("a", {}, 0.9, None, 0, 3), ChunkHit("d", {}, 0.9, None, 0, 3)],
                 native=[[doc("a")], [], [doc("e")], [doc("f")]], rerank=rerank)
     page = await h.search("query", limit=2, document_candidate_limit=1, chunk_candidate_limit=1)
     found = names(page)
@@ -172,7 +184,7 @@ async def test_all_streams_resume_and_documents_return_once(harness, rerank):
 
 async def test_rejected_summary_later_chunk_and_pending_competition(harness):
     h = harness(documents=[doc("a"), doc("b"), doc("c")],
-                native=[[], [ChunkHit("c", {}, 1, None, 0, 1)], [ChunkHit("a", {}, 1, None, 0, 1)]])
+                native=[[], [ChunkHit("c", {}, 1, None, 0, 3)], [ChunkHit("a", {}, 1, None, 0, 3)]])
     h.scores = {"a": 0.9, "b": 0.8, "c": 0.4, "c:0": 0.95}
     first = await h.search("q", limit=1, document_candidate_limit=3, chunk_candidate_limit=1)
     assert names(first) == ["a"]
@@ -341,7 +353,7 @@ async def test_preparation_and_assembly_have_bounded_retries(harness):
     h = harness(documents=[doc("bad"), doc("good")], chunks=[ChunkHit("missing", {}, 1, None, 0, 1)])
     async def missing(*args, **kwargs):
         raise OSError("gone")
-    h.source.fetch_chunk = missing
+    h.source.fetch_document = missing
     h.fail_assembly.add("bad")
     page = await h.search("q", limit=3)
     assert names(page) == ["good"] and page.warnings
@@ -409,7 +421,7 @@ async def test_uneven_native_offsets_are_source_owned(harness):
         if len(positions) == 1:
             return NativeSearchBatch([], 17, 0)
         if len(positions) == 2:
-            return NativeSearchBatch([ChunkHit("a", {}, 1, None, 0, 1)], 17, 33)
+            return NativeSearchBatch([ChunkHit("a", {}, 1, None, 0, 3)], 17, 33)
         return None
     h.source.native_search = native
     page = await h.search("q")

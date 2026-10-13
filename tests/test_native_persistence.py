@@ -64,20 +64,28 @@ async def test_refresh_failure_and_deletion_are_atomic(test_context, tmp_path, m
         assert kept.last_modified == old_mtime
         assert kept.summary == original.summary
     monkeypatch.setattr(indexer, "_embed_batch", original_embed)
-    await indexer.maintain_collection(source)
+    # The handle cache is process-local. A document whose handle is already
+    # cached is not re-checked within this process: its (stale) mtime is
+    # accepted, and change/deletion are noticed by a fresh process, which
+    # starts with an empty cache. A new source simulates that restart.
+    _, fresh_source = make_indexer(test_context, tmp_path)
+    await indexer.maintain_collection(fresh_source)
     await indexer.wait_for_idle()
-    async with source.context.get_session() as session:
+    async with fresh_source.context.get_session() as session:
         current = await session.get(Document, (source.id, path.name))
-        assert current.last_modified == (await source.fetch_document(path.name)).last_modified
-        assert current.summary == ""
+        assert current.last_modified == (await fresh_source.fetch_document(path.name)).last_modified
+        # The refresh cleared the stale summary, and the completion trigger
+        # regenerated it (from the handle summary) while the refresh settled.
+        assert current.summary == original.summary
         assert not (await session.execute(select(ChunkSummary))).scalars().all()
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
         assert len(chunks) == 1
         assert chunks[0].summary_span is None
-    await indexer._record_failure(source, path.name, "old failure")
+    await indexer._record_failure(fresh_source, path.name, "old failure")
     path.unlink()
-    await indexer.maintain_collection(source)
-    async with source.context.get_session() as session:
+    _, fresh_source2 = make_indexer(test_context, tmp_path)
+    await indexer.maintain_collection(fresh_source2)
+    async with fresh_source2.context.get_session() as session:
         for model in (Document, DocumentChunk, ChunkSummary, FailedDocument):
             assert not (await session.execute(select(model))).scalars().all()
 
@@ -99,6 +107,9 @@ async def test_collection_rename_preserves_local_ids(test_context, tmp_path):
         chunks = (await session.execute(select(DocumentChunk))).scalars().all()
         assert chunks[0].chunk_id == "article.txt?c=0"
         assert chunks[0].collection_id == "renamed"
+    # The indexing trigger scheduled a summary task; let it settle before
+    # the test's database fixture is torn down.
+    await indexer.wait_for_idle()
 
 
 async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_path, monkeypatch):
@@ -124,6 +135,9 @@ async def test_summary_submissions_cross_semantic_boundaries(test_context, tmp_p
             select(ChunkSummary).order_by(ChunkSummary.summary_span)
         )).scalars().all()
         assert [s.summary for s in summaries] == ["Summary: " + c.text for c in chunks]
+    # Chunk summarization triggered a document summary task; settle it
+    # before teardown.
+    await indexer.wait_for_idle()
 
 
 async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, monkeypatch):
@@ -141,6 +155,9 @@ async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, mon
     async with source.context.get_session() as session:
         document = await session.get(Document, (source.id, pointer.document_id))
         assert document.keywords == ["good-key"]
+    # Indexing triggered a document summary task; settle it before the
+    # test's database fixture is torn down.
+    await indexer.wait_for_idle()
 
 
 async def test_manual_migration_from_legacy_constraints(test_context, pg_url):

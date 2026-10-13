@@ -47,14 +47,13 @@ async def test_wikipedia_raw_text_round_trip(tmp_path, monkeypatch):
     assert len(semantic) == 2
     assert "".join("".join(parts) for _, parts in semantic) == text
     for meta, parts in semantic:
-        assert await pointer.fetch_chunk(meta) == "".join(parts)
-        semantic_text = "".join(parts)
+        semantic_text = await pointer.fetch_chunk(meta)
+        assert semantic_text == "".join(parts)
         offset = 0
         for embedding_text in create_embedding_chunks(parts, 1, 8):
-            assert await source.fetch_chunk(
-                pointer.document_id, meta, "embedding",
-                offset=offset, length=len(embedding_text),
-            ) == embedding_text
+            # Embedding chunks partition the semantic text; retrieval call
+            # sites slice the span from the semantic text.
+            assert semantic_text[offset:offset + len(embedding_text)] == embedding_text
             offset += len(embedding_text)
 
 

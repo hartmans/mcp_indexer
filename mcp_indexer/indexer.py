@@ -5,17 +5,19 @@ import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from mcp_indexer.context import Context
 from mcp_indexer.llm import VECTOR_DIMENSIONS
-from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, FailedDocument, deserialize_metadata
-from mcp_indexer.plugins.base import DocumentSource, DocumentNotFoundError, create_embedding_chunks
+from mcp_indexer.models import ChunkSummary, Document, DocumentChunk, FailedDocument, IndexingWork, deserialize_metadata
+from mcp_indexer.plugins.base import DocumentHandle, DocumentSource, DocumentNotFoundError, create_embedding_chunks
+from mcp_indexer.retrieval import fetch_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,14 @@ class Indexer:
         self._running_documents: dict[asyncio.Task, DocumentIndexingStats] = {}
         self._monitor_task: Optional[asyncio.Task] = None
         self._debug_stats_path = Path(DEBUG_STATS_FILENAME)
+        # One in-flight document summary run per (collection, document);
+        # triggers and the catch-up scan schedule at most one run, and the
+        # on-demand walk joins a run instead of duplicating it.
+        self._in_flight_summaries: dict[tuple[str, str], asyncio.Task] = {}
+        self._summary_lock = asyncio.Lock()
+        # Pass-level document summarization; the trigger consults it. The MCP
+        # path runs no passes and treats summarization as enabled.
+        self._document_summaries_enabled = True
 
     def _require_built_collections(self) -> None:
         if not self.context.collections:
@@ -130,7 +140,12 @@ class Indexer:
             return set(result.scalars().all())
 
     async def _record_failure(self, source: DocumentSource, document_id: str, reason: str) -> None:
-        """Record a failure for a document."""
+        """Record a failure for a document.
+
+        Also retires any pending work entry targeting the failed document:
+        handled failures are recorded, not retried, and must not block the
+        parent's summarization readiness or reappear on every restart.
+        """
         async with self.context.get_session() as session:
             failed = FailedDocument(
                 collection_id=source.id,
@@ -138,7 +153,14 @@ class Indexer:
                 failure_reason=reason,
             )
             await session.merge(failed)
+            await session.execute(delete(IndexingWork).where(
+                IndexingWork.collection_id == source.id,
+                IndexingWork.document_id == document_id,
+            ))
             await session.commit()
+        # A failed target no longer blocks its parent's readiness (failed
+        # children are excluded), so the parent may be ready right now.
+        await self._trigger_document_summary(source, document_id, for_parent=True)
 
     async def index_all(
         self,
@@ -149,6 +171,10 @@ class Indexer:
         maintenance: bool = False,
     ):
         await self.context.build_collections()
+        # Pass-level document summarization; completion triggers consult it,
+        # so a pass with summarize_documents off stays silent about document
+        # summaries even while its indexing and chunk work completes.
+        self._document_summaries_enabled = summarize_documents
         loops = []
         for source in self.context.collections.values():
             if maintenance:
@@ -167,6 +193,9 @@ class Indexer:
     async def index_collection(self, source: DocumentSource):
         if source.indexing_mode != "full":
             return
+        # Durable work published by earlier parent commits (and not yet
+        # retired) is processed first, then source discovery proceeds.
+        await self._index_pending_work(source)
         pointers = []
         async for pointer in source.get_documents(last_modified=None):
             pointers.append(pointer)
@@ -175,6 +204,46 @@ class Indexer:
                 pointers = []
         if pointers:
             await self._index_discovered_documents(source, pointers)
+
+    async def _index_pending_work(self, source: DocumentSource) -> None:
+        """Process pending indexing_work rows until none remain.
+
+        Work rows are created atomically with a parent's commit; the parent
+        then schedules its children directly. Rows therefore survive only
+        across process stops, so this pass is the recovery path. Each batch
+        is awaited before the next scan: every row seen at the start of an
+        iteration is retired by the end of its gather (the index commit or
+        the failure record retires it), and newly published rows come only
+        from the batch just awaited, so the pass is bounded by the trees it
+        recovers.
+        """
+        while True:
+            async with self.context.get_session() as session:
+                rows = (await session.execute(
+                    select(IndexingWork.document_id)
+                    .where(IndexingWork.collection_id == source.id)
+                    .order_by(IndexingWork.document_id)
+                    .limit(256),
+                )).scalars().all()
+            if not rows:
+                return
+            failed_docs = await self._get_failed_documents(source)
+            tasks = []
+            for document_id in rows:
+                task = await self._index_work_row(source, document_id, failed_docs)
+                if task is not None:
+                    tasks.append(task)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _retire_work(self, source: DocumentSource, document_id: str) -> None:
+        """Delete the pending work entry targeting document_id, if any."""
+        async with self.context.get_session() as session:
+            await session.execute(delete(IndexingWork).where(
+                IndexingWork.collection_id == source.id,
+                IndexingWork.document_id == document_id,
+            ))
+            await session.commit()
 
     async def _index_discovered_documents(self, source: DocumentSource, pointers) -> None:
         document_ids = [pointer.document_id for pointer in pointers]
@@ -248,13 +317,40 @@ class Indexer:
     async def ensure_document_indexed(
         self, source: DocumentSource, document_id: str, *, retry_failed: bool = False,
     ) -> None:
-        """Persist a local document ID if absent; never probe an existing document."""
+        """Persist a local document ID if absent; never probe an existing document.
+
+        A child row implies its parent row exists, so when the requested ID
+        has no ancestors in the database the missing ancestors are indexed
+        first, from the root down to the requested child. Sibling subtrees
+        are not completed; they remain ordinary discovered child work.
+        """
         async with self.context.get_session() as session:
             if await session.get(Document, (source.id, document_id)) is not None:
                 return
+        # Walk up the ID hierarchy, collecting missing ancestors.
+        missing_ancestors: list[str] = []
+        node = document_id
+        while True:
+            parent, _, _ = node.rpartition(":")
+            if not parent:
+                break
+            async with self.context.get_session() as session:
+                if await session.get(Document, (source.id, parent)) is not None:
+                    break
+            missing_ancestors.append(parent)
+            node = parent
+        for ancestor in reversed(missing_ancestors):
+            await self._ensure_document_row(source, ancestor, retry_failed=retry_failed)
+        await self._ensure_document_row(source, document_id, retry_failed=retry_failed)
+
+    async def _ensure_document_row(
+        self, source: DocumentSource, document_id: str, *, retry_failed: bool = False,
+    ) -> None:
+        """Index a single document ID (callers establish ancestor rows)."""
+        async with self.context.get_session() as session:
             failure = await session.get(FailedDocument, (source.id, document_id))
-            if failure is not None and not retry_failed:
-                raise RuntimeError(f"Previously failed document {document_id}: {failure.failure_reason}")
+        if failure is not None and not retry_failed:
+            raise RuntimeError(f"Previously failed document {document_id}: {failure.failure_reason}")
         try:
             await self.index_document(
                 await source.fetch_document(document_id),
@@ -300,107 +396,273 @@ class Indexer:
     async def summarize_results(
         self, collection_id: str, document_ids: Iterable[str]
     ) -> None:
+        """Bring the requested documents' summary trees to summarized state.
+
+        Each requested document is indexed first (establishing its row and
+        its ancestors'), and its tree is then summarized bottom-up to the
+        ultimate parent -- the full subtree, since a parent's summary is
+        built from its children's. The walk awaits only the work it
+        initiates (and runs already in flight for the same document); it
+        never waits on the process idle mechanism, and duplicate work with
+        concurrently scheduled runs is accepted. Failed documents follow the
+        general failure rules.
+        """
         document_ids = set(document_ids)
         if not document_ids:
             return
 
         source = self.context.collections[collection_id]
         failed_docs = await self._get_failed_documents(source)
+        for document_id in sorted(document_ids):
+            if document_id in failed_docs:
+                continue
+            await self.ensure_document_indexed(source, document_id)
 
-        async with self.context.get_session() as session:
-            stmt = (
-                select(DocumentChunk.document_id)
-                .where(
-                    DocumentChunk.collection_id == collection_id,
-                    DocumentChunk.document_id.in_(document_ids),
-                    DocumentChunk.summary_span.is_(None),
-                )
-                .distinct()
-                .order_by(DocumentChunk.document_id)
-            )
-            if failed_docs:
-                stmt = stmt.where(DocumentChunk.document_id.not_in(failed_docs))
-            result = await session.execute(stmt)
-            pending_document_ids = result.scalars().all()
+        live_ids = sorted(document_ids - failed_docs)
+        ultimates = sorted({
+            await self._ultimate_parent(source, document_id)
+            for document_id in live_ids
+        })
+        for ultimate in ultimates:
+            await self._summarize_subtree(source, ultimate)
 
+    async def _ultimate_parent(self, source: DocumentSource, document_id: str) -> str:
+        """Walk the stored parent chain up to the root of the tree."""
+        node = document_id
+        while True:
+            async with self.context.get_session() as session:
+                doc = await session.get(Document, (source.id, node))
+            parent = doc.parent_document_id if doc is not None else None
+            if parent is None:
+                return node
+            node = parent
 
-            # Check which documents have an empty summary.
-            needs_doc_summary: set[str] = set()
-            doc_stmt = (
-                select(Document.document_id)
-                .where(
-                    Document.collection_id == collection_id,
-                    Document.document_id.in_(document_ids),
-                    Document.summary == "",
-                )
-            )
-            if failed_docs:
-                doc_stmt = doc_stmt.where(Document.document_id.not_in(failed_docs))
-            result = await session.execute(doc_stmt)
-            needs_doc_summary = set(result.scalars().all())
+    async def _summarize_subtree(self, source: DocumentSource, document_id: str) -> None:
+        """Converge the document's subtree to summarized state, bottom-up.
 
-        tasks = []
-        for document_id in pending_document_ids:
-            stats = DocumentIndexingStats(
-                document_id=document_id, operation="chunk_summary", source=source
-            )
-            tasks.append(
-                self._schedule_unbounded_document_task(
-                    self.summarize_document_chunks(source, document_id),
-                    stats,
-                )
-            )
-
-        await asyncio.gather(*tasks)
-        tasks = []
-
-        # After chunk-level summaries are done, summarize the document itself.
-        for document_id in needs_doc_summary:
-            stats = DocumentIndexingStats(
-                document_id=document_id, operation="document_summary", source=source
-            )
-            tasks.append(
-                self._schedule_unbounded_document_task(
-                self.summarize_document(source, document_id),
-                stats,
-            ))
-
-        await asyncio.gather(*tasks)
-
-    async def summarize_documents_collection(self, source: DocumentSource):
-        # Get set of failed document_ids to skip
+        Pending child work is indexed first, the children's subtrees are
+        converged, then the document's own chunk summaries and document
+        summary run. A summary that is not ready when it runs simply yields
+        no summary (the readiness gate is not overridden); completion
+        triggers keep the tree converging in the background.
+        """
         failed_docs = await self._get_failed_documents(source)
-        
+        if document_id in failed_docs:
+            return
+        await self._index_subtree_work(source, document_id)
+        async with self.context.get_session() as session:
+            child_ids = (await session.execute(
+                select(Document.document_id).where(
+                    Document.collection_id == source.id,
+                    Document.parent_document_id == document_id,
+                )
+            )).scalars().all()
+        if child_ids:
+            await asyncio.gather(*(
+                self._summarize_subtree(source, child_id)
+                for child_id in child_ids
+            ))
+        await self._summarize_result_chunks(source, document_id)
+        async with self.context.get_session() as session:
+            needs_summary = (await session.execute(
+                select(Document.summary).where(
+                    Document.collection_id == source.id,
+                    Document.document_id == document_id,
+                )
+            )).scalar_one_or_none()
+        if needs_summary == "":
+            await self._run_document_summary(
+                source, document_id, bounded=False, join=True,
+            )
+
+    async def _index_subtree_work(
+        self, source: DocumentSource, document_id: str,
+    ) -> None:
+        """Index the document's pending direct-child work targets, awaited.
+
+        The work rows were published atomically with the parent's last
+        index commit; each target is resolved once here, and its row retires
+        with the index commit (or the failure record). Index failures are
+        absorbed: the failed target is excluded from the tree per the
+        general failure rules.
+        """
+        async with self.context.get_session() as session:
+            rows = (await session.execute(
+                select(IndexingWork.document_id).where(
+                    IndexingWork.collection_id == source.id,
+                    IndexingWork.parent_document_id == document_id,
+                )
+            )).scalars().all()
+        if not rows:
+            return
+        failed_docs = await self._get_failed_documents(source)
+        tasks = []
+        for child_id in rows:
+            task = await self._index_work_row(source, child_id, failed_docs, bounded=False)
+            if task is not None:
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _index_work_row(
+        self,
+        source: DocumentSource,
+        document_id: str,
+        failed_docs: set[str],
+        *,
+        bounded: bool = True,
+    ) -> asyncio.Task | None:
+        """Resolve one pending work row targeting document_id.
+
+        Retires the row when the target is failed, gone, or unchanged since
+        it was last indexed; otherwise schedules an index and returns the
+        task. The row retires atomically with the index commit (or the
+        failure record).
+        """
+        if document_id in failed_docs:
+            # Failure exclusion: a failed target never stalls a parent or
+            # reappears on every restart.
+            await self._retire_work(source, document_id)
+            return None
+        try:
+            pointer = await source.fetch_document(document_id)
+        except DocumentNotFoundError:
+            # The child is gone; the parent's next successful enumeration
+            # (or maintenance) reconciles any row.
+            await self._retire_work(source, document_id)
+            return None
+        async with self.context.get_session() as session:
+            stored = await session.get(Document, (source.id, document_id))
+        if stored is not None and stored.last_modified == pointer.last_modified:
+            # Unchanged since it was indexed; the work is done.
+            await self._retire_work(source, document_id)
+            return None
+        stats = DocumentIndexingStats(
+            document_id=document_id, operation="index", source=source,
+        )
+        if bounded:
+            return await self._schedule_document_task(
+                self.index_document(pointer, stats), stats,
+            )
+        return self._schedule_unbounded_document_task(
+            self.index_document(pointer, stats), stats,
+        )
+
+    async def _summarize_result_chunks(
+        self, source: DocumentSource, document_id: str,
+    ) -> None:
+        """Chunk-level summaries for one document, awaited to completion."""
         async with self.context.get_session() as session:
             result = await session.execute(
-                select(Document).where(
+                select(DocumentChunk.document_id).where(
+                    DocumentChunk.collection_id == source.id,
+                    DocumentChunk.document_id == document_id,
+                    DocumentChunk.summary_span.is_(None),
+                ).distinct()
+            )
+            needs_chunks = result.first() is not None
+        if not needs_chunks:
+            return
+        stats = DocumentIndexingStats(
+            document_id=document_id, operation="chunk_summary", source=source,
+        )
+        task = self._schedule_unbounded_document_task(
+            self.summarize_document_chunks(source, document_id), stats,
+        )
+        await task
+
+    async def _summarization_ready(self, source: DocumentSource, document_id: str) -> bool:
+        """Tree readiness for bottom-up document summarization.
+
+        Ready when no work entry targets the document or any descendant
+        (failed targets retire their work entries when the failure is
+        recorded, so they neither block nor retry) and every non-failed
+        child row has a summary. Never waits; a not-ready document is left
+        for a completion trigger or a later pass.
+        """
+        if await self._has_pending_subtree_work(source, document_id):
+            return False
+        failed_docs = await self._get_failed_documents(source)
+        async with self.context.get_session() as session:
+            rows = (await session.execute(
+                select(Document.document_id, Document.summary).where(
+                    Document.collection_id == source.id,
+                    Document.parent_document_id == document_id,
+                )
+            )).all()
+        for child_id, child_summary in rows:
+            if child_id in failed_docs:
+                continue
+            if child_summary == "":
+                return False
+        return True
+
+    async def _has_pending_subtree_work(
+        self, source: DocumentSource, document_id: str
+    ) -> bool:
+        """True while any work entry targets the document or a descendant.
+
+        Descendant IDs extend the document's ID with hierarchy separators,
+        so the exact ID plus a prefix match covers the subtree; LIKE
+        metacharacters in the ID are escaped.
+        """
+        escaped = (
+            document_id.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        async with self.context.get_session() as session:
+            result = await session.execute(
+                select(IndexingWork.document_id).where(
+                    IndexingWork.collection_id == source.id,
+                    or_(
+                        IndexingWork.document_id == document_id,
+                        IndexingWork.document_id.like(
+                            f"{escaped}:%", escape="\\",
+                        ),
+                    ),
+                ).limit(1)
+            )
+            return result.first() is not None
+
+    async def summarize_documents_collection(self, source: DocumentSource):
+        """Single catch-up pass: schedule a summary for every doc ready now.
+
+        Not a pump: documents that become ready while this pass's tasks run
+        are picked up by the completion triggers (which fire on the parent
+        when a child's summary lands), and work that finished in an earlier
+        process is caught here because triggers are process-local. The pass
+        boundary's wait_for_idle converges the tasks the triggers schedule.
+        Failed documents follow the general failure rules and are excluded.
+        """
+        failed_docs = await self._get_failed_documents(source)
+        async with self.context.get_session() as session:
+            result = await session.execute(
+                select(Document.document_id).where(
                     Document.collection_id == source.id,
                     Document.summary == "",
                 )
             )
-            documents = result.scalars().all()
-
-        if not documents:
-            return
-
-        # Filter out failed documents
-        document_ids = sorted(d.document_id for d in documents if d.document_id not in failed_docs)
-        for document_id in document_ids:
-            stats = DocumentIndexingStats(
-                document_id=document_id, operation="document_summary", source=source
-            )
-            await self._schedule_document_task(
-                self.summarize_document(source, document_id),
-                stats,
+            candidates = result.scalars().all()
+        for document_id in candidates:
+            if document_id in failed_docs:
+                continue
+            if not await self._summarization_ready(source, document_id):
+                continue
+            await self._run_document_summary(
+                source, document_id, bounded=True, join=False,
             )
 
-        await self.wait_for_idle()
-
-    async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> None:
-        await self.sem.acquire()
+    async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> asyncio.Task:
+        # Slot acquisition happens inside the task, not here: a parent that
+        # schedules its children while holding its own slot must not block on
+        # a child's slot acquisition (with one slot that would deadlock).
+        # Descendant work still participates in the same semaphore pool, task
+        # tracking, and idle machinery.
         task = asyncio.create_task(self._run_with_semaphore(coro, stats))
         self._track_task(task, stats)
         task.add_done_callback(self._on_task_done)
+        return task
 
     def _schedule_unbounded_document_task(
         self, coro, stats: DocumentIndexingStats
@@ -411,6 +673,7 @@ class Indexer:
         return task
 
     async def _run_with_semaphore(self, coro, stats: DocumentIndexingStats):
+        await self.sem.acquire()
         try:
             return await coro
         except Exception as e:
@@ -418,6 +681,74 @@ class Indexer:
             raise
         finally:
             self.sem.release()
+
+    async def _run_document_summary(
+        self,
+        source: DocumentSource,
+        document_id: str,
+        *,
+        bounded: bool = True,
+        join: bool = True,
+    ) -> bool | None:
+        """Run summarize_document on the document, at most once at a time.
+
+        The in-flight map holds one summary run per (collection, document):
+        triggers and the catch-up scan schedule at most one run, and the
+        on-demand walk joins a run already in flight instead of duplicating
+        it. The entry is removed unconditionally when the run completes,
+        success or failure. With ``join`` the call awaits the run and returns
+        whether a summary was committed; otherwise it returns once the run is
+        scheduled.
+        """
+        key = (source.id, document_id)
+        async with self._summary_lock:
+            task = self._in_flight_summaries.get(key)
+            if task is None or task.done():
+                stats = DocumentIndexingStats(
+                    document_id=document_id, operation="document_summary",
+                    source=source,
+                )
+                coro = self.summarize_document(source, document_id)
+                if bounded:
+                    task = await self._schedule_document_task(coro, stats)
+                else:
+                    task = self._schedule_unbounded_document_task(coro, stats)
+                self._in_flight_summaries[key] = task
+                task.add_done_callback(
+                    lambda _t, k=key, t=task: (
+                        self._in_flight_summaries.pop(k, None)
+                        if self._in_flight_summaries.get(k) is t else None
+                    ),
+                )
+        if not join:
+            return None
+        try:
+            return bool(await task)
+        except Exception:
+            # The failure is recorded by the task's done handling; a failed
+            # run simply yields no summary.
+            return False
+
+    async def _trigger_document_summary(
+        self, source: DocumentSource, document_id: str, *, for_parent: bool,
+    ) -> None:
+        """Completion trigger.
+
+        When content work succeeds on a document -- or a failure is recorded
+        for one -- exactly one document's summary readiness just changed: the
+        document itself for its own indexing/chunk work, its parent for a
+        finished (or failed) child. If document summarization is enabled for
+        this run, schedule a summary on it; the in-flight map deduplicates
+        against concurrent triggers.
+        """
+        if not self._document_summaries_enabled:
+            return
+        if for_parent:
+            parent = self._parent_of(document_id)
+            if parent is None:
+                return
+            document_id = parent
+        await self._run_document_summary(source, document_id, bounded=True, join=False)
 
     def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
         self._running_documents[task] = stats
@@ -583,6 +914,7 @@ class Indexer:
                     document_id=pointer.document_id,
                     order=order,
                     chunk_id=f"{pointer.document_id}?c={order}",
+                    text=e_text if pointer.save_text else None,
                     embedding=embedding,
                     summary_span=None,
                     semantic_chunk_id=semantic_chunk_id,
@@ -593,21 +925,90 @@ class Indexer:
                 )
             )
 
+        # Enumerate the immediate subdocuments. Their work entries are
+        # published atomically with this document's own rows, and a
+        # complete enumeration is what permits reconciling removed
+        # children. An enumeration failure propagates through the general
+        # failure handling; it never establishes absence.
+        child_handles: list[DocumentHandle] = [
+            child async for child in pointer.get_sub_documents()
+        ]
+
         metadata_dict = await pointer.get_metadata()
         doc_record = Document(
             collection_id=source.id,
             document_id=pointer.document_id,
+            parent_document_id=self._parent_of(pointer.document_id),
             title=metadata_dict.get("title", "Untitled"),
             title_strength=int(metadata_dict.get("title_strength", 0)),
             last_modified=pointer.last_modified,
             summary="",
             embedding=[0.0] * VECTOR_DIMENSIONS,
             keywords=normalize_keywords(metadata_dict.get("keywords", [])),
+            metadata_dict={
+                key: value
+                for key, value in metadata_dict.items()
+                if key not in ("title", "title_strength", "keywords", "last_modified")
+            },
         )
         # Attach chunks to document; the merge cascades them on insert and
         # replaces the previous chunk set on refresh.
         doc_record.chunks = all_chunks
-        await self._index_document(source, doc_record)
+        # Existing child mtimes are read before the commit so the
+        # post-commit scheduling below can skip unchanged children.
+        stored_children = await self._direct_child_mtimes(source, pointer.document_id)
+        await self._index_document(
+            source, doc_record,
+            child_ids=[child.document_id for child in child_handles],
+        )
+
+        # Post-commit scheduling: reuse the already-enumerated handles
+        # (the process-local cache keeps them cheap) through the existing
+        # semaphore-limited task machinery, without waiting for child slot
+        # acquisition or completion. Failure exclusion applies here as
+        # well as to restart work.
+        failed_docs = await self._get_failed_documents(source)
+        for child in child_handles:
+            child_id = child.document_id
+            if child_id in failed_docs:
+                continue
+            stored_mtime = stored_children.get(child_id)
+            if stored_mtime is not None and stored_mtime == child.last_modified:
+                continue
+            stats = DocumentIndexingStats(
+                document_id=child_id, operation="index", source=source,
+            )
+            await self._schedule_document_task(
+                self.index_document(child, stats), stats,
+            )
+        # Indexing complete: this document's own summary inputs may now
+        # exist (a summary-only leaf, or freshly ingested chunks).
+        await self._trigger_document_summary(
+            source, pointer.document_id, for_parent=False,
+        )
+
+    @staticmethod
+    def _parent_of(document_id: str) -> str | None:
+        """The parent ID of a collection-local ID, or None for a root.
+
+        The rightmost hierarchy separator (``:``) separates a child from
+        its parent; the parent is always an exact ID prefix of the child.
+        """
+        parent, _, _ = document_id.rpartition(":")
+        return parent or None
+
+    async def _direct_child_mtimes(
+        self, source: DocumentSource, document_id: str
+    ) -> dict[str, datetime]:
+        """Stored last_modified values of the direct children with rows."""
+        async with self.context.get_session() as session:
+            rows = (await session.execute(
+                select(Document.document_id, Document.last_modified).where(
+                    Document.collection_id == source.id,
+                    Document.parent_document_id == document_id,
+                )
+            )).all()
+        return {row[0]: row[1] for row in rows}
 
     async def summarize_document_chunks(
         self, source: DocumentSource, document_id: str
@@ -666,6 +1067,10 @@ class Indexer:
                     chunk.summary_span = span_index
             doc.summaries = doc_summaries
             await session.commit()
+        # Span summaries are the document's own summary inputs.
+        await self._trigger_document_summary(
+            source, document_id, for_parent=False,
+        )
         return True
 
     async def summarize_document(
@@ -676,20 +1081,63 @@ class Indexer:
                 Document, (source.id, document_id),
                 options=[selectinload(Document.summaries)],
             )
+            child_rows = (await session.execute(
+                select(Document.document_id, Document.summary).where(
+                    Document.collection_id == source.id,
+                    Document.parent_document_id == document_id,
+                )
+            )).all()
         if doc is None:
+            return False
+        # Tree readiness: descendant work has completed or failed, and
+        # available child summaries have been produced. The check never
+        # waits, so it holds no semaphore slot that descendants need; a
+        # not-ready document is left for a later round.
+        if not await self._summarization_ready(source, document_id):
             return False
         expected_mtime = doc.last_modified
         pointer = await source.fetch_document(document_id)
         metadata_dict = await pointer.get_metadata()
 
         doc_summary = await pointer.get_document_summary()
-        if not doc_summary:
+        child_summaries = [
+            (child_id, child_summary)
+            for child_id, child_summary in child_rows
+            if child_summary
+        ]
+        # Summary-only documents (e.g. an image) use the handle-provided
+        # summary as-is, with no second LLM pass over it. Everything else is
+        # composed by the LLM from the available inputs below; a
+        # handle-provided summary never bypasses child-summary incorporation
+        # for a parent with subdocuments.
+        if not (doc_summary and not child_summaries):
             span_summaries = [s.summary for s in sorted(
                 doc.summaries, key=lambda s: s.summary_span
             ) if s.summary]
-            if not span_summaries:
+            sections: list[str] = []
+            if doc_summary:
+                # Handles supply a bounded excerpt, not the full text;
+                # label it as such.
+                sections.append(
+                    f"Excerpt of the document's text:\n{doc_summary}"
+                )
+            if span_summaries:
+                sections.append(
+                    "Summaries of parts of the document:\n"
+                    + "\n\n".join(span_summaries)
+                )
+            if child_summaries:
+                # Descendant information propagates through immediate-child
+                # summaries, not by flattening the whole tree.
+                sections.append(
+                    "Summaries of subdocuments within the document:\n"
+                    + "\n".join(
+                        f"{child_id}: {child_summary}"
+                        for child_id, child_summary in child_summaries
+                    )
+                )
+            if not sections:
                 return False
-            doc_summary_text = "\n\n".join(span_summaries)
             doc_summary_list = await self.context.llm(
                 [[
                     (
@@ -698,7 +1146,8 @@ class Indexer:
                     ),
                     (
                         "user",
-                        f"Write no more than two paragraphs to summarize the following document:\n\n{doc_summary_text}",
+                        "Write no more than two paragraphs to summarize the "
+                        "following document:\n\n" + "\n\n".join(sections),
                     ),
                 ]]
             )
@@ -751,10 +1200,22 @@ class Indexer:
             doc.keywords = (extracted_keywords if extracted_keywords else
                             normalize_keywords(metadata_dict.get("keywords", [])))
             await session.commit()
-            return True
+        # This summary is now an input to the parent's summary.
+        await self._trigger_document_summary(
+            source, document_id, for_parent=True,
+        )
+        return True
 
-    async def _index_document(self, source: DocumentSource, doc: Document) -> None:
-        """Persist the prepared document, fully replacing any previous version."""
+    async def _index_document(
+        self, source: DocumentSource, doc: Document, child_ids: list[str],
+    ) -> None:
+        """Persist the prepared document, fully replacing any previous version.
+
+        The document, its own chunk rows, and the ``indexing_work`` entries
+        for the enumerated child IDs are committed together. A complete
+        enumeration also reconciles removed children: their subtrees and
+        work entries are deleted in the same transaction.
+        """
         async with self.context.get_session() as session:
             # The transient clobbers the previous version: every field is
             # written, the chunk set is replaced (delete-orphan), and previous
@@ -763,6 +1224,9 @@ class Indexer:
             for _ in range(2):
                 try:
                     await session.merge(doc)
+                    await self._publish_child_work(
+                        session, source.id, doc.document_id, child_ids,
+                    )
                     await session.execute(delete(FailedDocument).where(
                         FailedDocument.collection_id == source.id,
                         FailedDocument.document_id == doc.document_id,
@@ -776,6 +1240,54 @@ class Indexer:
             raise RuntimeError(
                 f"Could not index {source.id}:{doc.document_id} after concurrent conflict"
             )
+
+    async def _publish_child_work(
+        self, session, collection_id: str, document_id: str, child_ids: list[str],
+    ) -> None:
+        """Reconcile and publish child work within the parent's transaction.
+
+        Successful enumeration permits deletion: direct children absent from
+        the enumeration lose their Document subtrees (the parent FK cascades)
+        and their work entries. The document's own pending work is retired,
+        and a work entry is (re)published for every discovered child --
+        including children with rows or failures, which selection-time
+        exclusion handles.
+        """
+        if child_ids:
+            stmt = select(Document.document_id).where(
+                Document.collection_id == collection_id,
+                Document.parent_document_id == document_id,
+                Document.document_id.not_in(child_ids),
+            )
+        else:
+            stmt = select(Document.document_id).where(
+                Document.collection_id == collection_id,
+                Document.parent_document_id == document_id,
+            )
+        stale_children = (await session.execute(stmt)).scalars().all()
+        if stale_children:
+            await session.execute(delete(IndexingWork).where(
+                IndexingWork.collection_id == collection_id,
+                IndexingWork.document_id.in_(stale_children),
+            ))
+            # The Document rows; fk_document_parent's ON DELETE CASCADE removes
+            # each child's subtree, chunks, summaries, and work entries where
+            # it is the parent.
+            await session.execute(delete(Document).where(
+                Document.collection_id == collection_id,
+                Document.document_id.in_(stale_children),
+            ))
+        # The document's own pending work is complete with this commit.
+        await session.execute(delete(IndexingWork).where(
+            IndexingWork.collection_id == collection_id,
+            IndexingWork.document_id == document_id,
+        ))
+        for child_id in child_ids:
+            await session.merge(IndexingWork(
+                collection_id=collection_id,
+                document_id=child_id,
+                parent_document_id=document_id,
+            ))
 
     async def _reconstruct_semantic_chunks(
         self, source: DocumentSource, document_id: str
@@ -792,27 +1304,15 @@ class Indexer:
         document_rows.sort(key=lambda row: row.order)
 
         grouped_rows: dict[int, list[DocumentChunk]] = {}
-        grouped_metadata: dict[int, dict[str, Any]] = {}
         for row in document_rows:
-            key = row.semantic_chunk_id
-            grouped_rows.setdefault(key, []).append(row)
-            if key not in grouped_metadata:
-                # Every row in a semantic chunk carries the same source
-                # metadata; strip any chunk-level offsets from legacy rows.
-                grouped_metadata[key] = {
-                    k: v
-                    for k, v in self._deserialize_metadata(row.metadata_str).items()
-                    if k not in ("o", "s")
-                }
+            grouped_rows.setdefault(row.semantic_chunk_id, []).append(row)
 
         semantic_chunks = [
             ReconstructedSemanticChunk(
                 rows=rows,
-                text=await source.fetch_chunk(
-                    document_id, grouped_metadata[key], scope="semantic",
-                ),
+                text=await fetch_chunk(source, rows[0].chunk_id, scope="semantic"),
             )
-            for key, rows in grouped_rows.items()
+            for rows in grouped_rows.values()
         ]
         return semantic_chunks
 

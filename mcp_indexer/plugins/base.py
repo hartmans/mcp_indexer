@@ -1,9 +1,11 @@
+import asyncio
 import bisect
 import dataclasses
+import time
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Generic, List, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Generic, List, Literal, TypeVar, cast
 
 from ..context import SOURCE_REGISTRY
 
@@ -64,16 +66,10 @@ class DocumentHandle:
     source: "DocumentSource"
     document_id: str
     last_modified: datetime
-
-    @property
-    def save_text(self) -> bool:
-        """Whether the indexer should persist chunk text to the database.
-
-        Only ``False`` is supported today; enabling retention requires work
-        in both the write path (populating the text column) and the read path
-        (retrieving from it).
-        """
-        return False
+    # Whether the indexer persists each embedding chunk's exact text in
+    # ``DocumentChunk.text``. Output retention, independent of the bridge's
+    # input capabilities.
+    save_text: bool = False
 
     async def get_metadata(self) -> dict[str, str]:
         ...
@@ -103,8 +99,83 @@ class DocumentHandle:
         return
         yield
 
+    async def fetch_sub_document(self, document_id: str) -> "DocumentHandle":
+        """Resolve an immediate child by its full collection-local ID.
+
+        ``document_id`` is the child's complete collection-local ID; with the
+        final ``:`` component removed it is this handle's own
+        ``document_id``. The returned child handle retains that full ID and
+        uses it to identify its own descendants. The default reports the
+        child as absent; container documents override it.
+        """
+        raise DocumentNotFoundError(
+            document_id, f"has no subdocument {document_id.split(':')[-1]}"
+        )
+
     async def get_document_summary(self) -> str:
         ...
+
+
+class HandleCache:
+    """Process-local cache of :class:`DocumentHandle` objects.
+
+    Entries are keyed by full collection-local document ID and carry a
+    monotonic last-used timestamp, updated on insertion and on a cache hit.
+    Idle entries are evicted by a single recurring expiration callback
+    scheduled on the running event loop: at most one callback is scheduled
+    per cache, and it reschedules itself only while entries remain. Eviction
+    releases cache references without invalidating handles still held by
+    running work. This is idle expiration for memory management, not
+    source-freshness validation.
+    """
+
+    def __init__(self, *, interval: float = 300.0):
+        self._interval = interval
+        self._entries: dict[str, tuple[Any, float]] = {}
+        self._scheduled = False
+
+    def get(self, document_id: str) -> Any:
+        """Return the cached handle for ``document_id`` (refreshing its
+        last-used timestamp) or None if absent."""
+        entry = self._entries.get(document_id)
+        if entry is None:
+            return None
+        handle, _ = entry
+        self._entries[document_id] = (handle, time.monotonic())
+        return handle
+
+    def cache_document(self, handle: Any) -> None:
+        """Insert or refresh a handle, scheduling the idle-expiration
+        callback if one is not already scheduled."""
+        self._entries[handle.document_id] = (handle, time.monotonic())
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if self._scheduled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (synchronous context); the cache still works,
+            # it just performs no idle eviction.
+            return
+        self._scheduled = True
+        loop.call_later(self._interval, self._expire)
+
+    def _expire(self) -> None:
+        self._scheduled = False
+        now = time.monotonic()
+        stale = [
+            key for key, (_, last_used) in self._entries.items()
+            if now - last_used >= self._interval
+        ]
+        for key in stale:
+            del self._entries[key]
+        if self._entries:
+            self._schedule()
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 def create_embedding_chunks(
@@ -177,6 +248,9 @@ class DocumentSource(Generic[p]):
     reranker: "AbstractReranker | None"
     default_indexing_mode: Literal["full", "indexed"] = "full"
     separate_rerank: bool = False
+    # Idle-expiration interval (seconds) for the process-local handle cache.
+    # Overridable by tests.
+    handle_cache_interval: float = 300.0
 
     @property
     def indexing_mode(self) -> Literal["full", "indexed"]:
@@ -196,6 +270,7 @@ class DocumentSource(Generic[p]):
         self.reranker = reranker
         from ..search_state import SearchSessionStore
         self._search_sessions = SearchSessionStore()
+        self._handle_cache = HandleCache(interval=self.handle_cache_interval)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -207,14 +282,49 @@ class DocumentSource(Generic[p]):
         ...
 
     async def fetch_document(self, document_id: str) -> p:
-        """Resolve a local ID with current mtime; raise DocumentNotFoundError if absent.
+        """Resolve a full collection-local ID, root or nested subdocument.
 
-        Acquisition is async: resolving an ID may require asynchronous work
-        (for example, preparing content to establish that a subdocument
-        exists). The returned handle is durable and may be retained
+        A handle already in the process-local cache is returned directly.
+        Otherwise a root ID (no hierarchy separator) is acquired via
+        :meth:`_fetch_root`; an ID containing a ``:`` hierarchy separator is
+        split at the rightmost separator and resolved by acquiring the parent
+        (recursively) and delegating to the parent's handle-level
+        :meth:`DocumentHandle.fetch_sub_document`. The resolved handle is
+        cached before being returned. It is durable and may be retained
         independently of this call.
         """
+        cached = self._handle_cache.get(document_id)
+        if cached is not None:
+            return cached
+        parent_id, separator, _component = document_id.rpartition(":")
+        if not separator:
+            handle = await self._fetch_root(document_id)
+        else:
+            parent = await self.fetch_document(parent_id)
+            # A child resolved through this source is a handle of the same
+            # source; fetch_sub_document is typed against the base class.
+            handle = cast(p, await parent.fetch_sub_document(document_id))
+        self._handle_cache.cache_document(handle)
+        return handle
+
+    async def _fetch_root(self, document_id: str) -> p:
+        """Acquire a root (non-subdocument) document by its local ID.
+
+        Implemented by concrete sources. Resolve with the current mtime and
+        raise DocumentNotFoundError if the root is absent from an available
+        source. Acquisition is async: it may perform asynchronous work such
+        as preparing content.
+        """
         ...
+
+    def cache_document(self, handle: "DocumentHandle") -> None:
+        """Register a handle in this source's process-local cache.
+
+        Called by subdocument enumeration and any other producer of handles
+        so that later fetches of the same full collection-local ID reuse the
+        handle instead of re-acquiring it.
+        """
+        self._handle_cache.cache_document(handle)
 
     async def native_search(
         self, query: str, *, document_limit: int, chunk_limit: int,
@@ -237,32 +347,6 @@ class DocumentSource(Generic[p]):
         ranked list only.
         """
         return None
-
-    async def fetch_chunk(
-        self, document_id: str, chunk_metadata: dict[str, Any],
-        scope: Literal["semantic", "embedding"],
-        offset: int | None = None, length: int | None = None,
-    ) -> str:
-        """Fetch one chunk's text.
-
-        ``scope="semantic"`` returns the whole semantic chunk; the
-        chunk-level ``offset``/``length`` are ignored (callers may still
-        supply them, e.g. copied from a database row, for uniformity).
-        ``scope="embedding"`` returns the slice
-        ``semantic_text[offset:offset + length]``; both are required, in
-        characters, and an embedding fetch without them is an error.
-        """
-        handle = await self.fetch_document(document_id)
-        full_text = await handle.fetch_chunk(chunk_metadata)
-
-        if scope == "semantic":
-            return full_text
-
-        if offset is None or length is None:
-            raise ValueError(
-                "Embedding-scope fetch_chunk requires offset and length"
-            )
-        return full_text[offset:offset + length]
 
     def document_id(self, chunk_id: str) -> str:
         return chunk_id.rsplit("?", 1)[0]

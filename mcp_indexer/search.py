@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from .models import Document, DocumentChunk
+from .retrieval import fetch_chunk
 from .search_state import (
     HitRecord, InvalidSearchCursor, PageWork, SearchAdvanceError, SearchSession,
 )
@@ -185,10 +186,17 @@ async def _prepare_hit(indexer, collection, hit):
     if isinstance(hit, DocumentHit):
         text = hit.summary or await _document_summary(indexer, collection, hit.document_id)
         return replace(hit, summary=text), text
-    return hit, await collection.fetch_chunk(
-        hit.document_id, hit.chunk_metadata, scope="embedding",
-        offset=hit.embedding_offset, length=hit.embedding_length,
-    )
+    if hit.chunk_id is not None:
+        return hit, await fetch_chunk(collection, hit.chunk_id, scope="embedding")
+    # A metadata-only hit has no stored row: acquire the handle through the
+    # source cache and slice the requested embedding span from the semantic
+    # text. Indexing the candidate is not required to rerank it.
+    handle = await collection.fetch_document(hit.document_id)
+    semantic_text = await handle.fetch_chunk(hit.chunk_metadata)
+    offset, length = hit.embedding_offset, hit.embedding_length
+    if offset is None or length is None:
+        raise ValueError("Embedding-scope fetch requires offset and length")
+    return hit, semantic_text[offset:offset + length]
 
 
 async def _score_texts(reranker, query, texts):

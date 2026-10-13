@@ -8,7 +8,7 @@ DocumentHandle, async document acquisition, ContentBridge/FileBridge, DocumentPl
 
 Subdocument resolution and indexing, retained-text write/read paths, document metadata persistence, and the handle cache described below are target work, not claims about the current implementation. The current source-level fetch_chunk wrapper is replaced by the shared retrieval helper in this design.
 
-PDF is the next format to design; EPUB remains another motivating format. ZIP and notmuch are responsibility-boundary probes, not implementation requests. Format-specific decisions stay separate from the common infrastructure.
+DoclingDocument handles PDF and selected office formats, with ImageDocument children for extracted figures. These plugins and bottom-up tree summarization are part of the next spike. EPUB remains another motivating format; ZIP and notmuch remain responsibility-boundary probes, not implementation requests.
 
 ## Identity and hierarchy
 
@@ -44,7 +44,9 @@ Each source owns an in-memory cache keyed by full collection-local document_id. 
 
 This cache replaces the need for a document-bound chunk-reader object or caller-managed handle caches in retrieval. Text retained in the database can be returned without acquiring a handle at all.
 
-Cache eviction, expiration, resource-cost tuning, and concurrent-miss coordination are deferred until PDF/EPUB preparation requirements are understood. There is no refresh flag, freshness probe, or invalidation protocol required now. Stale handles during a process lifetime are accepted; discovering changes only after process restart is acceptable. This is not a snapshot guarantee for mutable underlying bytes. The existing maintenance path is not a constraint on this design and is not being redesigned here.
+Cache entries carry a monotonic last-used timestamp, updated on insertion and cache hits. When cache_document is called and no expiration handle is registered, the source schedules an expiration callback for 300 seconds later. The callback evicts entries unused for at least 300 seconds and registers another callback only if the cache remains nonempty. There is at most one scheduled expiration callback per source. The interval is overridable for tests. Eviction releases cache references; it does not invalidate handles still held by running work.
+
+This is idle expiration for memory management, not source-freshness validation. There is no refresh flag, freshness probe, or invalidation protocol required now. Stale handles are accepted; discovering changes only after process restart remains acceptable. This is not a snapshot guarantee for mutable underlying bytes. The existing maintenance path is not a constraint on this design and is not being redesigned here. Further resource-cost tuning and concurrent-miss coordination remain implementation considerations.
 
 ## Sources, plugins, and interpretation policy
 
@@ -55,7 +57,8 @@ DocumentHandle
     DocumentPlugin
         TextDocument
             WikipediaDocument
-        PdfDocument (to be designed)
+        DoclingDocument
+        ImageDocument
         EpubDocument (future)
 ```
 
@@ -130,7 +133,9 @@ Child work acquires the document through source.fetch_document, benefiting from 
 
 ### Scheduling
 
-Process pending indexing_work first when index_collection restarts, then proceed to source discovery. Do not interleave work-table queries into the discovery loop or complicate semaphore handling to implement fairness between the two streams. No same-run queue-draining guarantee is added by this scheduling decision.
+Process pending indexing_work first when index_collection restarts, then proceed to source discovery. After its own commit, index_document schedules its enumerated subdocuments through the existing semaphore-limited task machinery. This uses the already-enumerated children, not work-table polling inside the discovery loop, and allows reuse of prepared document content while handles are available. Durable work entries remain the recovery mechanism if the process stops between commit and scheduling or completion. Failure exclusion applies to post-commit scheduling as well as restart work.
+
+Parents schedule children without waiting for child slot acquisition or completion while holding their own semaphore slot. Descendant work participates in the existing task/idle tracking; do not introduce a separate child concurrency pool.
 
 ### Direct requests for descendants
 
@@ -139,6 +144,18 @@ Process pending indexing_work first when index_collection restarts, then proceed
 ### Consistency scope
 
 Do not add parent generations, subtree revision tokens, or special refresh coordination now. Work refers to an ID resolved through the normal acquisition path; it does not promise an old source version. Disappeared children are reconciled by successful parent enumeration. Existing source-change-during-indexing limitations and process-lifetime handle staleness are accepted. Maintenance redesign is deferred.
+
+## Bottom-up document summarization
+
+Document summarization waits until the tree is ready: descendant work has completed or failed, and available child summaries have been produced. Summaries are generated bottom-up, not provisionally regenerated on every child completion. Waiting for readiness must not hold a semaphore slot needed by descendants. Failed work follows the general failure rules rather than causing automatic retries or an indefinite readiness wait.
+
+Generic document summarization incorporates immediate-child summaries along with the document’s own available textual inputs. Prompt sections distinguish:
+
+- Full document text, when supplied (label excerpts as excerpts rather than full text).
+- Summaries of parts of the document: chunk summaries.
+- Summaries of subdocuments within the document: each child document_id paired with its summary.
+
+Use clear section boundaries and omit unavailable input sections. Descendant information propagates through immediate-child summaries rather than flattening the whole tree into every ancestor prompt. A handle-provided summary must not bypass child-summary incorporation for a parent with subdocuments. ImageDocument remains a summary-only leaf using get_document_summary. Partial conversion and incomplete enumeration follow the same generic indexing/failure rules as other documents; there is no separate Docling-specific partial-conversion policy.
 
 ## Content bridges and delegation
 
@@ -155,6 +172,24 @@ FileBridge reads real files and exposes their paths without copying. Reads own t
 A future AttachmentBridge can hold decoded attachment bytes, serve slices, and materialize a temporary path for scoped access. A future StreamBridge takes a producer coroutine, defers production until first content access, and retains output for reuse; production runs at most once per bridge instance. Pandoc output motivates this design. Exact producer result type, failure/cancellation semantics, concurrent production, and overlapping temporary-path lifetimes remain bridge implementation questions, not additional settled requirements.
 
 Keeping content in memory plus swap is accepted initially. Large real-file archives can remain file-backed; hypothetical nested archives do not justify a more complex streaming architecture now. Future bridges retaining live resources must define cleanup without invalidating handles when enumeration ends.
+
+### DoclingDocument and ImageDocument
+
+`plugins/docling.py` defines our DoclingDocument plugin (distinct from Docling's own result type). Register it for `.pdf`, `.docx`, `.odt`, `.ods`, `.ppt`, `.pptx`, `.doc`, and `.rtf` through the existing extension-policy mechanism.
+
+DoclingDocument consumes a ContentBridge and retains the processed representation in memory. Enable OCR using RapidOCR with its **PyTorch backend**, retain extracted figure images, and do not retain page images. Internal page rendering for OCR/extraction is not prohibited. Do not use Docling's vision-model enrichment/description support. Backend-specific extraction details are implementation choices; no separate PDF chunker is introduced.
+
+Export Docling's Markdown and expose it through a bridge to a TextDocument delegate using the existing Markdown policy. The delegate has the same document_id as its parent plugin and is not a subdocument. DoclingDocument delegates chunk enumeration/retrieval to it and sets save_text=True. If straightforward serializer hooks or reference mapping allow it, make image references identify the image subdocuments; otherwise retain Docling's ordinary Markdown output. Do not build fragile placeholder matching or custom Markdown reconstruction. Any substitution precedes chunking so offsets and retained text address the same representation.
+
+Extracted figures become ImageDocument children. Choose IDs with best-effort stability across repeated processing, but occasional rerendering-induced subdocument churn is acceptable. Exact image identity/selection details are left to implementation and reported with the result.
+
+`plugins/images.py` defines ImageDocument, consuming a ContentBridge for image content. It supplies `get_document_summary` using the existing image-capable LLM path, and yields no chunks or subdocuments. It sets save_text=True, although this has no effect without chunk rows; its document summary is persisted normally. No LLM response cache or separate image-model routing system is introduced. Child summaries feed generic bottom-up parent summarization.
+
+### Optional dependency and regression samples
+
+Docling is an optional dependency installed via `mcp_indexer[docling]`, including the dependencies needed for the selected OCR backend. The extension mappings and plugin registration remain available without Docling; instantiating DoclingDocument then raises an informative ImportError rather than falling back to text or breaking unrelated plugin imports.
+
+Real conversion regression tests cover `.doc`, `.docx`, and `.pdf`. Short sample files may be checked into the repository under `tests/`. Skip Docling-dependent conversion tests when Docling is unavailable; keep generic infrastructure tests and missing-dependency behavior testable without it. Installed-but-broken conversion is not silently treated as an absent optional dependency. Model provisioning/download requirements must be reported during verification rather than hidden by fabricated results or broad skips.
 
 ### EPUB delegation
 
@@ -173,32 +208,50 @@ NotmuchMailSource
 
 Threads/messages need not participate in plugin discovery. A message can yield body chunks and attachment subdocuments. Ordinary non-attachment MIME parts need not become documents. AttachmentBridge supplies decoded content directly to the selected plugin; there is no AttachmentDocument wrapper.
 
-## Next implementation spike: common subdocument infrastructure
+## Next implementation spike: subdocuments, Docling, and image summaries
 
-This is proposed implementation scope, not authorization to implement during this plan update. PdfDocument design is the next format discussion; no PDF extraction or image policy is implied by this infrastructure spike.
+This is proposed implementation scope, not authorization to implement during this plan update. Implement the common infrastructure and the Docling/ImageDocument integration described above as one verified spike; retain the distinction between general orchestration and format interpretation.
 
 ### Scope
 
-1. Implement reserved-colon identity routing, full-ID handle-level child resolution, and the per-source process-local handle cache with a public insertion operation for enumeration.
+1. Implement reserved-colon identity routing, full-ID handle-level child resolution, and the per-source process-local handle cache with public insertion, last-used tracking, and a single recurring 300-second idle-expiration callback. Make the interval overridable for tests.
 2. Implement save_text writes, defer DocumentChunk.text by default, and add the chunk-ID-based shared retrieval helper. Replace all source.fetch_chunk consumers, including MCP, indexer reconstruction, and reranker preparation; keep metadata-only hits local to `_prepare_hit`.
 3. Persist document metadata separately from title/keywords and expose nonconflicting fields in tool document responses/results. Add direct sub_documents to MCP fetch_document.
-4. Add durable indexing_work storage and parent/child orchestration: atomic parent/work publication, successful-enumeration reconciliation, failure exclusion, pending-work-first scheduling on restart, and ensure_document_indexed traversal from missing ancestors to a requested descendant.
-5. Support chunk-plus-child, chunk-only, and summary-only handles without format-specific orchestration. Preserve summary embeddings for documents without chunks.
-6. Supply schema migration steps for new storage and preserve existing source filtering, text policies, Wikipedia behavior, and byte/character offset distinctions. Inspect current callers and tests before changing signatures. Required base-interface changes belong to this explicit scope and require implementation approval under repository rules.
+4. Add durable indexing_work storage and parent/child orchestration: atomic parent/work publication, successful-enumeration reconciliation, failure exclusion, pending-work-first scheduling on restart, post-commit scheduling of enumerated children through the existing semaphore pool, and ensure_document_indexed traversal from missing ancestors to a requested descendant.
+5. Support chunk-plus-child, chunk-only, and summary-only handles without format-specific orchestration. Implement tree-readiness gating and bottom-up document summarization with distinct text, chunk-summary, and child-ID/summary sections. Preserve summary embeddings for documents without chunks; readiness waits must not occupy semaphore slots.
+6. Add plugins/docling.py and plugins/images.py, bridge adapters needed for converted Markdown and figure content, Markdown delegation, and all eight agreed extension mappings. Use OCR with RapidOCR/PyTorch, extracted figures without retained page images, and the existing image-capable LLM rather than Docling vision enrichment. Set save_text=True on both plugins. Choose best-effort stable image IDs and substitute Markdown image references only if straightforward.
+7. Add the docling optional extra, lazy dependency failure on plugin instantiation, and short real .doc/.docx/.pdf regression samples under tests/. Skip conversion tests only for absent Docling.
+8. Supply schema migration steps for new storage and preserve existing source filtering, text policies, Wikipedia behavior, and byte/character offset distinctions. Inspect current callers and tests before changing signatures. Required base-interface changes belong to this explicit scope and require implementation approval under repository rules.
 
 ### Verification
 
 - Establish a green pytest baseline before implementation; use synthetic handles/bridges and pytest monkeypatch rather than requiring a PDF library for common infrastructure tests.
-- Verify nested full-ID resolution, root/child cache population and reuse, and encoded-colon paths without confusing collection prefixes, hierarchy separators, or chunk suffixes.
+- Verify nested full-ID resolution, root/child cache population and reuse, and encoded-colon paths without confusing collection prefixes, hierarchy separators, or chunk suffixes. With a shortened interval, verify last-use extension, idle eviction, only one scheduled callback, rescheduling for a nonempty cache, stopping when empty, and continued usability of handles retained outside the cache.
 - Verify retained embedding and semantic retrieval (including a non-root embedding ID), deferred ordinary text loading, a single retrieval statement per scope, and no handle acquisition on the retained-text path. Verify unretained fallback, correct character slicing, and missing-row versus NULL-text behavior.
 - Verify reranking of stored chunk IDs and metadata-only hits without adding an origin flag or forcing indexing for the latter.
 - Verify JSON-compatible metadata persistence, title/keyword separation, response-field precedence, and direct-child visibility through MCP.
-- Verify parent/work atomicity, restart recovery, failure exclusion even after work recreation, descendant indexing with missing ancestors, and subtree removal only after complete enumeration. Verify the pending-work-first scheduling contract without interleaved polling.
+- Verify parent/work atomicity, restart recovery, failure exclusion even after work recreation, descendant indexing with missing ancestors, and subtree removal only after complete enumeration. Verify pending-work-first restart handling and post-commit child scheduling without interleaved polling. Exercise nested work with a single semaphore slot to catch parent/child deadlocks, and verify idle tracking includes scheduled descendants.
 - Verify all supported document shapes, including summary-only searchability, and preserve newline/multibyte round trips and missing-document versus source-outage distinctions.
+- Verify bottom-up summary ordering, child readiness/failure handling, and labeled prompt sections containing immediate-child IDs and summaries. Ensure a parent is not finalized before its available child summaries and that waiting does not occupy a semaphore slot.
+- Run real .doc/.docx/.pdf conversion using checked-in short fixtures; verify Markdown delegation and retrieval round trips, metadata, and extracted image children where present. Include PDF coverage that exercises OCR and figure extraction, not merely parsing an existing text layer. Verify repeat processing yields consistent enumeration/direct lookup and document the chosen image-ID strategy without promising cross-render identity stability.
+- Verify all agreed extension mappings, import/registration without Docling, informative instantiation failure, and conversion-test skipping when the optional dependency is absent. Verify ImageDocument sends bridge image content through the existing LLM path and creates a document summary without chunks.
 - Run the full suite with `~/ai/venv/bin/python -m pytest -q`. Audit the diff against this plan and report consequential choices or deviations rather than silently expanding scope.
 
-### Non-goals and next format decisions
+### Settled implementation decisions
 
-No architecture.md rewrite, maintenance redesign, cache freshness/eviction policy, whole-subtree transaction, generation-token system, configurable policy machinery, ZIP/notmuch implementation, or generalized streaming framework.
+Recorded as the spike closed. These settle the items the plan left to implementation, reported with the result; they do not reopen settled architecture.
 
-PdfDocument design will determine extraction and semantic boundaries, image selection and identity (embedded object versus page occurrence), image summarization, parent-summary use of child summaries, and any image-content delivery. EPUB chapter structure and concrete future-bridge lifecycle details remain deferred to their respective format work.
+- Figure child IDs are `fig-<reading-order index>-<sha1 of the PNG bytes, first 12 hex chars>`. Best-effort stable across repeat processing of the same document; rerender-induced churn is accepted as an ID change, and no cross-render identity stability is promised.
+- Markdown image-reference substitution uses `export_to_markdown(image_mode="embedded")`: the emitted data-URI references are matched to figure children in document order and, only when the count exactly equals the figure count, each is replaced with `![Figure N](<child document id>)`. On a count mismatch the Markdown is retained exactly as produced. No placeholder matching or custom reconstruction.
+- Docling pipeline options must reach the converter as `DocumentConverter(format_options={InputFormat.X: XFormatOption(pipeline_options=opts)})`; a separately constructed options object is silently ignored. PDF options: RapidOCR/torch OCR, `generate_picture_images=True`, `generate_page_images=False`, no vision-model enrichment. Office formats use their per-format `FormatOption`; `.doc` converts natively (no `soffice` at runtime — `soffice` is used only to produce the checked-in `.doc` fixture).
+- Real conversion fixtures are short files checked in under `tests/fixtures/` (`sample.pdf` with a text page, a figure, and a full-page bitmap scan to exercise OCR; `sample.docx`; `sample.doc`).
+- Summarization convergence is event-driven rather than pumped: completion triggers schedule the parent's document summary when a child's work lands (index commit, chunk summarization, child document summary, and failure record all trigger), `summarize_documents_collection` performs one catch-up scan for work completed in an earlier process, and `summarize_results` converges the full tree bottom-up in a single pass, joining in-flight runs. Pumped schedule-ready → wait_for_idle rounds were rejected: pending work rows decrement only through completion or failure, and a stuck task would loop indefinitely. `summarize_results` does not interact with the idle mechanism, and duplicate work it may schedule is accepted.
+- Pending `indexing_work` is processed in batches of at most 256 rows at the start of `index_collection`, each batch fully awaited before rescan; every row seen at the start of an iteration retires by the end of its batch (index commit or failure record), so the pass is bounded by the trees it recovers. A task that neither completes nor fails is not detected — an accepted limitation of the shared task machinery, not handled by this spike.
+- Pass-level document summarization is gated by a flag set at the start of the indexing pass, so `index_all(summarize_documents=False)` stays silent about document summaries even while its indexing and chunk work completes.
+- Test hygiene: tests that end with trigger-scheduled summary tasks settle them with `wait_for_idle` before fixture teardown (a summary task running against a torn-down database surfaces as a teardown error, not a test failure).
+
+### Non-goals and implementation discretion
+
+No architecture.md rewrite, maintenance redesign, freshness-validation protocol, whole-subtree transaction, generation-token system, configurable policy machinery, LLM response cache, separate image-model routing, Docling vision enrichment, ZIP/notmuch implementation, or generalized streaming framework. Idle cache expiration is in scope; more elaborate memory budgeting is not.
+
+Image identity/selection, straightforward Markdown reference adaptation, and small backend integration details are implementation choices with best-effort stability; report them rather than reopening settled architecture. Do not add a Docling-specific partial-conversion policy in place of general failure handling. Binary image delivery through tools, EPUB chapter structure, and unrelated future-bridge lifecycle details remain deferred.

@@ -125,12 +125,27 @@ TEXT_POLICY: dict[str, Any] = {
     "embedding_boundary_regexps": (r"\n\s*\n",),
 }
 
+# Docling-handled formats: PDF and selected office formats. Interpretation
+# is fixed by the plugin (conversion, Markdown delegation, figure
+# subdocuments); the policy carries only the handler name.
+DOCLING_POLICY: dict[str, Any] = {
+    "handler": "docling",
+}
+
 _EXTENSION_POLICIES: dict[str, dict[str, Any]] = {
     ".md": MARKDOWN_POLICY,
     ".markdown": MARKDOWN_POLICY,
     ".html": HTML_POLICY,
     ".htm": HTML_POLICY,
     ".rst": RST_POLICY,
+    ".pdf": DOCLING_POLICY,
+    ".doc": DOCLING_POLICY,
+    ".docx": DOCLING_POLICY,
+    ".odt": DOCLING_POLICY,
+    ".ods": DOCLING_POLICY,
+    ".ppt": DOCLING_POLICY,
+    ".pptx": DOCLING_POLICY,
+    ".rtf": DOCLING_POLICY,
 }
 
 
@@ -227,9 +242,13 @@ class FileSource(DocumentSource[P]):
             raise DocumentNotFoundError(document_id) from exc
         return self.make_document(document_id, mtime, path)
 
-    async def fetch_document(self, document_id: str) -> P:
-        """Resolve a local ID with its current mtime; raise
-        DocumentNotFoundError if absent."""
+    async def _fetch_root(self, document_id: str) -> P:
+        """Acquire a root (non-subdocument) document by its local ID.
+
+        Resolve with the current mtime; raise DocumentNotFoundError if absent.
+        The synchronous path work runs in a thread so the event loop is not
+        blocked by filesystem stats.
+        """
         return await asyncio.to_thread(self._fetch_document, document_id)
 
     def make_document(self, document_id: str, mtime: datetime, path: Path) -> P:

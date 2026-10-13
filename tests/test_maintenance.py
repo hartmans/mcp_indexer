@@ -143,18 +143,29 @@ async def test_stale_summary_cannot_restore_replaced_or_deleted_document(deleted
     replaced = None if deleted else SimpleNamespace(last_modified=now + timedelta(days=1), summaries=[])
     loads = iter([original, replaced])
 
+    class _EmptyResult:
+        def all(self):
+            return []
+        def first(self):
+            return None
+        def scalars(self):
+            return self
+
     class Session:
-        def __init__(self):
-            self.calls = 0
+        # Shared across session instances: the write-session read is the 2nd
+        # get overall, even though it happens in a later session.
+        calls = 0
         async def get(self, model, identity, *args, **kwargs):
             assert identity == ("wiki", "article")
-            self.calls += 1
+            Session.calls += 1
             result = next(loads)
             # The write-session read (2nd call) must be locked so the mtime
             # guard and the write are atomic against a concurrent refresh.
-            if self.calls == 2:
+            if Session.calls == 2:
                 assert kwargs.get("with_for_update") is True
             return result
+        async def execute(self, stmt):
+            return _EmptyResult()
         async def commit(self):
             raise AssertionError("Stale summary must not commit")
 

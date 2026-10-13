@@ -15,6 +15,7 @@ from .indexer import Indexer
 from .search import SearchResult, search
 from .models import Document, DocumentChunk
 from .plugins.base import DocumentSource
+from .retrieval import fetch_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -31,23 +32,32 @@ def result_info(
 ) -> list[dict[str, Any]]:
     formatted_results: list[dict[str, Any]] = []
     for document, relevant_chunks in results:
-        formatted_results.append(
-            {
-                "title": document.title,
-                "keywords": list(document.keywords),
-                "document_id": _document_ref(document.collection_id, document.document_id),
-                "summary": document.summary,
-                "relevant_embedding_chunks": [
-                    _relevant_chunk_info(document, chunk)
-                    for chunk in relevant_chunks
-                ],
-            }
-        )
+        entry: dict[str, Any] = {
+            "title": document.title,
+            "keywords": list(document.keywords),
+            "document_id": _document_ref(document.collection_id, document.document_id),
+            "summary": document.summary,
+            "relevant_embedding_chunks": [
+                _relevant_chunk_info(document, chunk)
+                for chunk in relevant_chunks
+            ],
+        }
+        _expose_metadata_fields(document, entry)
+        formatted_results.append(entry)
     return formatted_results
 
 
 def _document_ref(collection_id: str, ref_id: str) -> str:
     return f"{collection_id}:{ref_id}"
+
+
+def _expose_metadata_fields(document: Document, response: dict[str, Any]) -> None:
+    """Expose persisted metadata values on a response.
+
+    Tool-owned response fields always win; metadata never overrides them.
+    """
+    for key, value in (document.metadata_dict or {}).items():
+        response.setdefault(key, value)
 
 
 def search_result_info(page: SearchResult) -> dict[str, Any]:
@@ -213,13 +223,7 @@ async def core_fetch_document(
         for chunk in document.chunks:
             if chunk.semantic_chunk_id != current_semantic_id:
                 current_semantic_id = chunk.semantic_chunk_id
-                part = await source.fetch_chunk(
-                    document_id=document.document_id,
-                    chunk_metadata=dict(chunk.metadata_dict),
-                    scope="semantic",
-                    offset=chunk.embedding_offset,
-                    length=chunk.embedding_length,
-                )
+                part = await fetch_chunk(source, chunk.chunk_id, scope="semantic")
                 full_text_parts.append(part)
         result["full_text"] = "".join(full_text_parts)
     else:
@@ -261,6 +265,14 @@ async def core_fetch_document(
                 last_summary_span = chunk.summary_span
         result["semantic_chunks"] = semantic_chunks
 
+    # Direct child visibility: enumerate the immediate subdocuments from the
+    # source so children are discoverable, not merely addressable.
+    handle = await source.fetch_document(document_id)
+    result["sub_documents"] = [
+        _document_ref(collection_id, child.document_id)
+        async for child in handle.get_sub_documents()
+    ]
+    _expose_metadata_fields(document, result)
     return result
 
 
@@ -298,14 +310,7 @@ async def core_fetch_chunk(
             f"({_document_ref(collection_id, root.chunk_id)!r}) instead."
         )
 
-    chunk_metadata = dict(chunk.metadata_dict)
-    text = await source.fetch_chunk(
-        document_id=document_id,
-        chunk_metadata=chunk_metadata,
-        scope=scope,
-        offset=chunk.embedding_offset,
-        length=chunk.embedding_length,
-    )
+    text = await fetch_chunk(source, chunk.chunk_id, scope=scope)
 
     return {
         "document_id": _document_ref(collection_id, document_id),

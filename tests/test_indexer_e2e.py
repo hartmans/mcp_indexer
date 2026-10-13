@@ -570,3 +570,159 @@ async def test_failed_document_tracking(test_context, tmp_path):
     assert documents[0].document_id == "alpha.txt"
     # beta.txt should still be in FailedDocument (failure records are not cleared)
     assert any(f.document_id == "beta.txt" for f in failed_after)
+
+
+@pytest.mark.asyncio
+async def test_metadata_persisted_and_exposed_in_responses(test_context, tmp_path, monkeypatch):
+    """get_metadata values persist in Document.metadata_dict with the
+    dedicated-column fields extracted, and are exposed on tool responses
+    without overriding tool-owned fields."""
+    from mcp_indexer.plugins.plugin import DocumentPlugin
+    from mcp_indexer.server import core_fetch_document
+    from mcp_indexer.models import Document
+
+    async def get_metadata(self):
+        return {
+            "title": "Real Title", "title_strength": 5,
+            "keywords": "x, y", "last_modified": "stale",
+            "language": "en",
+        }
+    monkeypatch.setattr(DocumentPlugin, "get_metadata", get_metadata)
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "short.txt").write_text(
+        "alpha alpha alpha\n\nbeta beta beta\n", encoding="utf-8",
+    )
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
+    })
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 10,
+        "max_size": 1000,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+    from mcp_indexer.context import Context
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = FileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
+
+    async with test_context.session_factory() as session:
+        doc = await session.get(Document, ("notes", "short.txt"))
+    assert doc.title == "Real Title"
+    assert doc.title_strength == 5
+    assert doc.keywords == ["x", "y"]
+    # The remaining JSON-compatible values persist; dedicated-column fields
+    # are not duplicated on the JSON column.
+    assert doc.metadata_dict == {"language": "en"}
+
+    result = await core_fetch_document(
+        context=context,
+        indexer=indexer,
+        prefixed_document_id="notes:short.txt",
+    )
+    assert result["title"] == "Real Title"
+    assert result["language"] == "en"
+    assert "last_modified" not in result
+    summary = result["summary"]
+
+    # Tool-owned response fields win over metadata values.
+    async with test_context.session_factory() as session:
+        doc = await session.get(Document, ("notes", "short.txt"))
+        doc.metadata_dict = {"language": "en", "summary": "metadata wants this"}
+        await session.commit()
+    result = await core_fetch_document(
+        context=context,
+        indexer=indexer,
+        prefixed_document_id="notes:short.txt",
+    )
+    assert result["summary"] == summary
+    assert result["summary"] != "metadata wants this"
+    assert result["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_fetch_document_exposes_immediate_sub_documents(test_context, tmp_path, monkeypatch):
+    """fetch_document lists the immediate subdocuments, so children are
+    discoverable rather than merely addressable."""
+    from types import SimpleNamespace
+    from mcp_indexer.server import core_fetch_document
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "short.txt").write_text(
+        "alpha alpha alpha\n\nbeta beta beta\n", encoding="utf-8",
+    )
+    collection_config = CollectionConfig.model_validate({
+        "collection_id": "notes",
+        "tool_prefix": "notes",
+        "description": "Test notes collection",
+        "doc_summary_prompt": "Summarize the document",
+        "chunk_summary_prompt": "Summarize the chunk",
+        "source_blob": {"type": "file", "directory": str(docs_dir)},
+    })
+    server_config = ServerConfig.model_validate({
+        "db_uri": "postgresql://test",
+        "min_size": 10,
+        "max_size": 1000,
+    })
+    config_manager = FakeConfigManager("notes", collection_config, server_config)
+    from mcp_indexer.context import Context
+    context = Context(
+        engine=test_context.engine,
+        session_factory=test_context.session_factory,
+        embedding=FakeEmbedding(),
+        llm=FakeLlm(),
+        config=config_manager,
+    )
+    source = FileSource("notes", context=context, collection_config=collection_config)
+    context.collections["notes"] = source
+
+    indexer = Indexer(context)
+    await run_indexing_pipeline(indexer)
+    # index_all() rebuilt the collections from config; patch the live source.
+    source = context.collections["notes"]
+    original_fetch = source.fetch_document
+
+    class SubDocParent:
+        """Delegates to the real handle; adds subdocument enumeration."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.document_id = inner.document_id
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def get_sub_documents(self):
+            yield SimpleNamespace(document_id="short.txt:page-1")
+            yield SimpleNamespace(document_id="short.txt:page-2")
+
+    async def fake_fetch(document_id):
+        return SubDocParent(await original_fetch(document_id))
+    monkeypatch.setattr(source, "fetch_document", fake_fetch)
+
+    result = await core_fetch_document(
+        context=context,
+        indexer=indexer,
+        prefixed_document_id="notes:short.txt",
+    )
+    assert result["sub_documents"] == [
+        "notes:short.txt:page-1",
+        "notes:short.txt:page-2",
+    ]

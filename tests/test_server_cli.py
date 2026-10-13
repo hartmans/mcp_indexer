@@ -62,7 +62,7 @@ async def test_registered_search_tool_smoke(monkeypatch):
     indexer = object()
     document = SimpleNamespace(
         collection_id="wiki", document_id="article", title="Article",
-        keywords=["physics"], summary="An article",
+        keywords=["physics"], summary="An article", metadata_dict={},
     )
 
     async def search(actual_indexer, collection_id, query, *, limit, rerank_query, cursor):

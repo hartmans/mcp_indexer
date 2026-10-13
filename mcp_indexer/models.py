@@ -37,7 +37,13 @@ class DocumentChunk(Base):
     document_id: Mapped[str] = mapped_column(String, primary_key=True)
     order: Mapped[int]
     chunk_id: Mapped[str] = mapped_column(String, primary_key=True)
-    text: Mapped[str | None]
+    # Exact text of this embedding chunk, retained for reproducible retrieval.
+    # Deferred at the mapper level: omitted from every entity SELECT (including
+    # relationship loads) and loaded only through an explicit column select
+    # (the shared retrieval helper) or an undefer(). Accessing it on an
+    # entity-loaded row in async code raises MissingGreenlet, so no code can
+    # silently trigger a lazy text load.
+    text: Mapped[str | None] = mapped_column(deferred=True)
     embedding: Mapped[List[float]] = mapped_column(Vector(VECTOR_DIMENSIONS))
     summary_span: Mapped[int | None]
     # `order` of the first row of this row's semantic chunk. Every row in a
@@ -126,6 +132,10 @@ class Document(Base):
     keywords: Mapped[List[str]] = mapped_column(ARRAY(String))
     summary: Mapped[str]
     last_modified: Mapped[datetime]
+    # Remaining JSON-compatible contents of get_metadata() after title and
+    # keywords are popped into their dedicated fields. Named `metadata_dict`
+    # because `metadata` is reserved by the SQLAlchemy Declarative base.
+    metadata_dict: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Relationships - cascade merge to handle upsert of chunks atomically
     # The chunks relationship is ordered by `order` so queries return chunks sorted.
@@ -223,6 +233,37 @@ class FailedDocument(Base):
     __table_args__ = (
         Index("ix_failed_document_collection", "collection_id"),
         Index("ix_failed_document_document_id", "document_id"),
+    )
+
+
+class IndexingWork(Base):
+    """Durable record of pending sub-document indexing work.
+
+    A work entry records the full collection-local ID of a discovered child
+    (the target) together with its parent in the same collection. The target
+    need not yet have a ``Document`` row; the parent does. Entries are published
+    atomically with the parent's own chunk rows and are retired when the target
+    is indexed successfully. The table records pending work, not a saved handle
+    or a frozen source revision.
+    """
+    __tablename__ = "indexing_work"
+
+    collection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # Full collection-local ID of the child to be indexed (the target).
+    document_id: Mapped[str] = mapped_column(String, primary_key=True)
+    # The parent that discovered this child; always in the same collection and
+    # guaranteed to have a Document row.
+    parent_document_id: Mapped[str] = mapped_column(String)
+
+    __table_args__ = (
+        Index("ix_indexing_work_parent", "collection_id", "parent_document_id"),
+        ForeignKeyConstraint(
+            ["collection_id", "parent_document_id"],
+            ["document.collection_id", "document.document_id"],
+            name="fk_indexing_work_parent",
+            ondelete="CASCADE",
+            deferrable=True, initially="DEFERRED",
+        ),
     )
 
 
