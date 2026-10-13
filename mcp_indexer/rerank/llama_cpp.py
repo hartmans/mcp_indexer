@@ -11,14 +11,26 @@ from urllib.parse import urlsplit
 
 from .base import AbstractReranker, RerankResult
 
+# Tokens of headroom beyond the stored-chunk cap for the rerank query.  A
+# rerank input is one query plus one chunk: chunk sizes are configured in
+# characters, which already bounds the chunk's token count, but the query is
+# unbounded, so a fixed budget covers normal search queries.
+QUERY_HEADROOM = 512
+
 
 class LlamaCppReranker(AbstractReranker):
     """Use a llama.cpp server over TCP, or launch one on a Unix socket.
 
     ``command_line`` selects the managed Unix-socket form. The configured
     command should contain the model and reranker options; this class appends
-    ``--host <temporary-path>.sock``. Without a command, ``url`` selects an
-    already-running TCP server.
+    ``--host <temporary-path>.sock``. When ``max_size`` is set, it also
+    derives ``--ctx-size``, ``--batch-size``, and ``--ubatch-size`` for any
+    of those the command does not configure: a rerank input is one query plus
+    one chunk, so the stored-chunk cap plus a fixed query headroom bounds the
+    largest single input, and llama.cpp clamps the physical batch to the
+    micro-batch while embedding is enabled, so the batch flags must move
+    together. Without a command,
+    ``url`` selects an already-running TCP server.
     """
 
     def __init__(
@@ -27,11 +39,14 @@ class LlamaCppReranker(AbstractReranker):
         url: str = "http://127.0.0.1:8080/v1",
         model: str | None = None,
         command_line: Sequence[str] | None = None,
+        max_size: int | None = None,
         startup_timeout: float = 60.0,
         request_timeout: float = 400.0,
     ) -> None:
         if command_line is not None and not command_line:
             raise ValueError("command_line cannot be empty")
+        if max_size is not None and max_size <= 0:
+            raise ValueError("max_size must be positive")
         if startup_timeout <= 0 or request_timeout <= 0:
             raise ValueError("timeouts must be positive")
         parsed = urlsplit(url)
@@ -43,6 +58,7 @@ class LlamaCppReranker(AbstractReranker):
         self.url = url.rstrip("/")
         self.model = model
         self.command_line = tuple(command_line) if command_line is not None else None
+        self.max_size = max_size
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
         self._setup_lock = asyncio.Lock()
@@ -56,6 +72,28 @@ class LlamaCppReranker(AbstractReranker):
         if process is not None and process.returncode is None:
             process.terminate()
 
+    def _derived_sizing_args(self) -> list[str]:
+        """Server sizing flags derived from the stored-chunk cap.
+
+        A rerank input is one query plus one chunk, so the largest single
+        input is bounded by the chunk cap plus the query.  Chunk sizes are
+        configured in characters, which bounds the chunk's token count, so
+        ``max_size + QUERY_HEADROOM`` serves as a conservative token budget.
+        Only flags the configured command omits are derived; explicit values
+        win.
+        """
+        if self.max_size is None or self.command_line is None:
+            return []
+        size = self.max_size + QUERY_HEADROOM
+        args: list[str] = []
+        if "--ctx-size" not in self.command_line:
+            args += ["--ctx-size", str(size)]
+        if "--batch-size" not in self.command_line:
+            args += ["--batch-size", str(size)]
+        if "--ubatch-size" not in self.command_line:
+            args += ["--ubatch-size", str(size)]
+        return args
+
     async def setup(self) -> None:
         async with self._setup_lock:
             if self._ready:
@@ -67,6 +105,7 @@ class LlamaCppReranker(AbstractReranker):
                 self._socket_path = Path(self._socket_directory.name) / "llama.sock"
                 self._process = await asyncio.create_subprocess_exec(
                     *self.command_line,
+                    *self._derived_sizing_args(),
                     "--host",
                     str(self._socket_path),
                     stdout=asyncio.subprocess.DEVNULL,

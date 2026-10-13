@@ -99,7 +99,7 @@ async def test_build_collections_assigns_configured_reranker(monkeypatch):
 
 
 async def test_build_collections_selects_llama_cpp_reranker(monkeypatch):
-    from mcp_indexer.config import CollectionConfig, RerankConfig
+    from mcp_indexer.config import CollectionConfig, RerankConfig, ServerConfig
     from mcp_indexer.context import SOURCE_REGISTRY
     from mcp_indexer.plugins.base import DocumentSource
     import mcp_indexer.rerank
@@ -125,10 +125,12 @@ async def test_build_collections_selects_llama_cpp_reranker(monkeypatch):
         model="reranker-model",
         request_timeout=12,
     )
+    server_config = ServerConfig(max_size=1234)
     config = SimpleNamespace(
         list_collections=lambda: ["docs"],
         get_collection_config=lambda collection_id: collection,
         get_rerank_config=lambda: rerank_config,
+        get_server_config=lambda: server_config,
     )
     context = Context(
         engine=None,
@@ -151,3 +153,4 @@ async def test_build_collections_selects_llama_cpp_reranker(monkeypatch):
     assert reranker.kwargs["url"] == "http://reranker:8080"
     assert reranker.kwargs["model"] == "reranker-model"
     assert reranker.kwargs["request_timeout"] == 12
+    assert reranker.kwargs["max_size"] == 1234

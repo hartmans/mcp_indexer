@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mcp_indexer.rerank.llama_cpp import LlamaCppReranker
+from mcp_indexer.rerank.llama_cpp import LlamaCppReranker, QUERY_HEADROOM
 
 
 async def _http_response(writer, payload, status="200 OK"):
@@ -103,6 +103,97 @@ async def test_managed_server_uses_unix_socket_and_is_terminated(monkeypatch):
     assert args[-1].endswith("/llama.sock")
     assert kwargs["stdout"] == asyncio.subprocess.DEVNULL
     assert calls == [("GET", "/models", {"use_base_path": True})]
+
+    del reranker
+    gc.collect()
+    assert process.terminated
+
+
+async def test_managed_server_derives_sizing_from_max_size(monkeypatch):
+    class Process:
+        returncode = None
+
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    process = Process()
+    launched = []
+
+    async def create_subprocess_exec(*args, **kwargs):
+        launched.append(args)
+        return process
+
+    async def request(self, method, path, payload=None, **kwargs):
+        return {"data": [{"id": "reranker", "meta": {}}]}
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(LlamaCppReranker, "_request", request)
+
+    reranker = LlamaCppReranker(
+        command_line=["llama-server", "-m", "reranker.gguf", "--rerank"],
+        max_size=5000,
+    )
+    await reranker.setup()
+
+    args = launched[0]
+    size = str(5000 + QUERY_HEADROOM)
+    assert args[:4] == ("llama-server", "-m", "reranker.gguf", "--rerank")
+    assert args[-8:-2] == (
+        "--ctx-size", size,
+        "--batch-size", size,
+        "--ubatch-size", size,
+    )
+    assert args[-2] == "--host"
+    assert args[-1].endswith("/llama.sock")
+
+    del reranker
+    gc.collect()
+    assert process.terminated
+
+
+async def test_managed_server_keeps_explicit_sizing(monkeypatch):
+    class Process:
+        returncode = None
+
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    process = Process()
+    launched = []
+
+    async def create_subprocess_exec(*args, **kwargs):
+        launched.append(args)
+        return process
+
+    async def request(self, method, path, payload=None, **kwargs):
+        return {"data": [{"id": "reranker", "meta": {}}]}
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(LlamaCppReranker, "_request", request)
+
+    reranker = LlamaCppReranker(
+        command_line=[
+            "llama-server", "-m", "reranker.gguf", "--rerank",
+            "--ctx-size", "3000",
+        ],
+        max_size=5000,
+    )
+    await reranker.setup()
+
+    args = launched[0]
+    size = str(5000 + QUERY_HEADROOM)
+    # Explicit --ctx-size wins; only the batch flags are derived.
+    assert args.count("--ctx-size") == 1
+    assert args[args.index("--ctx-size") + 1] == "3000"
+    assert args[-6:-2] == ("--batch-size", size, "--ubatch-size", size)
+    assert args[-2] == "--host"
+    assert args[-1].endswith("/llama.sock")
 
     del reranker
     gc.collect()

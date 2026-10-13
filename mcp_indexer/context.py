@@ -126,10 +126,22 @@ class Context:
                     if rerank_config is None or rerank_config.plugin == "qwen":
                         reranker = QwenReranker()
                     else:
+                        get_server_config = getattr(
+                            self.config, "get_server_config", None
+                        )
+                        server_config = (
+                            get_server_config() if get_server_config is not None
+                            else None
+                        )
+                        max_size = (
+                            server_config.max_size if server_config is not None
+                            else None
+                        )
                         reranker = LlamaCppReranker(
                             url=rerank_config.url,
                             model=rerank_config.model,
                             command_line=rerank_config.command_line,
+                            max_size=max_size,
                             startup_timeout=rerank_config.startup_timeout,
                             request_timeout=rerank_config.request_timeout,
                         )
