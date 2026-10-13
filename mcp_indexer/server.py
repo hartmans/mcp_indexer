@@ -32,16 +32,11 @@ def result_info(
 ) -> list[dict[str, Any]]:
     formatted_results: list[dict[str, Any]] = []
     for document, relevant_chunks in results:
-        entry: dict[str, Any] = {
-            "title": document.title,
-            "keywords": list(document.keywords),
-            "document_id": _document_ref(document.collection_id, document.document_id),
-            "summary": document.summary,
-            "relevant_embedding_chunks": [
-                _relevant_chunk_info(document, chunk)
-                for chunk in relevant_chunks
-            ],
-        }
+        entry = document_fields(document)
+        entry["relevant_embedding_chunks"] = [
+            chunk_info(document.collection_id, chunk)
+            for chunk in relevant_chunks
+        ]
         _expose_metadata_fields(document, entry)
         formatted_results.append(entry)
     return formatted_results
@@ -49,6 +44,31 @@ def result_info(
 
 def _document_ref(collection_id: str, ref_id: str) -> str:
     return f"{collection_id}:{ref_id}"
+
+
+def document_fields(document: Document) -> dict[str, Any]:
+    """Document identity fields shared by tool responses."""
+    return {
+        "title": document.title,
+        "keywords": list(document.keywords),
+        "document_id": _document_ref(document.collection_id, document.document_id),
+        "summary": document.summary,
+    }
+
+
+def chunk_summary(chunk: DocumentChunk) -> str | None:
+    """The chunk's span summary text, or None when unsummarized."""
+    return chunk.summary.summary if chunk.summary else None
+
+
+def chunk_info(collection_id: str, chunk: DocumentChunk) -> dict[str, Any]:
+    """Shared chunk-identity fields used across tool responses."""
+    return {
+        "chunk_id": _document_ref(collection_id, chunk.chunk_id),
+        "summary": chunk_summary(chunk),
+        "semantic_length": chunk.semantic_length,
+        "embedding_length": chunk.embedding_length,
+    }
 
 
 def _expose_metadata_fields(document: Document, response: dict[str, Any]) -> None:
@@ -76,14 +96,9 @@ def _tool_name(collection_id: str, suffix: str) -> str:
     return f"{collection_id}_{suffix}"
 
 
-def _parse_prefixed_document_id(prefixed_document_id: str) -> tuple[str, str]:
-    collection_id, document_id = prefixed_document_id.split(":", 1)
-    return collection_id, document_id
-
-
-def _parse_prefixed_chunk_id(prefixed_chunk_id: str) -> tuple[str, str]:
-    collection_id, chunk_id = prefixed_chunk_id.split(":", 1)
-    return collection_id, chunk_id
+def _parse_prefixed_id(prefixed_id: str) -> tuple[str, str]:
+    collection_id, rest = prefixed_id.split(":", 1)
+    return collection_id, rest
 
 
 def _get_collection_source(context: Context, collection_id: str) -> DocumentSource:
@@ -140,21 +155,6 @@ async def _load_chunk_record(
         return result.scalars().one_or_none()
 
 
-def _relevant_chunk_info(
-    document: Document,
-    chunk: DocumentChunk,
-) -> dict[str, Any]:
-    return {
-        "chunk_id": _document_ref(
-            document.collection_id,
-            chunk.chunk_id,
-        ),
-        "summary": chunk.summary.summary if chunk.summary else None,
-        "semantic_length": chunk.semantic_length,
-        "embedding_length": chunk.embedding_length,
-    }
-
-
 async def core_search(
     *,
     context: Context,
@@ -183,7 +183,7 @@ async def core_fetch_document(
     indexer: Indexer,
     prefixed_document_id: str,
 ) -> dict[str, Any]:
-    collection_id, document_id = _parse_prefixed_document_id(prefixed_document_id)
+    collection_id, document_id = _parse_prefixed_id(prefixed_document_id)
     source = _get_collection_source(context, collection_id)
 
     # Ensure the document's summaries are up‑to‑date before we hydrate it.
@@ -200,12 +200,7 @@ async def core_fetch_document(
         )
 
     # Build the base response with fields we always include.
-    result: dict[str, Any] = {
-        "title": document.title,
-        "keywords": list(document.keywords),
-        "document_id": _document_ref(document.collection_id, document.document_id),
-        "summary": document.summary,
-    }
+    result: dict[str, Any] = document_fields(document)
 
     # Compute total semantic length across the document's semantic chunks.
     # semantic_length is denormalized across every row of a semantic chunk,
@@ -245,7 +240,7 @@ async def core_fetch_document(
             if chunk.semantic_chunk_id != current_semantic_id:
                 current = {
                     "chunk_id": _document_ref(collection_id, chunk.chunk_id),
-                    "summary": chunk.summary.summary if chunk.summary else None,
+                    "summary": chunk_summary(chunk),
                     "embedding_chunks": [entry],
                     "length": chunk.semantic_length,
                 }
@@ -257,9 +252,7 @@ async def core_fetch_document(
                     chunk.summary_span is not None
                     and chunk.summary_span != last_summary_span
                 ):
-                    entry["summary"] = (
-                        chunk.summary.summary if chunk.summary else None
-                    )
+                    entry["summary"] = chunk_summary(chunk)
                 current["embedding_chunks"].append(entry)
             if chunk.summary_span is not None:
                 last_summary_span = chunk.summary_span
@@ -282,7 +275,7 @@ async def core_fetch_chunk(
     prefixed_chunk_id: str,
     scope: Literal["semantic", "embedding"] = "semantic",
 ) -> dict[str, Any]:
-    collection_id, chunk_id = _parse_prefixed_chunk_id(prefixed_chunk_id)
+    collection_id, chunk_id = _parse_prefixed_id(prefixed_chunk_id)
     source = _get_collection_source(context, collection_id)
     document_id = source.document_id(chunk_id)
 
@@ -314,12 +307,9 @@ async def core_fetch_chunk(
 
     return {
         "document_id": _document_ref(collection_id, document_id),
-        "chunk_id": _document_ref(collection_id, chunk.chunk_id),
         "scope": scope,
         "text": text,
-        "summary": chunk.summary.summary if chunk.summary else None,
-        "semantic_length": chunk.semantic_length,
-        "embedding_length": chunk.embedding_length,
+        **chunk_info(collection_id, chunk),
         "warnings": warnings,
     }
 
