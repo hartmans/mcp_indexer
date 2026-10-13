@@ -1,8 +1,15 @@
+import os
 import tomllib
 from typing import Any, Dict, Literal, Type, TypeVar
 from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def default_complex_documents() -> int:
+    """Default slot count for complex document conversion: the core count."""
+    return os.cpu_count() or 1
+
 
 class ServerConfig(BaseModel):
     """Truly global server settings."""
@@ -22,6 +29,8 @@ class ServerConfig(BaseModel):
     embedding_request_timeout: float | None = 400.0
     llm_timeout_retries: int = 20
     embedding_timeout_retries: int = 20
+    # Concurrency for complex (pipeline-heavy) document conversion.
+    complex_documents: int = Field(default_factory=default_complex_documents)
 
 
 class RerankConfig(BaseModel):

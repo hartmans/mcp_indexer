@@ -18,6 +18,12 @@ does not pay the pipeline startup cost (OCR model loading, torch
 initialization) again.  The converter — and the accelerator memory its
 pipelines hold — is released :data:`DOCLING_IDLE_TIMEOUT` seconds after
 the last conversion so an idle GPU does not hold memory indefinitely.
+
+Conversion runs are additionally bounded by the context-level
+``complex_document_semaphore`` (sized from the ``complex_documents``
+server config, defaulting to the core count): at most that many Docling
+conversions run at once, so a burst of complex documents cannot saturate
+the machine (or an accelerator) with pipeline work.
 """
 import asyncio
 import hashlib
@@ -255,21 +261,25 @@ class DoclingDocument(DocumentPlugin):
     async def _ensure_converted(self) -> TextDocument:
         """Convert the source file on first use; return the delegate.
 
-        The idle release is scheduled in a ``finally`` so a failed
-        conversion cannot strand the shared converter — and the memory
-        its pipelines hold — without an idle timer.
+        The conversion run holds a slot on the context's
+        ``complex_document_semaphore`` while it takes the source path,
+        runs the blocking conversion, and (re)schedules the idle release.
+        The release is scheduled in a ``finally`` so a failed conversion
+        cannot strand the shared converter — and the memory its
+        pipelines hold — without an idle timer.
         """
         if self._delegate is not None:
             return self._delegate
         async with self._conversion_lock:
             if self._delegate is not None:
                 return self._delegate
-            _cancel_idle_release()
-            try:
-                async with self.bridge.path() as path:
-                    result = await asyncio.to_thread(self._convert_sync, path)
-            finally:
-                _schedule_idle_release()
+            async with self.source.context.complex_document_semaphore:
+                _cancel_idle_release()
+                try:
+                    async with self.bridge.path() as path:
+                        result = await asyncio.to_thread(self._convert_sync, path)
+                finally:
+                    _schedule_idle_release()
             doc = result.document
             if result.status.value not in ("success", "partial_success"):
                 raise RuntimeError(

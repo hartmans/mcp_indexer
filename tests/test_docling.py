@@ -366,6 +366,63 @@ async def test_shared_converter_released_after_idle_timeout(tmp_path, monkeypatc
 
 @requires_docling
 @pytest.mark.asyncio
+async def test_conversions_bounded_by_context_semaphore(tmp_path, monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    import mcp_indexer.plugins.docling as docling_module
+
+    docling_module._reset_shared_state()
+    state = {"in_flight": 0, "peak": 0, "done": 0}
+
+    def bounded_convert(path):
+        state["in_flight"] += 1
+        state["peak"] = max(state["peak"], state["in_flight"])
+        time.sleep(0.4)
+        state["in_flight"] -= 1
+        state["done"] += 1
+        return SimpleNamespace(
+            status=SimpleNamespace(value="success"),
+            document=SimpleNamespace(
+                export_to_markdown=lambda **kwargs: "converted text. " * 20 + "\n",
+                pictures=[],
+            ),
+        )
+
+    monkeypatch.setattr(docling_module, "_shared_convert", bounded_convert)
+
+    source = make_source(tmp_path)
+    source.context.complex_document_semaphore = asyncio.Semaphore(2)
+    base = await source.fetch_document("sample.pdf")
+
+    docs = [
+        DoclingDocument(
+            f"doc-{i}.pdf",
+            source=source,
+            bridge=base.bridge,
+            policy=DOCLING_POLICY,
+            last_modified=base.last_modified,
+            metadata={"title": f"doc-{i}.pdf"},
+        )
+        for i in range(4)
+    ]
+
+    async def convert(doc):
+        async for _ in doc.get_chunks(50, 4000):
+            pass
+
+    await asyncio.gather(*(convert(doc) for doc in docs))
+
+    assert state["done"] == 4
+    assert state["in_flight"] == 0
+    # The context semaphore (2) bounded the four concurrent conversion runs;
+    # without it all four would have been in flight at once.
+    assert state["peak"] <= 2
+    docling_module._reset_shared_state()
+
+
+@requires_docling
+@pytest.mark.asyncio
 async def test_figure_summary_travels_the_llm_path(tmp_path):
     source = make_source(tmp_path)
     doc = await source.fetch_document("sample.docx")

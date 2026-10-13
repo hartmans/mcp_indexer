@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import asyncio
 from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -6,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from mcp_indexer.config import ConfigManager
+from mcp_indexer.config import ConfigManager, default_complex_documents
 from mcp_indexer.llm import LlmCall, EmbeddingCall
 from mcp_indexer.models import Base
 
@@ -29,6 +30,13 @@ class Context:
     llm: LlmCall
     config: ConfigManager
     collections: dict[str, "DocumentSource"] = field(default_factory=dict)
+    # Bounds how many complex (pipeline-heavy) document conversions may run
+    # at once; the Docling conversion run acquires it. Sized from
+    # ServerConfig.complex_documents when the context is built from a
+    # config; direct construction defaults to the core count.
+    complex_document_semaphore: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(default_complex_documents())
+    )
 
     @staticmethod
     def build_context(config_path: str | list[str]) -> "Context":
@@ -89,6 +97,9 @@ class Context:
             embedding=embedding_call,
             llm=llm_call,
             config=config_manager,
+            complex_document_semaphore=asyncio.Semaphore(
+                server_config.complex_documents
+            ),
         )
 
         return ctx
