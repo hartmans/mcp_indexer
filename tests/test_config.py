@@ -120,6 +120,159 @@ def test_search_thresholds_overridable_from_defaults_and_collection(tmp_path):
     assert config.min_rerank_score == 0.9
 
 
+def test_plugin_entries_default_to_empty(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[collections.docs]\ntool_prefix = "docs"\n')
+    config = ConfigManager(str(config_file)).get_collection_config("docs")
+    assert config.plugin == {}
+
+
+def test_plugin_entries_from_defaults_and_collection_supplement(tmp_path):
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text(
+        '[defaults]\n'
+        '[[defaults.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["rst"]\n'
+        'semantic_boundary_regexps = ["^=+"]\n'
+    )
+    base = tmp_path / "base.toml"
+    base.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["md"]\n'
+        'semantic_boundary_regexps = ["^#+"]\n'
+    )
+    config = ConfigManager([str(defaults), str(base)]).get_collection_config("docs")
+    assert set(config.plugin) == {".md", ".rst"}
+    # The defaults policy survives alongside the collection's own policy.
+    assert config.plugin[".rst"] == {"handler": "text", "semantic_boundary_regexps": ["^=+"]}
+    assert config.plugin[".md"] == {"handler": "text", "semantic_boundary_regexps": ["^#+"]}
+
+
+def test_collection_plugin_entry_overrides_default_per_extension(tmp_path):
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text(
+        '[defaults]\n'
+        '[[defaults.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["md"]\n'
+        'semantic_boundary_regexps = ["^#"]\n'
+        'default_marker = "default"\n'
+    )
+    base = tmp_path / "base.toml"
+    base.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["md"]\n'
+        'semantic_boundary_regexps = ["^##"]\n'
+        'collection_marker = "collection"\n'
+    )
+    config = ConfigManager([str(defaults), str(base)]).get_collection_config("docs")
+    # One effective policy for the extension: the collection entry wholly
+    # replaces the defaults entry, with no key-level merge.
+    policy = config.plugin.get(".md")
+    assert policy is not None
+    assert policy["semantic_boundary_regexps"] == ["^##"]
+    assert policy["collection_marker"] == "collection"
+    assert "default_marker" not in policy
+
+
+def test_plugin_entry_extensions_case_insensitive_and_dot_optional(tmp_path):
+    defaults = tmp_path / "defaults.toml"
+    defaults.write_text(
+        '[defaults]\n'
+        '[[defaults.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["MD"]\n'
+    )
+    base = tmp_path / "base.toml"
+    base.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = [".md"]\n'
+    )
+    config = ConfigManager([str(defaults), str(base)]).get_collection_config("docs")
+    # "MD" and ".md" are the same extension: one effective policy, keyed
+    # canonically.
+    assert set(config.plugin) == {".md"}
+    assert config.plugin[".md"]["handler"] == "text"
+
+
+def test_plugin_duplicate_extensions_within_one_list_last_wins(tmp_path):
+    base = tmp_path / "base.toml"
+    base.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["md"]\n'
+        'marker = "first"\n'
+        '\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = ["md"]\n'
+        'marker = "second"\n'
+    )
+    config = ConfigManager(str(base)).get_collection_config("docs")
+    assert set(config.plugin) == {".md"}
+    assert config.plugin[".md"]["marker"] == "second"
+
+
+def test_plugin_entry_requires_handler(tmp_path):
+    from pydantic import ValidationError
+    config_file = tmp_path / "invalid.toml"
+    config_file.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'extensions = ["md"]\n'
+    )
+    with pytest.raises(ValidationError, match="handler"):
+        ConfigManager(str(config_file)).get_collection_config("docs")
+
+
+def test_plugin_entry_requires_nonempty_extensions(tmp_path):
+    from pydantic import ValidationError
+    missing = tmp_path / "missing_extensions.toml"
+    missing.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+    )
+    with pytest.raises(ValidationError, match="extensions"):
+        ConfigManager(str(missing)).get_collection_config("docs")
+
+    empty_list = tmp_path / "empty_extensions.toml"
+    empty_list.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = []\n'
+    )
+    with pytest.raises(ValidationError, match="extensions"):
+        ConfigManager(str(empty_list)).get_collection_config("docs")
+
+    blank = tmp_path / "blank_extension.toml"
+    blank.write_text(
+        '[collections.docs]\n'
+        'tool_prefix = "docs"\n'
+        '[[collections.docs.plugin]]\n'
+        'handler = "text"\n'
+        'extensions = [""]\n'
+    )
+    with pytest.raises(ValidationError, match="non-empty"):
+        ConfigManager(str(blank)).get_collection_config("docs")
+
+
 class TestDeepMerge:
     def test_deep_merge_dicts(self):
         base = {"a": 1, "b": {"x": 10, "y": 20}, "c": [1, 2]}

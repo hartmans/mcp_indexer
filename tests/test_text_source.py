@@ -13,6 +13,7 @@ class SimpleCfg:
     def __init__(self, directory, **kwargs):
         self.source_blob = {"directory": directory, **kwargs}
         self.doc_summary_prompt = "Summarize the document"
+        self.plugin = {}
 
     def resolve_source_config(self, model):
         return model.model_validate(self.source_blob)

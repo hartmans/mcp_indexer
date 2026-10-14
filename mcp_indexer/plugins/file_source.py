@@ -165,11 +165,13 @@ P = TypeVar("P", bound=DocumentPlugin)
 class FileSource(DocumentSource[P]):
     """An DocumentSource for files on disk.
 
-    Discovery maps each file's extension to an interpretation policy
-    (code-defined) and constructs the selected plugin through the
-    handler-name registry, so enumeration and direct fetch select
-    consistently. The document's encoding and summary length come from the
-    source's config, not per-document arguments.
+    Discovery maps each file's extension to an interpretation policy:
+    the source's extension map starts from the code-defined mapping and
+    overrides it with the collection's configured plugin entries. The
+    policy's ``handler`` name picks the plugin class, resolved through
+    the handler-name registry, so enumeration and direct fetch select
+    consistently. The document's encoding and summary length come from
+    the source's config, not per-document arguments.
     """
     source_prefix = "file"
     safe_document_path_chars = "/-_.!@+[]()"
@@ -182,6 +184,10 @@ class FileSource(DocumentSource[P]):
             reranker=reranker,
         )
         self.source_config = collection_config.resolve_source_config(FileSourceConfig)
+        # Code-defined map first; the collection's resolved
+        # extension-to-policy map (merged defaults and collection
+        # entries) overrides per extension.
+        self._extension_map = {**_EXTENSION_POLICIES, **collection_config.plugin}
 
     def _is_included(self, path: Path) -> bool:
         if self.source_config.include:
@@ -215,11 +221,14 @@ class FileSource(DocumentSource[P]):
     def policy_for_path(self, path: Path) -> dict[str, Any]:
         """Choose the interpretation policy for a file.
 
-        The default is the code-defined extension-to-policy mapping; a
-        source that interprets its files specially may override this (or
+        The source's extension map starts from the code-defined
+        extension-to-policy mapping, overridden by the collection's
+        configured plugin entries; unknown extensions and extensionless
+        files fall back to :data:`TEXT_POLICY`. A source that
+        interprets its files specially may override this (or
         :meth:`make_document` directly).
         """
-        return extension_policy(path)
+        return self._extension_map.get(path.suffix.lower(), TEXT_POLICY)
 
     async def get_documents(self, last_modified: Optional[datetime] = None) -> AsyncGenerator[P, None]:
         root = self.source_config.directory

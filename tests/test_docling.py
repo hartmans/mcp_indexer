@@ -46,6 +46,7 @@ class SimpleCfg:
 
     def __init__(self, directory, **kwargs):
         self.source_blob = {"directory": str(directory), **kwargs}
+        self.plugin = {}
 
     def resolve_source_config(self, model):
         return model.model_validate(self.source_blob)

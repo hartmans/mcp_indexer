@@ -14,8 +14,9 @@ from mcp_indexer.plugins.wikipedia import WikipediaDocument
 
 
 class SimpleCfg:
-    def __init__(self, directory, **kwargs):
+    def __init__(self, directory, *, plugin=None, **kwargs):
         self.source_blob = {"directory": directory, **kwargs}
+        self.plugin = dict(plugin or {})
 
     def resolve_source_config(self, model):
         return model.model_validate(self.source_blob)
@@ -177,6 +178,46 @@ async def test_policy_from_source_is_read_only_input(temp_file_env, mock_context
     assert doc.policy == original
     assert doc.policy["handler"] == "text"
     assert MARKDOWN_POLICY == original
+
+
+@pytest.mark.asyncio
+async def test_collection_plugin_entries_override_code_map(temp_file_env, mock_context):
+    policy = {
+        "handler": "text",
+        "semantic_boundary_regexps": [r"(?m)^## only$"],
+    }
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env, plugin={".md": policy}))
+
+    doc = await source.fetch_document("a.md")
+    # The configured policy replaces the code map's entry wholesale: the
+    # code map's other keys do not leak in.
+    assert doc.policy is not MARKDOWN_POLICY
+    assert doc.policy == policy
+    assert "extensions" not in doc.policy
+    assert "embedding_boundary_regexps" not in doc.policy
+
+    # Extensions the collection did not configure keep the code map, and
+    # unknown or extensionless files still fall back to the text policy.
+    assert source.policy_for_path(Path("e.rst")) is RST_POLICY
+    assert source.policy_for_path(Path("g.foobar")) is TEXT_POLICY
+    assert source.policy_for_path(Path("noext")) is TEXT_POLICY
+
+
+@pytest.mark.asyncio
+async def test_collection_plugin_map_covers_multiple_extensions(temp_file_env, mock_context):
+    policy = {"handler": "text", "semantic_boundary_regexps": [r"(?m)^custom$"]}
+    source = FileSource("col", context=mock_context, collection_config=SimpleCfg(temp_file_env, plugin={".md": policy, ".markdown": policy}))
+
+    docs = {doc.document_id: doc async for doc in source.get_documents()}
+    # The configured policy covers both extensions; the suffix lookup
+    # normalizes case.
+    assert docs["a.md"].policy == policy
+    assert docs["b.markdown"].policy == policy
+    assert docs["UPPER.MD"].policy == policy
+    assert docs["a.md"].policy is not MARKDOWN_POLICY
+    # Extensions outside the map keep their code-defined policy.
+    assert docs["c.html"].policy is HTML_POLICY
+    assert docs["f.txt"].policy is TEXT_POLICY
 
 
 @pytest.mark.asyncio

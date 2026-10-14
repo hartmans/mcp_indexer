@@ -266,6 +266,20 @@ Configuration is managed via a TOML file and supports a hierarchical structure:
 
 *ConfigManager* is a class that collects all the configuration together.
 
+### Plugin extension policies
+
+The `plugin` field on `CollectionInfraConfig` is the resolved
+extension-to-policy map: canonical extension (lowercase, dotted) to
+policy dict, merged from the defaults and collection-level plugin
+lists in configuration (the configuration format is documented in the
+README). `FileSource` builds its effective extension map at
+construction by layering this map over the code-defined default map, so
+configured policies override per extension; `policy_for_path` looks
+the map up by the file's suffix, falling back to the default text
+policy for extensions absent from the map. The `extensions` key of the
+raw configuration entries is consumed by the merge and never reaches a
+plugin. Non-file sources ignore the map.
+
 ### Reranker configuration
 
 The optional global `[rerank]` section selects the single reranker shared by
