@@ -72,6 +72,11 @@ Phase 2 is pure DDL with no data dependency on phase 1's backfills, so
 it is applied even when phase 1's backfill is still pending; the exit
 code is then 1 and a re-run resumes phase 1 while phase 2 no-ops.
 
+Steps 4 and 15 also replace non-canonical FK shapes — an
+INITIALLY DEFERRED self-FK or work FK from an earlier model revision,
+or a self-FK without ON DELETE CASCADE — so every re-run converges
+toward the canonical constraints.
+
 ``document_chunk.text`` (exact-text retention) already exists in any
 database created after the model added the column; this migration does
 not touch it.
@@ -218,6 +223,27 @@ def not_null(cur, table: str, column: str) -> bool:
     return row is not None and row["is_nullable"] == "NO"
 
 
+# Canonical FK state: (condeferrable, condeferred, confdeltype) —
+# deferrable, initially immediate, ON DELETE CASCADE. Databases created
+# from an earlier model revision carry an INITIALLY DEFERRED
+# (collection, document) self-FK / work FK; steps 4 and 15 replace any
+# non-canonical shape so re-runs converge.
+CANONICAL_FK_STATE = (True, False, "c")
+
+
+def fk_state(cur, name: str) -> tuple[bool, bool, str] | None:
+    """(condeferrable, condeferred, confdeltype) for a constraint,
+    or None if it does not exist."""
+    cur.execute("""
+        SELECT condeferrable, condeferred, confdeltype
+        FROM pg_constraint WHERE conname = %s
+    """, (name,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return (row["condeferrable"], row["condeferred"], row["confdeltype"])
+
+
 def run(cur, sql: str, params: tuple = ()) -> int:
     cur.execute(sql, params)
     return cur.rowcount
@@ -239,6 +265,24 @@ CANONICAL_FK_DDL = [
     "chunk_summary (collection_id, document_id, summary_span) "
     "ON DELETE SET NULL (summary_span) DEFERRABLE",
 ]
+
+# Canonical shape for the two FKs whose earlier revisions differed from
+# models.py (the semantic self-FK lacked ON DELETE CASCADE; the work FK
+# was INITIALLY DEFERRED). Both are deferrable, initially immediate,
+# with ON DELETE CASCADE.
+SELF_FK_DDL = """
+    ALTER TABLE document_chunk ADD CONSTRAINT fk_document_chunk_semantic
+    FOREIGN KEY (collection_id, document_id, semantic_chunk_id)
+    REFERENCES document_chunk (collection_id, document_id, "order")
+    ON DELETE CASCADE DEFERRABLE
+"""
+
+WORK_FK_DDL = """
+    ALTER TABLE indexing_work ADD CONSTRAINT fk_indexing_work_parent
+    FOREIGN KEY (collection_id, parent_document_id)
+    REFERENCES document (collection_id, document_id)
+    ON DELETE CASCADE DEFERRABLE
+"""
 
 
 def step_fks(cur, dry: bool) -> None:
@@ -308,7 +352,8 @@ def step_chunk_columns(cur, dry: bool) -> None:
             if not dry:
                 run(cur, f"ALTER TABLE document_chunk ADD COLUMN {col} INTEGER")
             print(f"4. added document_chunk.{col}" + (" (dry-run)" if dry else ""))
-    if not constraint_exists(cur, "fk_document_chunk_semantic"):
+    state = fk_state(cur, "fk_document_chunk_semantic")
+    if state is None:
         # The self-FK's referenced key is the (collection, document, order)
         # unique constraint, which models.py declares but a legacy DB may
         # lack.
@@ -326,14 +371,17 @@ def step_chunk_columns(cur, dry: bool) -> None:
             print("4. added uq_document_chunk_order"
                   + (" (dry-run)" if dry else ""))
         if not dry:
-            run(cur, """
-                ALTER TABLE document_chunk ADD CONSTRAINT
-                fk_document_chunk_semantic
-                FOREIGN KEY (collection_id, document_id, semantic_chunk_id)
-                REFERENCES document_chunk (collection_id, document_id, "order")
-                DEFERRABLE
-            """)
+            run(cur, SELF_FK_DDL)
         print("4. added deferrable fk_document_chunk_semantic"
+              + (" (dry-run)" if dry else ""))
+    elif state != CANONICAL_FK_STATE:
+        # Databases from an earlier model revision carry an
+        # INITIALLY DEFERRED self-FK; replace it so re-runs converge.
+        if not dry:
+            run(cur, "ALTER TABLE document_chunk DROP CONSTRAINT "
+                     "fk_document_chunk_semantic")
+            run(cur, SELF_FK_DDL)
+        print("4. replaced non-canonical fk_document_chunk_semantic"
               + (" (dry-run)" if dry else ""))
     if "ix_document_chunk_order" not in table_indexes(cur, "document_chunk"):
         if not dry:
@@ -701,16 +749,21 @@ def step_indexing_work_index(cur, dry: bool) -> None:
 
 
 def step_indexing_work_fk(cur, dry: bool) -> None:
-    if not constraint_exists(cur, "fk_indexing_work_parent"):
+    state = fk_state(cur, "fk_indexing_work_parent")
+    if state is None:
         if not dry:
-            run(cur, """
-                ALTER TABLE indexing_work ADD CONSTRAINT fk_indexing_work_parent
-                FOREIGN KEY (collection_id, parent_document_id)
-                REFERENCES document (collection_id, document_id)
-                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-            """)
+            run(cur, WORK_FK_DDL)
         print("15. added deferrable fk_indexing_work_parent"
-              + ("" if not dry else " (dry-run)"))
+              + (" (dry-run)" if dry else ""))
+    elif state != CANONICAL_FK_STATE:
+        # Migrations from an earlier revision created this FK
+        # INITIALLY DEFERRED; replace it so re-runs converge.
+        if not dry:
+            run(cur, "ALTER TABLE indexing_work DROP CONSTRAINT "
+                     "fk_indexing_work_parent")
+            run(cur, WORK_FK_DDL)
+        print("15. replaced non-canonical fk_indexing_work_parent"
+              + (" (dry-run)" if dry else ""))
     else:
         print("15. fk_indexing_work_parent already present")
 
@@ -781,10 +834,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if sem_ok:
             step_strip_metadata(cur, dry)
-            # Commit before finalize: on databases whose canonical FKs
-            # are INITIALLY DEFERRED (models.py), the strip's UPDATEs
-            # leave pending trigger events that would block its
-            # SET NOT NULL ALTERs.
+            # Commit before finalize: databases created from an earlier
+            # model revision still carry an INITIALLY DEFERRED self-FK,
+            # and the strip's UPDATEs leave pending trigger events that
+            # would block its SET NOT NULL ALTERs.
             if not dry:
                 conn.commit()
             sem_ok = step_finalize(cur, dry)

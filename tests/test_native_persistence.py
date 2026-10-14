@@ -263,6 +263,57 @@ async def test_migration_from_semantic_complete_state(test_context, pg_url,
     assert migration.main(["--config", str(config_path)]) == 0
 
 
+async def test_migration_converges_non_canonical_fks(test_context, pg_url,
+                                                      tmp_path):
+    """A database from an earlier model revision (INITIALLY DEFERRED
+    self-FK and work FK) converges to the canonical deferrable,
+    initially immediate, ON DELETE CASCADE constraints on a re-run."""
+    import importlib.util
+    import sys
+    from sqlalchemy import text
+
+    spec = importlib.util.spec_from_file_location(
+        "migrate_schema",
+        Path(__file__).parents[1] / "scripts" / "migrate_schema.py",
+    )
+    migration = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = migration
+    spec.loader.exec_module(migration)
+
+    # Simulate the pre-change model: both FKs initially deferred.
+    async with test_context.engine.begin() as connection:
+        await connection.exec_driver_sql("""
+            ALTER TABLE document_chunk DROP CONSTRAINT fk_document_chunk_semantic""")
+        await connection.exec_driver_sql("""
+            ALTER TABLE document_chunk ADD CONSTRAINT fk_document_chunk_semantic
+            FOREIGN KEY (collection_id, document_id, semantic_chunk_id)
+            REFERENCES document_chunk (collection_id, document_id, "order")
+            ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED""")
+        await connection.exec_driver_sql("""
+            ALTER TABLE indexing_work DROP CONSTRAINT fk_indexing_work_parent""")
+        await connection.exec_driver_sql("""
+            ALTER TABLE indexing_work ADD CONSTRAINT fk_indexing_work_parent
+            FOREIGN KEY (collection_id, parent_document_id)
+            REFERENCES document (collection_id, document_id)
+            ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED""")
+
+    config_path = tmp_path / "migration.toml"
+    config_path.write_text(f"[server]\ndb_uri = \"{pg_url}\"\n")
+
+    assert migration.main(["--config", str(config_path)]) == 0
+
+    async with test_context.engine.connect() as connection:
+        states = (await connection.execute(text(
+            "SELECT condeferrable, condeferred, confdeltype "
+            "FROM pg_constraint WHERE conname IN "
+            "('fk_document_chunk_semantic', 'fk_indexing_work_parent') "
+            "ORDER BY conname"))).fetchall()
+    assert states == [(True, False, "c"), (True, False, "c")]
+
+    # Converged state: a second run is a complete no-op.
+    assert migration.main(["--config", str(config_path)]) == 0
+
+
 async def test_migration_backfill_derives_semantic_columns(test_context,
                                                             pg_url, tmp_path):
     """The backfill steps derive the semantic columns from legacy metadata.

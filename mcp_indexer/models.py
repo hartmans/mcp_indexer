@@ -78,7 +78,11 @@ class DocumentChunk(Base):
             ["document_chunk.collection_id", "document_chunk.document_id", "document_chunk.order"],
             name="fk_document_chunk_semantic",
             ondelete="CASCADE",
-            deferrable=True, initially="DEFERRED",
+            # Deferrable so out-of-order writes (e.g. a collection rename)
+            # can SET CONSTRAINTS DEFERRED; initially immediate so
+            # violations surface at the offending row and bulk writes do
+            # not queue deferred validation.
+            deferrable=True,
         ),
         ForeignKeyConstraint(
             ["collection_id", "document_id"],
@@ -262,7 +266,10 @@ class IndexingWork(Base):
             ["document.collection_id", "document.document_id"],
             name="fk_indexing_work_parent",
             ondelete="CASCADE",
-            deferrable=True, initially="DEFERRED",
+            # Deferrable, initially immediate: work entries are published
+            # after the parent Document row in the same transaction, so no
+            # write path needs the initial deferral.
+            deferrable=True,
         ),
     )
 
