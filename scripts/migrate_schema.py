@@ -90,6 +90,12 @@ depends on the value the corpus was indexed with); per-collection file
 locations and encodings come from each collection's source config.
 
 DDL steps take ``ACCESS EXCLUSIVE`` locks; run with writers stopped.
+
+The backfill steps are sized for multi-million-row tables: group
+aggregates run as window functions joined back on ``chunk_id`` (a
+simple key) rather than hash joins on JSON-derived keys, and the
+session sets ``work_mem``/``maintenance_work_mem`` to 4GB and
+``synchronous_commit = off`` (resumable bulk migration).
 """
 
 from __future__ import annotations
@@ -345,26 +351,26 @@ def step_semantic_chunk_id(cur, dry: bool) -> None:
         print("5. semantic_chunk_id: (dry-run)")
         return
     # Group min is computed over every row (unfiltered) so a resume never
-    # recomputes a group from a partial row set.
+    # recomputes a group from a partial row set. The MIN() window is one
+    # scan + sort of the whole table, and the join back is on chunk_id
+    # (unique): the legacy query joined on the JSON-derived (b, e) keys,
+    # which no index can serve, so the planner had to build a
+    # multi-million-row hash table on computed keys (hours on 6M rows
+    # with the default work_mem).
     n = run(cur, f"""
         UPDATE document_chunk c
-        SET {SEMANTIC_CHUNK_ID} = g.min_order
+        SET {SEMANTIC_CHUNK_ID} = f.min_order
         FROM (
-            SELECT collection_id, document_id, b, e, MIN("order") AS min_order
-            FROM (
-                SELECT collection_id, document_id,
-                       (metadata_str::json->>'b')::bigint AS b,
-                       (metadata_str::json->>'e')::bigint AS e,
-                       "order"
-                FROM document_chunk
-            ) t
-            GROUP BY collection_id, document_id, b, e
-        ) g
-        WHERE c.collection_id = g.collection_id
-          AND c.document_id = g.document_id
+            SELECT chunk_id,
+                   MIN("order") OVER (
+                       PARTITION BY collection_id, document_id,
+                           (metadata_str::json->>'b')::bigint,
+                           (metadata_str::json->>'e')::bigint
+                   ) AS min_order
+            FROM document_chunk
+        ) f
+        WHERE c.chunk_id = f.chunk_id
           AND c.{SEMANTIC_CHUNK_ID} IS NULL
-          AND (c.metadata_str::json->>'b')::bigint = g.b
-          AND (c.metadata_str::json->>'e')::bigint = g.e
     """)
     print(f"5. semantic_chunk_id: {n} rows updated")
 
@@ -386,7 +392,9 @@ def step_embedding_length(cur, dry: bool, max_size: int) -> None:
 
     A flagged row is the last row of its (b, e) group with
     s == max_size: the legacy tail-merge may have grown its text
-    without updating s, so those go to the file pass instead.
+    without updating s, so those go to the file pass instead. The
+    flagged set is materialized in the session-local flagged_rows
+    temp table by ensure_flagged_table, which must run first.
     """
     if dry:
         print(f"7. embedding_length (detector: s == {max_size}): (dry-run)")
@@ -395,29 +403,13 @@ def step_embedding_length(cur, dry: bool, max_size: int) -> None:
         UPDATE document_chunk c
         SET {EMBEDDING_LENGTH} = m.s
         FROM (
-            SELECT collection_id, document_id, chunk_id,
-                   (metadata_str::json->>'b')::bigint AS b,
-                   (metadata_str::json->>'e')::bigint AS e,
-                   (metadata_str::json->>'o')::bigint AS o,
-                   (metadata_str::json->>'s')::bigint AS s
+            SELECT chunk_id, (metadata_str::json->>'s')::bigint AS s
             FROM document_chunk
             WHERE {EMBEDDING_LENGTH} IS NULL
+              AND chunk_id NOT IN (SELECT chunk_id FROM flagged_rows)
         ) m
-        WHERE c.collection_id = m.collection_id
-          AND c.document_id = m.document_id
-          AND c.chunk_id = m.chunk_id
-          AND NOT (
-              m.s = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM document_chunk c2
-                  WHERE c2.collection_id = m.collection_id
-                    AND c2.document_id = m.document_id
-                    AND (c2.metadata_str::json->>'b')::bigint = m.b
-                    AND (c2.metadata_str::json->>'e')::bigint = m.e
-                    AND (c2.metadata_str::json->>'o')::bigint > m.o
-              )
-          )
-    """, (max_size,))
+        WHERE c.chunk_id = m.chunk_id
+    """)
     print(f"7. embedding_length: {n} rows updated from metadata s")
 
 
@@ -425,40 +417,58 @@ def step_embedding_length(cur, dry: bool, max_size: int) -> None:
 # Phase 1, step 8: threaded file pass over flagged rows
 # ---------------------------------------------------------------------------
 
-FLAGGED_SQL = """
-    SELECT m.collection_id, m.document_id, m.chunk_id, m.b, m.e, m.o
+# Flagged rows for the file pass: the last row (by `o`) of each legacy
+# `(b, e)` group whose `s` equals max_size — the legacy tail-merge may
+# have grown that chunk's text without updating s. The MAX() window is
+# one scan + sort of the table; the previous formulation was a
+# correlated anti-join that probed every row of each group with JSON
+# comparisons, which is O(n^2) on a multi-million-row table.
+FLAGGED_WINDOW_SQL = """
+    SELECT chunk_id, collection_id, document_id, b, e, o
     FROM (
-        SELECT collection_id, document_id, chunk_id,
+        SELECT chunk_id, collection_id, document_id,
                (metadata_str::json->>'b')::bigint AS b,
                (metadata_str::json->>'e')::bigint AS e,
                (metadata_str::json->>'o')::bigint AS o,
-               (metadata_str::json->>'s')::bigint AS s
+               (metadata_str::json->>'s')::bigint AS s,
+               MAX((metadata_str::json->>'o')::bigint) OVER (
+                   PARTITION BY collection_id, document_id,
+                       (metadata_str::json->>'b')::bigint,
+                       (metadata_str::json->>'e')::bigint
+               ) AS group_max_o
         FROM document_chunk
-        WHERE {null_filter}
-    ) m
-    WHERE m.s = %s
-      AND NOT EXISTS (
-          SELECT 1 FROM document_chunk c2
-          WHERE c2.collection_id = m.collection_id
-            AND c2.document_id = m.document_id
-            AND (c2.metadata_str::json->>'b')::bigint = m.b
-            AND (c2.metadata_str::json->>'e')::bigint = m.e
-            AND (c2.metadata_str::json->>'o')::bigint > m.o
-      )
+        {null_filter}
+    ) t
+    WHERE o = group_max_o AND s = %s
 """
 
 
-def build_tasks(cur, max_size: int,
-                only_null: bool = True) -> list[dict]:
-    """Flagged rows: the last row of a (b, e) group with s == max_size.
+def ensure_flagged_table(cur, max_size: int, only_null: bool) -> int:
+    """(Re)build the session-local flagged_rows temp table.
 
-    ``only_null`` restricts to rows whose embedding_length is still NULL;
-    the column may not exist yet on a fresh dry-run, so the caller may
-    pass False in that case.
+    ON COMMIT PRESERVE ROWS keeps it across the commit between the
+    backfill steps and the file pass; it is dropped automatically when
+    the session ends. ``only_null`` restricts to rows whose
+    embedding_length is still NULL (the column may not exist on a fresh
+    dry-run, so the caller passes False there). Harmless in a dry-run:
+    it is session scratch, never written to the catalog. Returns the
+    flagged count.
     """
-    cur.execute(FLAGGED_SQL.format(
-        null_filter=(f"{EMBEDDING_LENGTH} IS NULL" if only_null else "TRUE")),
-        (max_size,))
+    sql = (
+        "CREATE TEMP TABLE flagged_rows ON COMMIT PRESERVE ROWS AS\n"
+        + FLAGGED_WINDOW_SQL.format(null_filter=(
+            f"WHERE {EMBEDDING_LENGTH} IS NULL" if only_null else "WHERE TRUE"))
+    )
+    cur.execute(sql, (max_size,))
+    return cur.rowcount
+
+
+def select_flagged_rows(cur) -> list[dict]:
+    cur.execute("""
+        SELECT chunk_id, collection_id, document_id, b, e, o
+        FROM flagged_rows
+        ORDER BY collection_id, document_id, o
+    """)
     return cur.fetchall()
 
 
@@ -725,7 +735,16 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = psycopg.connect(db_uri, row_factory=dict_row,
                            autocommit=False)
+    # Session settings for multi-million-row backfills: keep the window
+    # sorts, hash tables, and the one-off index build in RAM (with the
+    # 4MB work_mem default the step-5 aggregate spills to disk and can
+    # take hours on a 6M-row table), and skip per-commit fsyncs — the
+    # migration is resumable, so a crash loses at most the in-flight
+    # batch, which the resume re-selects.
     cur = conn.cursor()
+    cur.execute("SET work_mem = '4GB'")
+    cur.execute("SET maintenance_work_mem = '4GB'")
+    cur.execute("SET synchronous_commit = off")
     dry = args.dry_run
     sem_ok = True
 
@@ -739,17 +758,18 @@ def main(argv: list[str] | None = None) -> int:
 
         step_semantic_chunk_id(cur, dry)
         step_embedding_offset(cur, dry)
+        only_null = (not dry
+                     or EMBEDDING_LENGTH in table_columns(cur,
+                                                          "document_chunk"))
+        # Session scratch shared by step 7 (exclusion) and the file pass
+        # (read): the flagged set, computed once. Harmless in a dry-run.
+        n_flagged = ensure_flagged_table(cur, max_size, only_null)
+        print(f"7. flagged rows (detector: s == {max_size}): {n_flagged}")
         step_embedding_length(cur, dry, max_size)
         if not dry:
             conn.commit()
 
-        if (not dry
-                or EMBEDDING_LENGTH in table_columns(cur, "document_chunk")):
-            flagged = build_tasks(cur, max_size, only_null=True)
-        else:
-            # Fresh dry-run: the columns do not exist yet, so select the
-            # flagged set from the metadata alone.
-            flagged = build_tasks(cur, max_size, only_null=False)
+        flagged = select_flagged_rows(cur)
         sem_ok = file_pass(flagged, source_info, cur, args.workers, dry)
         if sem_ok and not dry:
             conn.commit()
@@ -761,6 +781,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if sem_ok:
             step_strip_metadata(cur, dry)
+            # Commit before finalize: on databases whose canonical FKs
+            # are INITIALLY DEFERRED (models.py), the strip's UPDATEs
+            # leave pending trigger events that would block its
+            # SET NOT NULL ALTERs.
+            if not dry:
+                conn.commit()
             sem_ok = step_finalize(cur, dry)
 
         # Phase 2 is pure DDL with no data dependency on the semantic

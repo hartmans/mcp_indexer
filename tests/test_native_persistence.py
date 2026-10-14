@@ -4,6 +4,7 @@ import asyncio
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import os
 
 import pytest
@@ -260,3 +261,104 @@ async def test_migration_from_semantic_complete_state(test_context, pg_url,
 
     # Fully migrated state: a second run is a complete no-op.
     assert migration.main(["--config", str(config_path)]) == 0
+
+
+async def test_migration_backfill_derives_semantic_columns(test_context,
+                                                            pg_url, tmp_path):
+    """The backfill steps derive the semantic columns from legacy metadata.
+
+    Seeds two documents with legacy chunk metadata (b, e, o, s), relaxes
+    the NOT NULL constraints to simulate the pre-backfill state, then
+    runs the backfill steps — including the file pass against a real
+    file — and asserts the derived values.
+    """
+    import importlib.util
+    import sys
+    import psycopg
+    from psycopg.rows import dict_row
+
+    spec = importlib.util.spec_from_file_location(
+        "migrate_schema",
+        Path(__file__).parents[1] / "scripts" / "migrate_schema.py",
+    )
+    migration = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = migration
+    spec.loader.exec_module(migration)
+
+    conn = psycopg.connect(pg_url.replace("+psycopg", ""),
+                           row_factory=dict_row, autocommit=False)
+    cur = conn.cursor()
+    try:
+        zero_vec = "[" + ",".join(["0.0"] * VECTOR_DIMENSIONS) + "]"
+
+        # Post-DDL, pre-backfill: the columns exist but are nullable and
+        # empty (create_all makes two of them NOT NULL; relax that).
+        for col in ("semantic_chunk_id", "embedding_offset"):
+            cur.execute(
+                f"ALTER TABLE document_chunk "
+                f"ALTER COLUMN {col} DROP NOT NULL")
+
+        for doc in ("doc-a.txt", "doc-b.txt"):
+            cur.execute(
+                "INSERT INTO document (collection_id, document_id, title, "
+                "title_strength, embedding, keywords, summary, "
+                "last_modified) VALUES ('col1', %s, %s, 1, %s, '{}', "
+                "'s', now())", (doc, doc, zero_vec))
+        # Legacy rows: doc-a is one semantic chunk [0, 1000) tiled by two
+        # embedding chunks (last s != max_size, so no tail-merge flag);
+        # doc-b's last chunk has s == max_size, so it is flagged and its
+        # length comes from the file (1500 chars), not from s.
+        rows = [
+            ("doc-a.txt", 0, "a0", 0, 1000, 0, 300),
+            ("doc-a.txt", 1, "a1", 0, 1000, 300, 700),
+            ("doc-b.txt", 0, "b0", 0, 1500, 0, 500),
+            ("doc-b.txt", 1, "b1", 0, 1500, 500, 500),
+        ]
+        for doc, order, chunk, b, e, o, s in rows:
+            cur.execute(
+                "INSERT INTO document_chunk (collection_id, document_id, "
+                "chunk_id, \"order\", embedding, summary_span, "
+                "semantic_chunk_id, embedding_offset, semantic_length, "
+                "embedding_length, metadata_str) "
+                "VALUES ('col1', %s, %s, %s, %s, NULL, NULL, NULL, NULL, "
+                "NULL, %s)",
+                (doc, chunk, order, zero_vec,
+                 json.dumps({"b": b, "e": e, "o": o, "s": s})))
+        conn.commit()
+
+        (tmp_path / "doc-b.txt").write_text("x" * 1500)
+        source_info = {"col1": (tmp_path, "utf-8")}
+
+        migration.step_semantic_chunk_id(cur, dry=False)
+        migration.step_embedding_offset(cur, dry=False)
+        assert migration.ensure_flagged_table(
+            cur, max_size=500, only_null=True) == 1
+        migration.step_embedding_length(cur, dry=False, max_size=500)
+        conn.commit()
+        migration.file_pass(migration.select_flagged_rows(cur),
+                            source_info, cur, 1, dry=False)
+        conn.commit()
+        migration.step_semantic_length(cur, dry=False)
+        migration.step_strip_metadata(cur, dry=False)
+        conn.commit()
+        assert migration.step_finalize(cur, dry=False)
+        conn.commit()
+
+        def row(doc, order):
+            cur.execute(
+                "SELECT semantic_chunk_id, embedding_offset, "
+                "embedding_length, semantic_length, metadata_str "
+                "FROM document_chunk WHERE document_id = %s AND "
+                "\"order\" = %s", (doc, order))
+            r = cur.fetchone()
+            return (r["semantic_chunk_id"], r["embedding_offset"],
+                    r["embedding_length"], r["semantic_length"],
+                    json.loads(r["metadata_str"]))
+
+        assert row("doc-a.txt", 0) == (0, 0, 300, 1000, {"b": 0, "e": 1000})
+        assert row("doc-a.txt", 1) == (0, 300, 700, 1000, {"b": 0, "e": 1000})
+        assert row("doc-b.txt", 0) == (0, 0, 500, 1500, {"b": 0, "e": 1500})
+        # The flagged row got its length from the file read, not s.
+        assert row("doc-b.txt", 1) == (0, 500, 1000, 1500, {"b": 0, "e": 1500})
+    finally:
+        conn.close()
