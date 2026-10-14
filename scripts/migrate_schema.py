@@ -25,7 +25,7 @@ Ordered steps (each inspects before acting, so re-runs are no-ops):
    (any existing constraint on those endpoints is dropped first,
    whether PG-generated or named).
 3. ``document.parent_document_id`` + deferrable self FK.
-4. ``document_chunk`` columns + semantic self FK + order index.
+4. ``document_chunk`` columns + semantic self FK.
 5. ``semantic_chunk_id`` backfill: ``min(order)`` of each
    ``(collection, document, b, e)`` group.
 6. ``embedding_offset`` backfill from metadata ``o`` (always a true
@@ -37,7 +37,9 @@ Ordered steps (each inspects before acting, so re-runs are no-ops):
    everywhere else.
 8. File pass (threaded): for the flagged rows, read the semantic
    chunk's ``[b, e)`` bytes from the source file, decode in the
-   source's encoding, and set ``embedding_length = char_len - o``.
+   source's encoding with errors=replace (the same convention as
+   text_document.fetch_chunk, which is how the chunk text itself was
+   produced), and set ``embedding_length = char_len - o``.
 9. ``semantic_length`` backfill: the sum of each semantic chunk
    group's ``embedding_length``. The legacy chunker tiles the semantic
    chunk with its embedding chunks, so the sum is the semantic chunk's
@@ -581,7 +583,11 @@ def file_pass(rows: list[dict], source_info: dict[str, tuple[Path, str]],
                 with open(path, "rb") as fh:
                     fh.seek(t.b)
                     data = fh.read(t.e - t.b)
-                char_len = len(data.decode(t.encoding))
+                # errors="replace" matches text_document.fetch_chunk:
+                # the chunk text was produced by that same decode, so a
+                # byte the source encoding rejects becomes U+FFFD here
+                # too, and char_len agrees with the stored text.
+                char_len = len(data.decode(t.encoding, errors="replace"))
                 with lock:
                     results[i] = (char_len - t.o_last, None)
             except Exception as exc:  # noqa: BLE001 - report, abort

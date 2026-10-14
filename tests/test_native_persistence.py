@@ -356,10 +356,13 @@ async def test_migration_backfill_derives_semantic_columns(test_context,
                                                             pg_url, tmp_path):
     """The backfill steps derive the semantic columns from legacy metadata.
 
-    Seeds two documents with legacy chunk metadata (b, e, o, s), relaxes
-    the NOT NULL constraints to simulate the pre-backfill state, then
-    runs the backfill steps — including the file pass against a real
-    file — and asserts the derived values.
+    Seeds three documents with legacy chunk metadata (b, e, o, s),
+    relaxes the NOT NULL constraints to simulate the pre-backfill
+    state, then runs the backfill steps — including the file pass
+    against real files — and asserts the derived values. doc-c's
+    flagged range contains bytes invalid in the source encoding; the
+    file pass decodes with errors=replace (as fetch_chunk does) and
+    the length counts the replacement characters.
     """
     import importlib.util
     import sys
@@ -387,7 +390,7 @@ async def test_migration_backfill_derives_semantic_columns(test_context,
                 f"ALTER TABLE document_chunk "
                 f"ALTER COLUMN {col} DROP NOT NULL")
 
-        for doc in ("doc-a.txt", "doc-b.txt"):
+        for doc in ("doc-a.txt", "doc-b.txt", "doc-c.txt"):
             cur.execute(
                 "INSERT INTO document (collection_id, document_id, title, "
                 "title_strength, embedding, keywords, summary, "
@@ -396,12 +399,15 @@ async def test_migration_backfill_derives_semantic_columns(test_context,
         # Legacy rows: doc-a is one semantic chunk [0, 1000) tiled by two
         # embedding chunks (last s != max_size, so no tail-merge flag);
         # doc-b's last chunk has s == max_size, so it is flagged and its
-        # length comes from the file (1500 chars), not from s.
+        # length comes from the file (1500 chars), not from s; doc-c's
+        # single chunk is flagged too, and its [0, 3) range holds bytes
+        # invalid in utf-8.
         rows = [
             ("doc-a.txt", 0, "a0", 0, 1000, 0, 300),
             ("doc-a.txt", 1, "a1", 0, 1000, 300, 700),
             ("doc-b.txt", 0, "b0", 0, 1500, 0, 500),
             ("doc-b.txt", 1, "b1", 0, 1500, 500, 500),
+            ("doc-c.txt", 0, "c0", 0, 3, 0, 500),
         ]
         for doc, order, chunk, b, e, o, s in rows:
             cur.execute(
@@ -416,12 +422,13 @@ async def test_migration_backfill_derives_semantic_columns(test_context,
         conn.commit()
 
         (tmp_path / "doc-b.txt").write_text("x" * 1500)
+        (tmp_path / "doc-c.txt").write_bytes(b"\xff\xfeA")
         source_info = {"col1": (tmp_path, "utf-8")}
 
         migration.step_semantic_chunk_id(cur, dry=False)
         migration.step_embedding_offset(cur, dry=False)
         assert migration.ensure_flagged_table(
-            cur, max_size=500, only_null=True) == 1
+            cur, max_size=500, only_null=True) == 2
         migration.step_embedding_length(cur, dry=False, max_size=500)
         conn.commit()
         migration.file_pass(migration.select_flagged_rows(cur),
@@ -449,5 +456,9 @@ async def test_migration_backfill_derives_semantic_columns(test_context,
         assert row("doc-b.txt", 0) == (0, 0, 500, 1500, {"b": 0, "e": 1500})
         # The flagged row got its length from the file read, not s.
         assert row("doc-b.txt", 1) == (0, 500, 1000, 1500, {"b": 0, "e": 1500})
+        # The invalid bytes decoded to two replacement characters:
+        # b"\xff\xfeA" -> "\ufffd\ufffdA", length 3, so the length is
+        # 3 - o (0).
+        assert row("doc-c.txt", 0) == (0, 0, 3, 3, {"b": 0, "e": 3})
     finally:
         conn.close()
