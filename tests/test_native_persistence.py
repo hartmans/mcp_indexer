@@ -167,8 +167,8 @@ async def test_manual_migration_from_legacy_constraints(test_context, pg_url):
     from psycopg.rows import dict_row
 
     spec = importlib.util.spec_from_file_location(
-        "migrate_semantic_schema",
-        Path(__file__).parents[1] / "scripts" / "migrate_semantic_schema.py",
+        "migrate_schema",
+        Path(__file__).parents[1] / "scripts" / "migrate_schema.py",
     )
     migration = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = migration
@@ -206,3 +206,57 @@ async def test_manual_migration_from_legacy_constraints(test_context, pg_url):
         conn.commit()
     finally:
         conn.close()
+
+
+async def test_migration_from_semantic_complete_state(test_context, pg_url,
+                                                      tmp_path):
+    """migrate_schema.py completes a database whose semantic phase has
+    already run but whose subdocument DDL has not: phase 1 no-ops,
+    phase 2 applies, the exit code is 0, and a re-run is a no-op."""
+    import importlib.util
+    import sys
+    from sqlalchemy import text
+
+    spec = importlib.util.spec_from_file_location(
+        "migrate_schema",
+        Path(__file__).parents[1] / "scripts" / "migrate_schema.py",
+    )
+    migration = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = migration
+    spec.loader.exec_module(migration)
+
+    # The fixture created the full current schema; roll back the
+    # subdocument parts to simulate a semantic-complete database.
+    async with test_context.engine.begin() as connection:
+        await connection.exec_driver_sql("DROP INDEX ix_indexing_work_parent")
+        await connection.exec_driver_sql("DROP TABLE indexing_work")
+        await connection.exec_driver_sql(
+            "ALTER TABLE document DROP COLUMN metadata_dict")
+
+    config_path = tmp_path / "migration.toml"
+    config_path.write_text(f"[server]\ndb_uri = \"{pg_url}\"\n")
+
+    assert migration.main(["--config", str(config_path)]) == 0
+
+    async with test_context.engine.connect() as connection:
+        cols = (await connection.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'document' "
+            "AND column_name = 'metadata_dict'"))).fetchall()
+        assert len(cols) == 1
+        tables = (await connection.execute(text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' "
+            "AND table_name = 'indexing_work'"))).fetchall()
+        assert len(tables) == 1
+        indexes = (await connection.execute(text(
+            "SELECT 1 FROM pg_indexes "
+            "WHERE indexname = 'ix_indexing_work_parent'"))).fetchall()
+        assert len(indexes) == 1
+        fks = (await connection.execute(text(
+            "SELECT condeferrable FROM pg_constraint "
+            "WHERE conname = 'fk_indexing_work_parent'"))).fetchall()
+        assert len(fks) == 1 and fks[0][0] is True
+
+    # Fully migrated state: a second run is a complete no-op.
+    assert migration.main(["--config", str(config_path)]) == 0

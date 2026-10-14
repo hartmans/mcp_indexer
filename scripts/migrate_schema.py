@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Idempotent, resumable schema migration for the semantic-chunk layout.
+"""Idempotent, resumable schema migration for the current database layout.
 
-Folded in (previously run separately as ``migrate_native_sources.sql``):
-orphan ``chunk_summary`` cleanup and re-creation of the
-``document_chunk``/``chunk_summary`` foreign keys as deferrable.
+Combined from ``migrate_semantic_schema.py`` (the semantic-chunk layout,
+itself folded in from ``migrate_native_sources.sql``) and
+``migrate_subdoc_schema.py`` (the subdocument spike's storage), so a
+database reaches the current schema with exactly one script, from any
+starting state: a fresh legacy database, a database where the semantic
+phase already ran (phase 1 is then a no-op and phase 2 applies), or a
+fully migrated database (complete no-op).
 
-Adds to the legacy layout (``o``/``s`` char offsets inside each chunk's
-``metadata_str`` JSON, no semantic-chunk grouping, no parent-document
-hierarchy):
+Phase 1 — semantic-chunk schema. Adds to the legacy layout
+(``o``/``s`` char offsets inside each chunk's ``metadata_str`` JSON, no
+semantic-chunk grouping, no parent-document hierarchy):
 
 * ``document.parent_document_id`` (nullable; left nullable even when
   fully populated, to stay open for documents that are not sub-documents).
@@ -44,17 +48,48 @@ Ordered steps (each inspects before acting, so re-runs are no-ops):
 11. Verify zero ``NULL``s and ``SET NOT NULL`` on the four
     ``document_chunk`` columns; report counts.
 
-Resume: unprocessed rows are identified by the columns being
+Phase 2 — subdocument schema. Adds the storage introduced by the
+subdocument/Docling spike:
+
+* ``document.metadata_dict`` (JSON, nullable) — the JSON-compatible
+  remainder of ``get_metadata()`` after title and keywords are stored in
+  their dedicated columns.
+* ``indexing_work`` — durable pending sub-document work: the full
+  collection-local ID of a discovered child (the target) plus its
+  parent, published atomically with the parent's own rows and retired
+  when the target is indexed or fails.
+
+Ordered steps (each inspects before acting, so re-runs are no-ops):
+
+12. ``document.metadata_dict`` (JSON, nullable).
+13. ``indexing_work`` table (composite primary key
+    ``(collection_id, document_id)``, NOT NULL ``parent_document_id``).
+14. ``ix_indexing_work_parent`` index.
+15. Deferrable ``fk_indexing_work_parent`` (the parent must have a
+    Document row; CASCADE removes a parent's work entries with it).
+
+Phase 2 is pure DDL with no data dependency on phase 1's backfills, so
+it is applied even when phase 1's backfill is still pending; the exit
+code is then 1 and a re-run resumes phase 1 while phase 2 no-ops.
+
+``document_chunk.text`` (exact-text retention) already exists in any
+database created after the model added the column; this migration does
+not touch it.
+
+Resume (phase 1): unprocessed rows are identified by the columns being
 ``NULL``; nothing is dropped. An interruption loses at most the
 in-flight batch, which is re-selected on restart.
 
 Usage (per our standard argument processing):
-    python scripts/migrate_semantic_schema.py --config config.toml
-    python scripts/migrate_semantic_schema.py --config a.toml --config b.toml
+    python scripts/migrate_schema.py --config config.toml
+    python scripts/migrate_schema.py --config a.toml --config b.toml
+    python scripts/migrate_schema.py --config config.toml --dry-run
 
 ``max_size`` is read from the server config (the tail-merge detector
 depends on the value the corpus was indexed with); per-collection file
 locations and encodings come from each collection's source config.
+
+DDL steps take ``ACCESS EXCLUSIVE`` locks; run with writers stopped.
 """
 
 from __future__ import annotations
@@ -87,8 +122,8 @@ CHUNK_COLS = (SEMANTIC_CHUNK_ID, EMBEDDING_OFFSET,
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Migrate document_chunk/document to the semantic-chunk "
-                    "schema (idempotent, resumable).",
+        description="Migrate to the current schema (semantic-chunk layout "
+                    "plus subdocument storage; idempotent, resumable).",
     )
     parser.add_argument(
         "-c", "--config", action="append", default=[], metavar="PATH",
@@ -125,8 +160,25 @@ def table_indexes(cur, table: str) -> set[str]:
     return {r["indexname"] for r in cur.fetchall()}
 
 
-def fk_exists(cur, name: str) -> bool:
+def table_exists(cur, table: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = %s", (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def column_exists(cur, table: str, column: str) -> bool:
+    return column in table_columns(cur, table)
+
+
+def constraint_exists(cur, name: str) -> bool:
     cur.execute("SELECT 1 FROM pg_constraint WHERE conname = %s", (name,))
+    return cur.fetchone() is not None
+
+
+def index_exists(cur, name: str) -> bool:
+    cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (name,))
     return cur.fetchone() is not None
 
 
@@ -166,7 +218,7 @@ def run(cur, sql: str, params: tuple = ()) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Steps 1-4: schema (folded-in native-sources SQL + new columns/FKs)
+# Phase 1, steps 1-4: schema (folded-in native-sources SQL + new columns/FKs)
 # ---------------------------------------------------------------------------
 
 CANONICAL_FK_DDL = [
@@ -231,7 +283,7 @@ def step_parent(cur, dry: bool) -> None:
             run(cur, "ALTER TABLE document ADD COLUMN parent_document_id VARCHAR")
         print("3. added document.parent_document_id"
               + (" (dry-run)" if dry else ""))
-    if not fk_exists(cur, "fk_document_parent"):
+    if not constraint_exists(cur, "fk_document_parent"):
         if not dry:
             run(cur, """
                 ALTER TABLE document ADD CONSTRAINT fk_document_parent
@@ -250,7 +302,7 @@ def step_chunk_columns(cur, dry: bool) -> None:
             if not dry:
                 run(cur, f"ALTER TABLE document_chunk ADD COLUMN {col} INTEGER")
             print(f"4. added document_chunk.{col}" + (" (dry-run)" if dry else ""))
-    if not fk_exists(cur, "fk_document_chunk_semantic"):
+    if not constraint_exists(cur, "fk_document_chunk_semantic"):
         # The self-FK's referenced key is the (collection, document, order)
         # unique constraint, which models.py declares but a legacy DB may
         # lack.
@@ -285,7 +337,7 @@ def step_chunk_columns(cur, dry: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Steps 5-7: pure-SQL backfills
+# Phase 1, steps 5-7: pure-SQL backfills
 # ---------------------------------------------------------------------------
 
 def step_semantic_chunk_id(cur, dry: bool) -> None:
@@ -370,7 +422,7 @@ def step_embedding_length(cur, dry: bool, max_size: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 8: threaded file pass over flagged rows
+# Phase 1, step 8: threaded file pass over flagged rows
 # ---------------------------------------------------------------------------
 
 FLAGGED_SQL = """
@@ -506,7 +558,7 @@ def file_pass(rows: list[dict], source_info: dict[str, tuple[Path, str]],
 
 
 # ---------------------------------------------------------------------------
-# Steps 9-11
+# Phase 1, steps 9-11
 # ---------------------------------------------------------------------------
 
 def step_semantic_length(cur, dry: bool) -> None:
@@ -588,6 +640,71 @@ def step_finalize(cur, dry: bool) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Phase 2, steps 12-15: subdocument storage
+# ---------------------------------------------------------------------------
+
+def step_metadata_dict(cur, dry: bool) -> None:
+    if not column_exists(cur, "document", "metadata_dict"):
+        if not dry:
+            run(cur, "ALTER TABLE document ADD COLUMN metadata_dict JSON")
+        print("12. added document.metadata_dict"
+              + ("" if not dry else " (dry-run)"))
+    else:
+        print("12. document.metadata_dict already present")
+
+
+def step_indexing_work_table(cur, dry: bool) -> None:
+    if not table_exists(cur, "indexing_work"):
+        if not dry:
+            run(cur, """
+                CREATE TABLE indexing_work (
+                    collection_id VARCHAR NOT NULL,
+                    document_id VARCHAR NOT NULL,
+                    parent_document_id VARCHAR NOT NULL,
+                    PRIMARY KEY (collection_id, document_id)
+                )
+            """)
+        print("13. created indexing_work" + ("" if not dry else " (dry-run)"))
+    else:
+        # A partial run may have created the table without the column;
+        # verify the canonical shape.
+        if not column_exists(cur, "indexing_work", "parent_document_id"):
+            if not dry:
+                run(cur, "ALTER TABLE indexing_work "
+                        "ADD COLUMN parent_document_id VARCHAR NOT NULL")
+            print("13. added indexing_work.parent_document_id"
+                  + ("" if not dry else " (dry-run)"))
+        else:
+            print("13. indexing_work already present")
+
+
+def step_indexing_work_index(cur, dry: bool) -> None:
+    if not index_exists(cur, "ix_indexing_work_parent"):
+        if not dry:
+            run(cur, "CREATE INDEX ix_indexing_work_parent "
+                    "ON indexing_work (collection_id, parent_document_id)")
+        print("14. added ix_indexing_work_parent"
+              + ("" if not dry else " (dry-run)"))
+    else:
+        print("14. ix_indexing_work_parent already present")
+
+
+def step_indexing_work_fk(cur, dry: bool) -> None:
+    if not constraint_exists(cur, "fk_indexing_work_parent"):
+        if not dry:
+            run(cur, """
+                ALTER TABLE indexing_work ADD CONSTRAINT fk_indexing_work_parent
+                FOREIGN KEY (collection_id, parent_document_id)
+                REFERENCES document (collection_id, document_id)
+                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+            """)
+        print("15. added deferrable fk_indexing_work_parent"
+              + ("" if not dry else " (dry-run)"))
+    else:
+        print("15. fk_indexing_work_parent already present")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not args.config:
@@ -610,9 +727,10 @@ def main(argv: list[str] | None = None) -> int:
                            autocommit=False)
     cur = conn.cursor()
     dry = args.dry_run
-    ok = True
+    sem_ok = True
 
     try:
+        print("== semantic-chunk schema ==")
         step_fks(cur, dry)
         step_parent(cur, dry)
         step_chunk_columns(cur, dry)
@@ -632,27 +750,40 @@ def main(argv: list[str] | None = None) -> int:
             # Fresh dry-run: the columns do not exist yet, so select the
             # flagged set from the metadata alone.
             flagged = build_tasks(cur, max_size, only_null=False)
-        ok = file_pass(flagged, source_info, cur, args.workers, dry)
-        if ok and not dry:
+        sem_ok = file_pass(flagged, source_info, cur, args.workers, dry)
+        if sem_ok and not dry:
             conn.commit()
 
-        if ok:
+        if sem_ok:
             step_semantic_length(cur, dry)
             if not dry:
                 conn.commit()
 
-        if ok:
+        if sem_ok:
             step_strip_metadata(cur, dry)
-            ok = step_finalize(cur, dry)
-        if ok and not dry:
+            sem_ok = step_finalize(cur, dry)
+
+        # Phase 2 is pure DDL with no data dependency on the semantic
+        # backfills, so it proceeds even when the backfill is pending.
+        print("== subdocument schema ==")
+        step_metadata_dict(cur, dry)
+        step_indexing_work_table(cur, dry)
+        step_indexing_work_index(cur, dry)
+        step_indexing_work_fk(cur, dry)
+        if not dry:
             conn.commit()
+
+        if sem_ok and not dry:
             print("migration complete")
+        elif not sem_ok:
+            print("subdocument DDL applied; semantic backfill "
+                  "incomplete - re-run to resume", file=sys.stderr)
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return 0 if ok else 1
+    return 0 if sem_ok else 1
 
 
 if __name__ == "__main__":

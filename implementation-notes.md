@@ -30,13 +30,16 @@ window can see stale stored results until maintenance finishes.
 
 ## Production steps for review
 
-1. Review `scripts/migrate_semantic_schema.py` and back up the production
+1. Review `scripts/migrate_schema.py` and back up the production
    database. With application writers stopped, run it against the intended
    database with `--config` (preview with `--dry-run`). It is idempotent and
    resumable: it applies the native-sources FK cleanup, adds the
    parent/semantic-chunk schema, backfills from the legacy metadata, reads
    flagged chunks from the source files, strips the legacy `o`/`s` metadata,
-   and `SET NOT NULL`s the new columns. The cleanup is recoverable through the
+   and `SET NOT NULL`s the new columns, then adds the subdocument storage
+   (`document.metadata_dict` and the `indexing_work` table). It also works
+   when the semantic phase already ran: that phase no-ops and only the
+   subdocument DDL applies. The cleanup is recoverable through the
    backup before the script runs, not after commit without a backup.
    Do not use the new maintenance code against the old schema.
 2. Run the application and PostgreSQL tests in an environment with the project

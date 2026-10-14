@@ -240,9 +240,10 @@ The database owns chunk and summary deletion through cascading document foreign
 keys. Refresh discards previous summaries and resets the document summary vector;
 concurrent summary writes guard against changed/deleted documents. Indexing and
 summary passes remain concurrent. The idempotent, resumable migration in
-`scripts/migrate_semantic_schema.py` is required for existing databases
-(it folds in the native-sources FK cleanup). Run it with `--config`; use
-`--dry-run` to preview.
+`scripts/migrate_schema.py` is required for existing databases
+(it folds in the native-sources FK cleanup and the subdocument storage).
+Run it with `--config`; use `--dry-run` to preview. It works whether the
+semantic phase already ran or not.
 
 Wikipedia uses a TextFileSource subclass, MediaWiki section boundaries, and direct
 read-only Xapian queries over the existing index. It keeps raw MediaWiki, including
