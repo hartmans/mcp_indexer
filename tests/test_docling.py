@@ -219,6 +219,7 @@ def test_unsupported_extension_raises_before_conversion(monkeypatch):
 
 
 @requires_docling
+@pytest.mark.long_cpu
 @pytest.mark.asyncio
 async def test_pdf_conversion_ocr_figures_and_retrieval(tmp_path):
     source = make_source(tmp_path)
@@ -279,6 +280,7 @@ async def test_docx_and_doc_conversion(tmp_path):
 
 
 @requires_docling
+@pytest.mark.long_cpu
 @pytest.mark.asyncio
 async def test_repeat_processing_yields_consistent_enumeration(tmp_path):
     source = make_source(tmp_path)
@@ -301,6 +303,7 @@ async def test_repeat_processing_yields_consistent_enumeration(tmp_path):
 
 
 @requires_docling
+@pytest.mark.long_cpu
 @pytest.mark.asyncio
 async def test_shared_converter_reused_across_documents(tmp_path, monkeypatch):
     import mcp_indexer.plugins.docling as docling_module
@@ -328,6 +331,7 @@ async def test_shared_converter_reused_across_documents(tmp_path, monkeypatch):
 
 
 @requires_docling
+@pytest.mark.long_cpu
 @pytest.mark.asyncio
 async def test_shared_converter_released_after_idle_timeout(tmp_path, monkeypatch):
     import mcp_indexer.plugins.docling as docling_module
