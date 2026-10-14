@@ -97,8 +97,8 @@ locations and encodings come from each collection's source config.
 DDL steps take ``ACCESS EXCLUSIVE`` locks; run with writers stopped.
 
 The backfill steps are sized for multi-million-row tables: group
-aggregates run as window functions joined back on ``chunk_id`` (a
-simple key) rather than hash joins on JSON-derived keys, and the
+aggregates run as window functions joined back on the full primary key
+(``collection_id``, ``document_id``, ``chunk_id``), and the
 session sets ``work_mem``/``maintenance_work_mem`` to 4GB and
 ``synchronous_commit = off`` (resumable bulk migration).
 """
@@ -403,16 +403,13 @@ def step_semantic_chunk_id(cur, dry: bool) -> None:
         return
     # Group min is computed over every row (unfiltered) so a resume never
     # recomputes a group from a partial row set. The MIN() window is one
-    # scan + sort of the whole table, and the join back is on chunk_id
-    # (unique): the legacy query joined on the JSON-derived (b, e) keys,
-    # which no index can serve, so the planner had to build a
-    # multi-million-row hash table on computed keys (hours on 6M rows
-    # with the default work_mem).
+    # scan + sort of the whole table. Join back on the full primary key;
+    # chunk_id alone is not guaranteed to be globally unique.
     n = run(cur, f"""
         UPDATE document_chunk c
         SET {SEMANTIC_CHUNK_ID} = f.min_order
         FROM (
-            SELECT chunk_id,
+            SELECT collection_id, document_id, chunk_id,
                    MIN("order") OVER (
                        PARTITION BY collection_id, document_id,
                            (metadata_str::json->>'b')::bigint,
@@ -421,6 +418,8 @@ def step_semantic_chunk_id(cur, dry: bool) -> None:
             FROM document_chunk
         ) f
         WHERE c.chunk_id = f.chunk_id
+          AND c.collection_id = f.collection_id
+          AND c.document_id = f.document_id
           AND c.{SEMANTIC_CHUNK_ID} IS NULL
     """)
     print(f"5. semantic_chunk_id: {n} rows updated")
@@ -454,12 +453,17 @@ def step_embedding_length(cur, dry: bool, max_size: int) -> None:
         UPDATE document_chunk c
         SET {EMBEDDING_LENGTH} = m.s
         FROM (
-            SELECT chunk_id, (metadata_str::json->>'s')::bigint AS s
+            SELECT collection_id, document_id, chunk_id,
+                   (metadata_str::json->>'s')::bigint AS s
             FROM document_chunk
             WHERE {EMBEDDING_LENGTH} IS NULL
-              AND chunk_id NOT IN (SELECT chunk_id FROM flagged_rows)
+              AND (collection_id, document_id, chunk_id) NOT IN (
+                  SELECT collection_id, document_id, chunk_id FROM flagged_rows
+              )
         ) m
         WHERE c.chunk_id = m.chunk_id
+          AND c.collection_id = m.collection_id
+          AND c.document_id = m.document_id
     """)
     print(f"7. embedding_length: {n} rows updated from metadata s")
 
