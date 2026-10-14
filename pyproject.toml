@@ -11,15 +11,12 @@ license = "GPL-3.0-only"
 dependencies = [
     "pydantic",
     "mcp>=2.2.0,<3",
-    "openai",
     "langchain",
-    "langgraph",
+    "langchain-openai",
     "pgvector",
     "sqlalchemy",
     "psycopg[binary]",
-    "langchain-openai",
-    "langchain-ollama",
-    "mwparserfromhell",
+    "PyYAML",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +34,13 @@ docling = [
     "torch",
     "torchvision",
 ]
+# Optional: Wikipedia source plugin (MediaWiki parsing plus Xapian keyword
+# lookup and native search). Both imports are deferred inside the plugin, so
+# it loads without them; they are only needed when a wikipedia collection runs.
+wikipedia = [
+    "mwparserfromhell",
+    "xapian",
+]
 test = [
     "pytest",
     "pytest-asyncio",
@@ -48,3 +52,6 @@ include = ["mcp_indexer*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "long_cpu: slow real-conversion tests (Docling OCR on CPU); skip with -m 'not long_cpu'",
+]
