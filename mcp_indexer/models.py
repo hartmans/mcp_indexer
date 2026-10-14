@@ -67,8 +67,11 @@ class DocumentChunk(Base):
     summary: Mapped[ChunkSummary | None] = relationship(back_populates="chunks", overlaps="document")
 
     __table_args__ = (
-        Index("ix_document_chunk_document_id", "document_id"),
-        Index("ix_document_chunk_order", "order"),
+        # No standalone indexes on document_id or order: both are only
+        # meaningful scoped to (collection_id, document_id), which the
+        # uq_document_chunk_order index serves — its leftmost prefix
+        # filters the document, and order as the trailing column serves
+        # ORDER BY without a sort.
         UniqueConstraint(
             "collection_id", "document_id", "order",
             name="uq_document_chunk_order",

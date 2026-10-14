@@ -163,14 +163,6 @@ def table_columns(cur, table: str) -> set[str]:
     return {r["column_name"] for r in cur.fetchall()}
 
 
-def table_indexes(cur, table: str) -> set[str]:
-    cur.execute(
-        "SELECT indexname FROM pg_indexes "
-        "WHERE schemaname = 'public' AND tablename = %s", (table,),
-    )
-    return {r["indexname"] for r in cur.fetchall()}
-
-
 def table_exists(cur, table: str) -> bool:
     cur.execute(
         "SELECT 1 FROM information_schema.tables "
@@ -386,11 +378,11 @@ def step_chunk_columns(cur, dry: bool) -> None:
             run(cur, SELF_FK_DDL)
         print("4. replaced non-canonical fk_document_chunk_semantic"
               + (" (dry-run)" if dry else ""))
-    if "ix_document_chunk_order" not in table_indexes(cur, "document_chunk"):
-        if not dry:
-            run(cur, "CREATE INDEX ix_document_chunk_order "
-                     "ON document_chunk (\"order\")")
-        print("4. added ix_document_chunk_order" + (" (dry-run)" if dry else ""))
+    # Note: models.py declares no standalone indexes on document_chunk's
+    # document_id or order — those are only meaningful scoped to
+    # (collection_id, document_id), which the uq_document_chunk_order
+    # index serves. Databases created from an earlier model revision may
+    # still carry ix_document_chunk_order; drop it by hand.
 
 
 # ---------------------------------------------------------------------------
