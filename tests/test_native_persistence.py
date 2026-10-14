@@ -265,9 +265,10 @@ async def test_migration_from_semantic_complete_state(test_context, pg_url,
 
 async def test_migration_converges_non_canonical_fks(test_context, pg_url,
                                                       tmp_path):
-    """A database from an earlier model revision (INITIALLY DEFERRED
-    self-FK and work FK) converges to the canonical deferrable,
-    initially immediate, ON DELETE CASCADE constraints on a re-run."""
+    """A database from an earlier model revision (INITIALLY DEFERRED,
+    cascading self-FK and work FK) converges to the canonical
+    constraints — deferrable, initially immediate, NO ACTION self-FK,
+    cascading work FK — on a re-run."""
     import importlib.util
     import sys
     from sqlalchemy import text
@@ -304,14 +305,51 @@ async def test_migration_converges_non_canonical_fks(test_context, pg_url,
 
     async with test_context.engine.connect() as connection:
         states = (await connection.execute(text(
-            "SELECT condeferrable, condeferred, confdeltype "
+            "SELECT conname, condeferrable, condeferred, confdeltype "
             "FROM pg_constraint WHERE conname IN "
             "('fk_document_chunk_semantic', 'fk_indexing_work_parent') "
             "ORDER BY conname"))).fetchall()
-    assert states == [(True, False, "c"), (True, False, "c")]
+    # Self-FK: NO ACTION; work FK: CASCADE. Both deferrable, initially
+    # immediate.
+    assert states == [
+        ("fk_document_chunk_semantic", True, False, "a"),
+        ("fk_indexing_work_parent", True, False, "c"),
+    ]
 
     # Converged state: a second run is a complete no-op.
     assert migration.main(["--config", str(config_path)]) == 0
+
+
+async def test_refresh_shrinking_across_semantic_heads(test_context,
+                                                        tmp_path):
+    """A refresh that shrinks the chunk set can delete semantic heads
+    while members still reference them (delete-orphan flush order); the
+    indexing transaction defers the NO ACTION self-FK, so it commits.
+
+    Without the deferral the delete raises IntegrityError.
+    """
+    indexer, source = make_indexer(test_context, tmp_path)
+    path = tmp_path / "article.md"
+    path.write_text("\n\n".join(
+        f"# Section {i}\n" + "lorem ipsum " * 10 for i in range(4)))
+    await indexer.ensure_document_indexed(source, path.name)
+    async with source.context.get_session() as session:
+        before = (await session.execute(
+            select(DocumentChunk))).scalars().all()
+    heads = {c.order for c in before if c.is_semantic_chunk}
+    assert len(before) >= 8  # enough groups to shrink across heads
+
+    path.write_text("# Short\nJust a short document.")
+    await indexer.index_document(
+        await source.fetch_document(path.name),
+        DocumentIndexingStats(path.name, "refresh", source=source),
+    )
+    async with source.context.get_session() as session:
+        after = (await session.execute(
+            select(DocumentChunk))).scalars().all()
+    deleted = {c.order for c in before} - {c.order for c in after}
+    assert deleted and deleted & heads  # the shrink removed group heads
+    await indexer.wait_for_idle()
 
 
 async def test_migration_backfill_derives_semantic_columns(test_context,

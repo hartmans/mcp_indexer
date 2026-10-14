@@ -77,11 +77,12 @@ class DocumentChunk(Base):
             ["collection_id", "document_id", "semantic_chunk_id"],
             ["document_chunk.collection_id", "document_chunk.document_id", "document_chunk.order"],
             name="fk_document_chunk_semantic",
-            ondelete="CASCADE",
-            # Deferrable so out-of-order writes (e.g. a collection rename)
-            # can SET CONSTRAINTS DEFERRED; initially immediate so
-            # violations surface at the offending row and bulk writes do
-            # not queue deferred validation.
+            # NO ACTION: a document's chunk rows are deleted as a set, or
+            # not at all; a head whose members still reference it is a
+            # corruption the constraint must reject, not a cascade should
+            # repair. Deferrable so the refresh transaction (which may
+            # delete a head before its members in one flush) can defer it.
+            ondelete="NO ACTION",
             deferrable=True,
         ),
         ForeignKeyConstraint(

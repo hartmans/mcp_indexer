@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -1223,6 +1223,14 @@ class Indexer:
             doc.summaries = []
             for _ in range(2):
                 try:
+                    # A refresh may delete a semantic head while its
+                    # members still reference it (delete-orphan flush
+                    # order); the NO ACTION self-FK forbids that
+                    # mid-transaction, so defer it. Both rows leave the
+                    # table in this transaction, so commit-time
+                    # validation still rejects a real violation.
+                    await session.execute(text(
+                        "SET CONSTRAINTS fk_document_chunk_semantic DEFERRED"))
                     await session.merge(doc)
                     await self._publish_child_work(
                         session, source.id, doc.document_id, child_ids,

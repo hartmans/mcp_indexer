@@ -74,8 +74,8 @@ code is then 1 and a re-run resumes phase 1 while phase 2 no-ops.
 
 Steps 4 and 15 also replace non-canonical FK shapes — an
 INITIALLY DEFERRED self-FK or work FK from an earlier model revision,
-or a self-FK without ON DELETE CASCADE — so every re-run converges
-toward the canonical constraints.
+or a cascading self-FK — so every re-run converges toward the
+canonical constraints.
 
 ``document_chunk.text`` (exact-text retention) already exists in any
 database created after the model added the column; this migration does
@@ -223,12 +223,15 @@ def not_null(cur, table: str, column: str) -> bool:
     return row is not None and row["is_nullable"] == "NO"
 
 
-# Canonical FK state: (condeferrable, condeferred, confdeltype) —
-# deferrable, initially immediate, ON DELETE CASCADE. Databases created
-# from an earlier model revision carry an INITIALLY DEFERRED
-# (collection, document) self-FK / work FK; steps 4 and 15 replace any
-# non-canonical shape so re-runs converge.
-CANONICAL_FK_STATE = (True, False, "c")
+# Canonical FK states: (condeferrable, condeferred, confdeltype) — both
+# deferrable and initially immediate; ON DELETE CASCADE ('c') for the
+# work FK, NO ACTION ('a') for the semantic self-FK (a document's chunk
+# rows are deleted as a set, or not at all). Databases created from an
+# earlier model revision carry other shapes (INITIALLY DEFERRED,
+# ON DELETE CASCADE on the self-FK); steps 4 and 15 replace any
+# non-canonical state so re-runs converge.
+SELF_FK_STATE = (True, False, "a")
+WORK_FK_STATE = (True, False, "c")
 
 
 def fk_state(cur, name: str) -> tuple[bool, bool, str] | None:
@@ -267,14 +270,14 @@ CANONICAL_FK_DDL = [
 ]
 
 # Canonical shape for the two FKs whose earlier revisions differed from
-# models.py (the semantic self-FK lacked ON DELETE CASCADE; the work FK
-# was INITIALLY DEFERRED). Both are deferrable, initially immediate,
-# with ON DELETE CASCADE.
+# models.py (the semantic self-FK was INITIALLY DEFERRED or cascading;
+# the work FK was INITIALLY DEFERRED). Both are deferrable and initially
+# immediate; the work FK cascades, the self-FK is NO ACTION.
 SELF_FK_DDL = """
     ALTER TABLE document_chunk ADD CONSTRAINT fk_document_chunk_semantic
     FOREIGN KEY (collection_id, document_id, semantic_chunk_id)
     REFERENCES document_chunk (collection_id, document_id, "order")
-    ON DELETE CASCADE DEFERRABLE
+    DEFERRABLE
 """
 
 WORK_FK_DDL = """
@@ -374,7 +377,7 @@ def step_chunk_columns(cur, dry: bool) -> None:
             run(cur, SELF_FK_DDL)
         print("4. added deferrable fk_document_chunk_semantic"
               + (" (dry-run)" if dry else ""))
-    elif state != CANONICAL_FK_STATE:
+    elif state != SELF_FK_STATE:
         # Databases from an earlier model revision carry an
         # INITIALLY DEFERRED self-FK; replace it so re-runs converge.
         if not dry:
@@ -755,7 +758,7 @@ def step_indexing_work_fk(cur, dry: bool) -> None:
             run(cur, WORK_FK_DDL)
         print("15. added deferrable fk_indexing_work_parent"
               + (" (dry-run)" if dry else ""))
-    elif state != CANONICAL_FK_STATE:
+    elif state != WORK_FK_STATE:
         # Migrations from an earlier revision created this FK
         # INITIALLY DEFERRED; replace it so re-runs converge.
         if not dry:
