@@ -14,11 +14,14 @@ from pathlib import Path
 
 import pytest
 
+from types import SimpleNamespace
+
 from mcp_indexer.context import Context
 from mcp_indexer.plugins.bridges import ByteBridge
 from mcp_indexer.plugins.docling import (
     DoclingDocument,
     _map_image_references,
+    _number_page_breaks,
     docling_available,
 )
 from mcp_indexer.plugins.file_source import (
@@ -161,6 +164,54 @@ def test_map_image_references_refuses_ambiguous_counts():
     assert _map_image_references(markdown, []) == markdown
 
 
+def test_number_page_breaks_annotates_each_break_with_its_page():
+    items = [
+        SimpleNamespace(prov=[SimpleNamespace(page_no=page)])
+        for page in (1, 1, 2, 2, 3)
+    ]
+    doc = SimpleNamespace(iterate_items=lambda: [(item, 0) for item in items])
+    markdown = "first page\n\fsecond page\n\fthird page\n"
+    numbered = _number_page_breaks(markdown, doc)
+    assert numbered == (
+        "first page\n"
+        "\f<!-- Page 2 -->"
+        "second page\n"
+        "\f<!-- Page 3 -->"
+        "third page\n"
+    )
+
+
+def test_number_page_breaks_leaves_markdown_without_breaks_alone():
+    doc = SimpleNamespace(iterate_items=lambda: iter(()))
+    assert _number_page_breaks("plain text", doc) == "plain text"
+
+
+def test_number_page_breaks_refuses_ambiguous_counts():
+    doc = SimpleNamespace(
+        iterate_items=lambda: [
+            (SimpleNamespace(prov=[SimpleNamespace(page_no=2)]), 0)
+        ]
+    )
+    markdown = "text\n\f"
+    # One form feed but no page transition in the item walk: the pairing
+    # is ambiguous, so the Markdown is retained exactly as produced.
+    assert _number_page_breaks(markdown, doc) == markdown
+
+
+def test_number_page_breaks_names_the_page_a_transition_skips_to():
+    # A page with no exported items (e.g. a blank page) produces no
+    # items, so a transition can rise by more than one. The annotation
+    # names the destination page it actually marks (3), not a blind
+    # break counter (2).
+    items = [
+        SimpleNamespace(prov=[SimpleNamespace(page_no=page)])
+        for page in (1, 3, 3)
+    ]
+    doc = SimpleNamespace(iterate_items=lambda: [(item, 0) for item in items])
+    markdown = "first page\n\fthird page\n"
+    assert _number_page_breaks(markdown, doc) == "first page\n\f<!-- Page 3 -->third page\n"
+
+
 @pytest.mark.asyncio
 async def test_image_document_summarizes_without_chunks(tmp_path):
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"fake-png-payload"
@@ -243,6 +294,11 @@ async def test_pdf_conversion_ocr_figures_and_retrieval(tmp_path):
     # its content, not merely the first page's native text.
     assert "QUICKBROWNFOX" in text
     assert "OCRMEASUREMENT" in text
+
+    # Page boundaries are preserved: the form feed marks the break and
+    # the comment names the page that begins there.
+    assert text.count("\f") == 1
+    assert "\f<!-- Page 2 -->" in text
 
     children = [c async for c in doc.get_sub_documents()]
     assert len(children) == 1

@@ -7,7 +7,10 @@ the result as Markdown, and interprets that Markdown through a
 carries the same document ID (a delegate, not a subdocument). Extracted
 figures become :class:`~mcp_indexer.plugins.images.ImageDocument`
 subdocuments, and the Markdown's image references are mapped to their
-subdocument IDs when the mapping is unambiguous.
+subdocument IDs when the mapping is unambiguous. Page boundaries are
+preserved in the Markdown: each break carries a form feed, followed by an
+HTML comment naming the page that begins there, so machine consumers can
+split on the form feed and LLM consumers can read the annotation.
 
 Docling is an optional dependency: importing and registering this module
 works without it, but instantiating :class:`DoclingDocument` raises an
@@ -224,6 +227,44 @@ def _map_image_references(markdown: str, figures: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _number_page_breaks(markdown: str, doc: Any) -> str:
+    """Annotate each form-feed page break with the page it begins.
+
+    Docling's serializer walked the items in reading order and emitted a
+    break wherever the page number rose past the previous item's. This
+    replay records the page each break starts at; the Nth recorded page
+    annotates the Nth form feed as ``\\f<!-- Page N -->``. When the
+    recorded breaks and the form feeds do not line up the pairing is
+    ambiguous and the Markdown is retained exactly as produced.
+    """
+    breaks = markdown.count("\f")
+    if breaks == 0:
+        return markdown
+    pages: list[int] = []
+    prev: int | None = None
+    for item, _level in doc.iterate_items():
+        prov = getattr(item, "prov", None)
+        if not prov:
+            continue
+        page = prov[0].page_no
+        if page is None:
+            continue
+        if prev is not None and page > prev:
+            pages.append(page)
+        prev = page
+    if len(pages) != breaks:
+        return markdown
+    parts: list[str] = []
+    pos = 0
+    for page in pages:
+        start = markdown.index("\f", pos)
+        parts.append(markdown[pos:start])
+        parts.append(f"\f<!-- Page {page} -->")
+        pos = start + 1
+    parts.append(markdown[pos:])
+    return "".join(parts)
+
+
 class DoclingDocument(DocumentPlugin):
     """A document interpreted through Docling conversion.
 
@@ -286,7 +327,10 @@ class DoclingDocument(DocumentPlugin):
                     f"Docling conversion of {self.document_id} failed "
                     f"with status {result.status.value}"
                 )
-            markdown = doc.export_to_markdown(image_mode="embedded")
+            markdown = doc.export_to_markdown(
+                image_mode="embedded", page_break_placeholder="\f"
+            )
+            markdown = _number_page_breaks(markdown, doc)
             figures: list[dict[str, Any]] = []
             for index, picture in enumerate(doc.pictures):
                 if picture.image is None:
