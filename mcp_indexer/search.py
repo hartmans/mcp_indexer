@@ -65,6 +65,16 @@ SearchHit = DocumentHit | ChunkHit
 
 @dataclass(frozen=True)
 class NativeSearchBatch:
+    """Native hits and source-owned continuation positions.
+
+    Positions start at zero and count source traversal, not necessarily hits.
+    Every batch, including an empty one, advances an enabled position without
+    decreasing either position. Disabled types retain their positions. Return
+    final hits in a batch before returning None to signal combined exhaustion.
+    Hits are ordered documents first, then chunks; limits apply per type.
+    Exceptions signal discovery failure, never exhaustion.
+    """
+
     hits: list[SearchHit]
     document_offset: int
     chunk_offset: int
@@ -621,7 +631,32 @@ async def search(
     rerank_query: str | None = None,
     cursor: str | None = None,
 ) -> SearchResult:
-    """Advance discovery once or replay the latest page within a 60-minute session."""
+    """Advance discovery once or replay the latest page within a 60-minute session.
+
+    ``query`` is required for a new search and may be omitted with ``cursor``.
+    A nonblank ``rerank_query`` drives vector discovery and scoring while the
+    original query drives native discovery. Resumes use saved queries; supplied
+    mismatches add warnings without including the saved private query text.
+
+    ``limit`` is a positive maximum number of distinct documents on the page.
+    Candidate limits are nonnegative per-type batch sizes, defaulting to four
+    times the initial limit. Zero disables a type; both cannot be disabled.
+    Candidate sizes, thresholds, and reranker are fixed for the session;
+    conflicting explicit candidate sizes on resume raise ValueError.
+
+    A short or empty page may have a continuation. Each advancement makes at
+    most one discovery batch per unfinished stream and ranks discovered evidence
+    together with pending candidates. Successful scores are retained, including
+    rejected scores, and returned documents are suppressed on later pages.
+
+    The latest consumed cursor replays the cached page regardless of a changed
+    page limit. Advancing its successor invalidates the older replay token.
+    InvalidSearchCursor covers unknown, expired, old, and wrong-source tokens;
+    SearchAdvanceError indicates a retryable operation failure. Continuation
+    failures preserve completed discovery and scoring for the same cursor.
+    Initial failures have no client-visible token. Concurrent callers share
+    shielded advancement, so cancelling a waiter does not cancel the work.
+    """
     if type(limit) is not int or limit <= 0:
         raise ValueError("limit must be a positive integer")
     collection = indexer.context.collections[collection_id]

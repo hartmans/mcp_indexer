@@ -1,323 +1,322 @@
-# Goal
-
-This is a server than indexes documents in collections and provides a set of mcp tools for each collection to search and fetch documents.
-
-## DocumentSource
-
-A DocumentSource represents a strategy for indexing documents as well as a retrieval strategy. For example one source might handle spreadsheets and another source might handle text files that could be converted to markdown.
-
-### DocumentPointers
-
-There is a generic DocumentPointer type that defines operations on a document and includes metadata.
-DocumentSources need to subclass this type.
-
-
-### Document and Chunk Identifiers
-
-A collection-local document_id is whatever the source needs to find a document.
-Sources, indexer methods taking a source, and database rows use local IDs; SQL
-stores collection_id separately. Local chunk IDs add `?c=0` and so on.
-
-Tools and external references use global IDs: *collection_id*:local_document_id
-or *collection_id*:local_chunk_id. There is no source-type prefix. The tool
-boundary adds/removes the collection prefix. Renaming a collection updates
-collection_id in each table and configuration without changing local IDs.
-### Chunking
-
-Chunking happens at multiple levels.
-A semantic chunk is an appropriate granularity for summarization and for retrieval for tasks where in-depth understanding is desired.
-
-Embedding chunks are appropriately sized for vector embeddings.
-
-*DocumentChunk* is a model stored in the database for each document chunk. It contains a metadata dictionary used to actually retrieve chunks; that can be passed into DocumentPointer.fetch_chunk to get the semantic chunk. *DocumentSource.fetch_chunk* can get semantic or embedding chunks.
-* *DocumentPointer.get_chunks* describes the chunk metadata dictionary in detail.
-
-The source's `get_chunks` yields, per semantic chunk, a list of *candidate*
-embedding chunks cut at the source's embedding boundaries. The candidates
-are a hint, not a sizing decision: `create_embedding_chunks` converts them
-into the stored embedding chunks, cutting at candidate boundaries wherever
-possible. A stored chunk therefore never straddles a boundary, except
-inside a single candidate larger than `max_size`, which is sliced at the
-cap and re-aligns with the source's boundaries at the following cuts.
-`max_size` is a constraint (no stored chunk exceeds it); `min_size` is a
-hint (chunks smaller than it are emitted only where the alternative would
-violate `max_size`).
-
-
-## Collections
-
-A collection  is an instance of a DocumentSource configured for a given set of documents. For example pointing the TextSource at a directory of stories could form a story collection.
-
-Collection configuration includes:
-
-* DocumentSource specific configuration (directory, chunking config, etc)
-* A MCP tool prefix
-*  Description of the collection to include in the mcp tool schemas
-* A prompt to describe what should be included in the summary of a document and document chunks.
-
-## Context
-
-The context includes:
-
-* Access to LangChain chat models for summarization
-* Access to the configured embedding model
-* PostgreSQL/pgvector sessions
-* A shared reranker assigned to collections with reranking enabled. Context
-  construction does not load model weights; the first search on an enabled
-  collection completes setup before discovery can issue an embedding or summary
-  model request. This reserves local accelerator memory before another local
-  model server can claim it. The instance's semaphore coordinates scoring across
-  collections.
-
-## Storage
-
-Postgres stores four tables. `document` is the unit of indexing; `document_chunk`
-holds one row per embedding chunk; `chunk_summary` holds a summary for a span of
-chunks; `failed_document` records documents that could not be indexed.
-
-### document
-
-Keyed by `(collection_id, document_id)`. `parent_document_id` is a bare column
-pointing at another row in the same collection through a composite foreign key,
-so documents form a tree of sub-documents rooted in one collection; deleting a
-document cascades to its whole subtree. `last_modified` carries the source
-modification time used to detect changes. The document-level `embedding`
-represents the document summary; `summary` and `keywords` are filled by
-summarization.
-
-### document_chunk
-
-Keyed by `(collection_id, document_id, chunk_id)`. `order` is the global ordinal
-of the embedding chunk within its document, unique per document. Each embedding
-chunk belongs to exactly one semantic chunk; `semantic_chunk_id` is the `order`
-of the first embedding chunk in that semantic chunk. Every row repeats that first
-row's `order`, so the first row of a semantic chunk is the one where
-`semantic_chunk_id == order`; `is_semantic_chunk` exposes that. The column is a
-deferred self-referential foreign key onto `(collection_id, document_id, order)`,
-so rows may be written in any order and it resolves at commit. `semantic_length`
-and `embedding_length` are populated by the indexer from the chunk metadata
-(`e - b` and `s`); `semantic_length` is denormalized across every row of the
-semantic chunk so a length lookup does not decode `metadata_str`. `summary_span`
-points at the `chunk_summary` covering this chunk (null until summarization).
-`metadata_str` is the JSON blob the source needs to re-fetch the chunk.
-
-### chunk_summary
-
-Keyed by `(collection_id, document_id, summary_span)`. `summary_span` is the
-ordinal of the summary within the document; the chunks it covers all carry the
-same `summary_span`.
-
-### failed_document
-
-Keyed by `(collection_id, document_id)` but not foreign-keyed to `document`, so a
-failure can be recorded for a document that does not exist yet or has been
-deleted.
-
-## Search
-
-Search orchestration lives in `search.py`; MCP and CLI consumers call it directly.
-Sources may override `DocumentSource.native_search` to search a corpus that has
-not been embedded in advance. Source-independent vector search always searches
-the indexed subset of the collection. Native and vector search coexist.
-
-Vector and native discovery run concurrently. Discovery returns detached
-`DocumentHit` and `ChunkHit` values, not ORM objects.
-Document hits carry a document ID, score, and optional summary. Chunk hits carry
-a document ID, retrieval metadata, score, and an optional stored chunk ID. The
-metadata follows the existing semantic/embedding retrieval conventions. Native
-hits can exist before their database records do. Each mechanism ranks document
-and chunk hits separately; scores are not comparable between lists.
-
-Search returns a named `SearchResult` with `results`, `resume_cursor`, and
-`warnings`. The result limit applies to distinct, previously unreturned documents.
-Without reranking, selection uses encounter order: vector document/chunk lists,
-then native document/chunk lists. With reranking, score every distinct new hit and
-retain its score; order eligible documents by their best discovered hit score.
-Include all qualifying discovered chunk hits for selected documents. Candidate
-overfetch defaults remain centralized in search. A separate optional rerank query
-is available to Python callers.
-
-Document scoring uses the supplied hit summary when available. Otherwise it
-uses a stored summary, or indexes the document and obtains a summary through
-the existing source-summary interface and generic summarization fallback.
-Chunk scoring retrieves embedding-chunk text through the source. Reranking
-preparation may index candidates that ultimately are not selected; this work
-is independent of result assembly.
-
-Candidate hits are deduplicated before concurrent text preparation, so each
-document summary or distinct chunk is scored at most once per search session.
-Concurrent preparation lets model requests fill the configured batchers.
-Assembly processes selected documents concurrently and selected hits only.
-Missing documents are fully chunked and
-embedded; persisted documents are not reindexed by search. If a document has
-indexed chunks, its complete set of chunks is stored. Embeddings remain
-non-null. Semantic chunks and their summary spans retain their existing meaning.
-
-Missing summaries are filled, with the source's document-summary interface
-tried first. Hit summaries do not need a separate persistence channel: sources
-that provide summaries can return them through that existing interface.
-Existing document summaries are preserved. The current generic fallback can
-summarize all spans to produce a document summary.
-
-Response ORM objects are loaded in fresh sessions after summary writes finish.
-Assembly groups by first occurrence of each document, merges relevant chunks,
-and removes duplicate chunk references. Failures are logged and usable results
-continue with warnings. Failed hit preparation and document assembly each permit
-one later retry before discarding the failed item. Reranker setup/batch failures
-raise retryable errors; continuation retains discovery work and successful scores.
-Discovery failures never mean exhaustion. Search does not add concurrency
-coordination for indexing or summarization across independent search sessions.
-
-Sources with structured native syntax set `separate_rerank = True`. Their MCP
-search tools expose an optional natural-language `rerank_query`, used for vector
-discovery and reranking, while `query` goes to native discovery. An omitted or
-blank natural-language query falls back to `query`. Other sources expose the
-same cursor API without `rerank_query`. Native discovery is called until exhausted;
-its base implementation returns `None`.
-
-### Resume cursors
-
-Each `DocumentSource` owns an in-memory search-session store. One advancing call
-performs at most one bounded discovery batch per unfinished mechanism, selecting
-from new and retained hits. Vector discovery uses separate document/chunk offsets,
-a cached query embedding, and the existing ANN/HNSW path. Approximate recall may
-miss documents; search does not introduce exhaustive vector scans. Offsets advance
-by raw candidate counts before orchestration suppresses duplicates, already
-returned documents, and rejected hits. Sources do not receive those seen sets.
-
-Native discovery accepts separate source-defined continuation offsets and returns
-`NativeSearchBatch(hits, document_offset, chunk_offset)` or `None`. Every batch,
-including an empty one, advances an enabled offset; only `None` establishes native
-exhaustion. Wikipedia offsets count raw Xapian matches actually examined and
-retain a bounded scanning budget. It resumes at that position without rescanning
-earlier matches; search orchestration handles repeated document/chunk identities.
-Unchanged native inputs require deterministic traversal and stable ties. Changes
-to documents may reorder or omit results during an active search.
-
-A cursor resumes using the saved query and rerank query; supplied mismatches
-produce warnings. Candidate sizes, thresholds, and reranker remain fixed; page
-limits may change. Each hit is scored once successfully, and each document is
-returned once along successive cursors. A later strong chunk may qualify a
-previously unreturned parent. Pages order discovered evidence only, so later pages
-can contain better-scoring documents. A short or empty page can still continue.
-
-Concurrent requests using the same current cursor share shielded advancement.
-The latest used cursor replays a cached page and next cursor without source/model
-work. Successfully using that next cursor frees the older replay token. Final
-pages remain replayable. Sessions expire after 60 minutes of inactivity, including
-idle cleanup; restarts/source replacement invalidate them. Tokens are opaque and
-collection-local, and replay copies loaded response data without database reads.
-State is process-local and needs sticky routing with multiple serving processes.
-
-MCP search tools accept `cursor` and allow query omission on resume. Their JSON
-objects contain `results`, `resume_cursor`, `resume_cursor_usage`, and `warnings`.
-When the cursor is null, usage is `End of documents reached`; otherwise it is
-`Call this tool again and pass in the cursor in the cursor argument to resume.`
-Invalid/expired cursors are explicit errors. The interactive client uses `:more`
-to resume. See `search-cursor-design.md` for the approved implementation contract.
-
-## Indexing coverage and maintenance
-
-`DocumentSource.indexing_mode` resolves collection configuration, then global
-configuration defaults, then the source's `default_indexing_mode` (`full` on the
-base source, `indexed` on Wikipedia). Overrides use additional config fragments.
-Full mode discovers unindexed documents through source enumeration; indexed mode
-only adds documents requested through search or explicit indexing. Neither mode
-refreshes persisted documents during search.
-
-`Indexer.ensure_document_indexed(source, document_id)` accepts a local ID, reuses
-stored documents without source probes, and fully indexes missing database rows.
-
-Maintenance is an independent opt-in operation (`--maintenance` or
-`index_all(maintenance=True)`). It pages over stored IDs in either indexing mode,
-fetches current pointers, and compares modification times. Changed documents are
-fully prepared before atomic replacement; missing documents are deleted promptly
-after `DocumentNotFoundError`. Other access failures retain stored documents.
-Source pointers expose current modification times and distinguish missing
-documents from unavailable source roots. No presence checks are added to search.
-
-The database owns chunk and summary deletion through cascading document foreign
-keys. Refresh discards previous summaries and resets the document summary vector;
-concurrent summary writes guard against changed/deleted documents. Indexing and
-summary passes remain concurrent. The idempotent, resumable migration in
-`scripts/migrate_schema.py` is required for existing databases
-(it folds in the native-sources FK cleanup and the subdocument storage).
-Run it with `--config`; use `--dry-run` to preview. It works whether the
-semantic phase already ran or not.
-
-Wikipedia uses a TextFileSource subclass, MediaWiki section boundaries, and direct
-read-only Xapian queries over the existing index. It keeps raw MediaWiki, including
-template names/arguments, and initially returns native article hits. After a new
-dump is extracted into the same collection, maintenance refreshes the stored
-subset. Extraction must replace changed files with changed mtimes, remove absent
-files, and update Xapian; the historical extraction/index scripts skip existing
-entries and are not reused by this source.
-
-## Configuration
-
-Configuration is managed via a TOML file and supports a hierarchical structure:
-
-1.  **Server Config**: Global settings for the server (e.g., database URI).
-2.  **Infrastructure Defaults**: Global defaults for collection-level settings (e.g., summary prompts, embedding models).
-3.  **Collection Config**: Specific settings for each collection. This includes:
-    *   **Inherited Infra**: Values inherited from Infrastructure Defaults, which can be overridden at the collection level.
-    *   **Required Fields**: Settings that must be defined per collection (e.g., MCP tool prefix).
-    *   **Source Config**: A plugin-specific configuration blob. The `DocumentSource` plugin is responsible for validating this blob into its own schema.
-
-*ConfigManager* is a class that collects all the configuration together.
-
-### Plugin extension policies
-
-The `plugin` field on `CollectionInfraConfig` is the resolved
-extension-to-policy map: canonical extension (lowercase, dotted) to
-policy dict, merged from the defaults and collection-level plugin
-lists in configuration (the configuration format is documented in the
-README). `FileSource` builds its effective extension map at
-construction by layering this map over the code-defined default map, so
-configured policies override per extension; `policy_for_path` looks
-the map up by the file's suffix, falling back to the default text
-policy for extensions absent from the map. The `extensions` key of the
-raw configuration entries is consumed by the merge and never reaches a
-plugin. Non-file sources ignore the map.
-
-### Reranker configuration
-
-The optional global `[rerank]` section selects the single reranker shared by
-collections whose `rerank` setting is enabled. `plugin = "qwen"` (the default)
-uses the in-process Transformers implementation. `plugin = "llama_cpp"` with a
-`url` connects to an existing llama.cpp TCP server and follows OpenAI client
-base-URL convention, including the `/v1` suffix by default. An optional `model`
-selects the served model and is included in rerank requests; it is needed when
-the server requires explicit model selection, such as vLLM. Supplying `command_line`
-instead makes the indexer launch that command on a temporary Unix-domain socket;
-the command contains the model and reranking flags, while the indexer appends
-the socket `--host` argument. Both transports use the base URL's `/models` for
-readiness and its vLLM-compatible `/rerank` API for scoring. No request escapes
-the configured base-URL path.
-### Search score thresholds and diagnostics
-
-Discovery quality is bounded by two overridable thresholds, both exposed as
-`[defaults]` infrastructure settings and per-collection overrides (and
-therefore inherited like `indexing_mode` and `rerank`):
-
-*   `min_cosine_distance`. Vector discovery excludes, in the
-    database query, any document or chunk whose pgvector cosine distance
-    exceeds this value. The predicate sits in the SQL `WHERE` clause ahead of
-    the per-type `LIMIT`, so distant rows are never fetched only to be
-    dropped in Python. The per-type limit then applies to the filtered set.
-*   `min_rerank_score`. When a reranker is active, ranked
-    candidates scoring below this value are dropped before the result limit is
-    applied, so a low-scoring candidate does not consume a document slot. Scores for rejected hits remain
-    recorded so repeated discovery does not rerank them.
-
-Both are `CollectionInfraConfig` fields, so they default from the model and
-are overridable per collection or through `[defaults]`. `search()` reads both
-from the collection's `CollectionConfig` and threads them through
-`vector_search_hits` and `rerank`.
-
-Per-hit score diagnostics are logged by `search` at the DEBUG level: the
-native score of each native hit, the cosine distance of each vector hit, and
-the reranker score of each successfully scored hit. They are silent at the default logging level.
-`set_debug_search()` toggles this module's logger between INFO and DEBUG; the
-search client's `--debug-search` argument calls it so the diagnostics appear
-on demand.
+# Architecture
+
+## Purpose and component boundaries
+
+The indexer makes heterogeneous document collections searchable and retrievable
+through MCP. It combines a persistent index of document summaries and text chunks
+with optional discovery in a source's own search engine. A collection can therefore
+be indexed in advance or acquire indexed coverage as users search it.
+
+A collection is one configured `DocumentSource` instance. The source owns discovery
+and document acquisition; bound `DocumentHandle` objects own document interpretation.
+The `Indexer` owns persistence, child-work scheduling, embeddings, and summary
+composition. Search orchestrates discovery, scoring, and result assembly through
+these interfaces. MCP and the interactive client adapt the shared application
+operations rather than implementing independent search pipelines.
+
+`Context` supplies database sessions, collections, batched chat and embedding model
+access, and shared resource controls. Configuration resolution separates server
+resources, collection infrastructure, and source-specific validation. Sources own
+the schema of their configuration; format plugins receive interpretation policies.
+The configuration schema and operational instructions live in [README.md](README.md).
+Exact method arguments and storage mechanics belong in the corresponding code.
+
+## Collection identity and document trees
+
+Sources, handles, and database rows use collection-local document IDs. Database
+identity always includes the collection separately. External references add
+`collection_id:` at the tool boundary; this prefix names a collection, not a source
+type. Changing a collection's name does not change its local document identities.
+
+A literal colon within a local ID separates subdocument levels. For example,
+`library:reports/report.pdf:figure` identifies a child of `reports/report.pdf`
+inside `library`. Literal colons in filename components are percent-encoded;
+hierarchy separators must be split before decoding. Chunk IDs append `?c=...` to
+the complete local document ID. Child resolution receives that complete local ID,
+not just the final component, so nested handlers retain enough context to resolve
+their own descendants.
+
+Documents form trees within a collection. A child's parent must exist in the same
+collection, and deleting a document deletes its subtree. Reparenting and
+cross-collection movement are not supported workflows. Direct addressability does
+not imply cheap or independent access: resolving a figure may require converting
+its parent document. Direct indexing of a descendant establishes missing ancestor
+rows first without requiring every sibling subtree to finish.
+
+## Acquisition, interpretation, and content
+
+`DocumentSource` enumerates roots, resolves roots and descendants, and optionally
+provides native search. `DocumentHandle` binds a source, full local identity, and
+modification time to operations for metadata, semantic chunks, document summaries,
+and immediate children. Acquisition is asynchronous and returns a durable handle,
+not an acquisition-scoped context manager. Handles yielded by enumeration remain
+usable after enumeration ends. Missing documents raise `DocumentNotFoundError`;
+an unavailable source is a different failure and must not establish absence.
+
+Document shapes are combinations of operations. A document may have chunks,
+children, both, or only a summary. A summary-only image still participates in
+indexing and document-vector search. A container can have children without its
+own text. Generic orchestration must support these shapes without branching on
+format names.
+
+Each source owns a process-local handle cache shared by direct acquisition, root
+enumeration, and child enumeration. Enumerators register acquired handles through
+the source. Idle eviction releases cache references without invalidating handles
+held by ongoing work. This cache manages reuse and memory, not freshness: a cache
+hit does not probe the source. Process-lifetime staleness is accepted, and a handle
+is not a snapshot guarantee for mutable underlying bytes.
+
+`DocumentPlugin` is a discoverable handle implementation that interprets a
+`ContentBridge`. Its handler-name registry is separate from source registration
+and from the extension-to-policy map. `FileSource` selects an interpretation
+policy for acquired files; other sources may construct a known handler directly.
+Policy describes interpretation and is read-only by convention. Metadata describes
+the particular document and can contain structured JSON-compatible values.
+
+A content bridge provides asynchronous whole-content and half-open byte-range
+reads, plus scoped access to a filesystem path. Every bridge supports all three
+operations, adapting its content internally. Real files can expose their paths;
+in-memory conversion output can materialize a temporary file for a path consumer.
+Path lifetime belongs to that context, not to the lifetime of the document handle.
+Bridge reads preserve original bytes, including newline sequences. This boundary
+lets format interpretation work with files, extracted figures, or future mail
+attachments without teaching the indexer how their bytes were acquired.
+
+Delegation is distinct from hierarchy. A converter can interpret its output
+through another plugin with the same document ID; that delegate introduces no
+new document or summary level. Docling uses a Markdown `TextDocument` delegate,
+while extracted figures become separately addressable `ImageDocument` children.
+Images obtain summaries through the shared image-capable LLM path. Format plugins
+own conversion and figure identities; generic indexing owns their persistence and
+failure handling. Optional format dependencies must not prevent unrelated sources
+or plugins from loading.
+
+## Chunking, retained text, and retrieval
+
+Semantic chunks are the handle-facing unit for contextual retrieval and
+summarization. Embedding chunks partition each semantic chunk into model-sized
+text. A handle supplies semantic retrieval metadata and candidate embedding
+boundaries; generic sizing enforces the maximum while treating the minimum and
+candidate boundaries as hints. Concatenating candidates, or the resulting stored
+embedding chunks, must reproduce exactly the semantic text returned by the handle.
+This invariant survives changes to sizing algorithms.
+
+Source metadata locates semantic content. Embedding offsets and lengths locate
+character spans within that decoded content and are separate from bridge byte
+offsets. Consumers must not interchange these coordinate systems. Every stored
+embedding chunk belongs to exactly one semantic chunk and has a stable order
+within its document. Summary spans group chunks for summarization without changing
+their semantic or embedding boundaries.
+
+A handle's `save_text` policy requests retention of each embedding chunk's exact
+text. Retention is independent of input storage: converted file content can need
+retention to preserve the indexed representation across later converter changes.
+Ordinary ORM loads defer this text because most consumers need references and
+summaries, not the content itself.
+
+The shared `retrieval.fetch_chunk(source, chunk_id, scope=...)` helper is the
+application boundary for stored chunk text. Embedding scope returns one stored
+span; semantic scope reconstructs its whole semantic group even when the supplied
+ID refers to a non-root embedding chunk. Complete retained text is returned without
+acquiring a handle. Otherwise the helper acquires a cached handle and retrieves
+the semantic text, applying a character slice for embedding scope. Missing rows,
+NULL text, and empty text are distinct. Retrieval must not concatenate partial
+retained text with content from another source version.
+
+Search hits without stored chunk IDs instead carry enough semantic metadata and
+span information for direct handle retrieval. They need not be indexed merely to
+score their text. This distinction is based on stored identity, not on whether
+native or vector discovery produced the hit.
+
+## Persistence and indexing lifecycle
+
+PostgreSQL and pgvector hold durable index state. `Document` is the unit of
+indexing and stores identity, parentage, modification time, metadata, summary, and
+summary embedding. `DocumentChunk` stores embedding units and their semantic
+membership; `ChunkSummary` stores summaries of spans. `IndexingWork` records
+pending child acquisition, and `FailedDocument` records handled indexing failures,
+including failures for documents with no stored row. Composite collection-local
+keys and database cascades enforce ownership throughout these relationships.
+
+Document metadata is persisted separately from the dedicated title and keyword
+fields. Tool responses expose nonconflicting metadata while reserving their own
+identity, summary, chunk, and child fields. Metadata cannot overwrite protocol
+fields. Fetching a document exposes its immediate children so hierarchy is
+discoverable as well as directly addressable.
+
+Indexing prepares a document's complete chunk set and enumerates its immediate
+children. The document, its chunks, and pending work for discovered children are
+published atomically. A parent commit promises recoverable child work, not a
+fully indexed subtree. Successful complete enumeration permits removal of absent
+children and their work; partial or failed enumeration never establishes absence.
+Child modification times inherit ancestor changes.
+
+Work entries identify targets and parents, not serialized handles or frozen
+source revisions. A child commit publishes its own descendant work and retires
+its completed work atomically. Restarted indexing processes pending work before
+new source discovery. After a parent commit, already enumerated children can be
+scheduled immediately through the shared indexing task machinery, reusing cached
+handles. Handled failures are recorded and excluded from ordinary scheduling,
+even if a parent later recreates work for the same ID; they do not cause an
+unbounded automatic retry loop.
+
+Parents must not hold a concurrency slot while waiting to acquire child slots or
+for children to finish. Descendants participate in the same task and idle tracking
+as root work. Recovery does not require a whole-subtree transaction, generation
+tokens, or a second child-worker pool.
+
+Full indexing discovers new roots by enumeration. Indexed-only coverage adds
+roots through search or explicit requests. Durable child work remains independent of root discovery policy.
+`ensure_document_indexed` reuses persisted documents without source probes and
+fully indexes missing ones. Search does not refresh an existing indexed document
+or persist only its matching chunks.
+
+Maintenance is a separate opt-in pass over stored documents. It compares acquired
+modification times, prepares changed content before atomic replacement, and deletes
+confirmed missing documents while retaining records on other access failures.
+Refresh invalidates old summaries, and summary writes guard against changed or
+deleted rows. Maintenance uses the same acquisition path and inherits its cache
+staleness; immediate freshness and coordination across source revisions are not
+promised. Redesigning that policy is separate from adding formats or search modes.
+
+## Summaries and shared model resources
+
+Chunk summaries describe spans of a document's own text. Document summaries
+combine available own-text inputs with immediate-child summaries. The composition
+keeps text or excerpts, summaries of parts, and identified child summaries distinct.
+Descendant information flows upward through immediate children rather than being
+flattened into every ancestor's prompt. A handle-provided summary cannot bypass
+available child summaries, while a summary-only leaf can use its supplied summary
+directly. Documents without chunks still receive summary embeddings.
+
+Document summarization proceeds bottom-up once descendant indexing work has
+completed or failed and available child summaries are ready. Readiness waits must
+not occupy slots needed by descendants. Completion and failure events trigger
+newly ready parent work; a catch-up pass handles work completed in an earlier
+process. Search result summarization can converge the required tree bottom-up.
+Failed descendants follow the general failure policy rather than blocking parent
+readiness indefinitely or creating provisional summaries after every completion.
+
+Concurrent preparation feeds shared model batchers. Expensive conversion uses
+context-level concurrency control, and reranking uses one shared configured
+adapter for enabled collections. Reranker setup completes before a new search
+issues embedding or summary requests, reserving local accelerator resources
+before other model services can claim them. Adapters may run in-process or call
+an external service, but search requires a finite score for every prepared input;
+scoring and page selection are separate operations. Database sessions must not
+remain open across source conversion or model calls.
+
+## Discovery, scoring, and result assembly
+
+`search.py` is the common search application interface. Vector discovery searches
+the indexed subset; optional native discovery searches the source corpus, including
+documents not yet persisted. They run concurrently and return detached
+`DocumentHit` and `ChunkHit` values rather than ORM objects. Native scores and
+vector distances are not comparable across discovery lists.
+
+Search deduplicates before text preparation or scoring. Document summaries and
+chunk spans are separate evidence for a document. Equivalent chunk references
+must share canonical semantic metadata and consistent span coordinates; a stored
+chunk ID is a retrieval reference rather than a separate discovery identity.
+Each distinct accepted hit is successfully scored at most once per session.
+The first accepted scoring input is retained as the choice for that hit rather
+than being refreshed and rescored during continuation.
+
+Without reranking, selection follows encounter order: vector documents, vector
+chunks, native documents, then native chunks within a batch, with older pending
+hits first. With reranking, all new prepared hits receive scores, including those
+not selected for this page. Documents compete by their best qualifying discovered
+hit; ties preserve encounter order and then document identity. Thresholds apply
+before page selection. A later strong chunk can qualify a document whose summary
+was rejected, but a returned document is never updated or returned again along
+the continuation chain.
+
+The page limit counts distinct successfully assembled documents. Selected
+documents include their qualifying discovered chunks with duplicate references
+removed. Document scoring uses a supplied hit summary when available, otherwise
+the stored/source summary and generic summarization path. Preparation may index a
+candidate that is never selected. Assembly ensures selected documents are fully
+indexed, fills missing summaries while preserving existing ones, and loads response
+objects after writes finish. Independent sessions do not gain a new global indexing
+or summarization lock through search.
+
+## Incremental discovery and cursor sessions
+
+A `SearchResult` carries results, a continuation cursor, and warnings. Each source
+owns an in-memory session store. A session freezes the query, effective natural-
+language query, candidate batch sizes, thresholds, and reranker, while allowing the
+page limit to change on advancement. Sources with structured native syntax can
+expose a separate natural-language rerank query; it drives both vector discovery
+and reranking while the original query drives native discovery.
+
+Each advancement performs at most one bounded batch per unfinished discovery
+stream, even when retained candidates could fill the page. New evidence competes
+with pending evidence; pages are ordered only by what has been discovered so far.
+Later pages can score better, and short or empty pages can still have continuation.
+A session ends only when discovery is exhausted and no eligible pending or
+retryable item work remains. Bounded candidate counts do not bound elapsed source
+or model time.
+
+Vector discovery keeps separate document and chunk positions and reuses the query
+embedding. Positions advance by raw candidate counts before duplicate suppression
+or rejection. The existing ANN/HNSW path remains approximate; exhausting its
+exposed candidates does not prove exhaustive recall. Native discovery returns
+`NativeSearchBatch` with source-owned continuation positions, passed back unchanged.
+An empty batch still advances at least one enabled position; only `None` means
+native exhaustion. Limits can disable a hit type, whose position remains unchanged.
+Unchanged native inputs require deterministic traversal and stable ties. Wikipedia
+uses raw Xapian match positions so filtered matches consume scan budget without
+requiring a rescan from the start.
+
+Duplicate and returned-document suppression belongs to orchestration. Discovery
+must not receive seen sets or shrink its offset-based candidate universe around
+them, which could skip unrelated results. Corpus changes can still reorder or omit
+candidates during a session; cursors are not database or source snapshots.
+
+Cursor tokens are opaque, collection-local references to process-local state.
+The current token advances; the most recently consumed token replays its cached
+page and next token. Successful advancement invalidates the older replay token.
+A final page remains replayable until expiration. Replay returns isolated copies
+of loaded response data without database, source, or model work, so caller mutation
+and corpus changes cannot alter the cached page. Collection resolution and any
+applicable access checks still precede replay.
+
+Concurrent requests for the same advancing token share one shielded operation.
+Cancelling a waiter must not cancel that operation or cause completed scoring to
+repeat. Page snapshot publication, returned-document tracking, pending-hit removal,
+and token rotation commit together in memory. Saved phase progress allows retries
+after a page-production failure without repeating successful discovery or scoring.
+The initial request has no client-visible retry token until it returns.
+
+Sessions expire after inactivity, including cleanup when no new requests arrive;
+in-flight advancement is protected from eviction. Restarting or replacing a
+source invalidates its tokens. Multiple serving processes require sticky routing.
+The replay window bounds response history, not active seen-set memory; hard memory
+caps would require an explicit admission policy. Terminal sessions release candidate
+state while retaining the final replay page.
+
+## Failure boundaries and extension direction
+
+Discovery failure is never exhaustion. Successful streams and pending work may
+produce a page with warnings while a failed stream remains retryable. If all
+attempted discovery fails with no usable work, search returns a retryable error.
+Reranker setup or batch failure also returns an error instead of mixing scored
+results with an unscored fallback. Successful discovery and scoring survive a
+failed continuation attempt.
+
+Individual preparation and assembly failures receive bounded later retries and
+then explicit warnings when discarded. Failed assembly never marks a document
+successfully returned. Persistent discovery outages can keep a session unfinished
+until expiration; unreadable documents prevent a guarantee of exhaustive results.
+Invalid or expired cursors are errors, never implicit new searches or empty
+terminal pages.
+
+New corpus access belongs in a source, new byte acquisition in a bridge, and new
+format interpretation in a handle or plugin. Converters should reuse text
+interpretation through delegation and retain converted text when reproducible
+retrieval requires it. EPUB conversion and mail attachment interpretation fit
+these boundaries but are not implemented features. Whether a chapter or message
+part is a subdocument depends on its identity, lifecycle, and retrieval needs;
+conversion alone does not require a new hierarchy level. Binary tool delivery,
+generalized streaming, and stronger freshness or subtree-version coordination
+remain separate design work rather than implied requirements of these interfaces.

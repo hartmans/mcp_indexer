@@ -3,7 +3,7 @@
 The former ``DocumentSource.fetch_chunk`` wrapper is replaced by
 ``fetch_chunk``: an application-level helper that operates on a stored chunk
 ID. It returns the text retained in the database whenever that text is
-available, and otherwise falls back to a fresh source read. The helper is
+available, and otherwise falls back to retrieval through a source handle. The helper is
 usable by search, the indexer, and MCP retrieval; it does not belong to any
 format plugin.
 """
@@ -94,7 +94,7 @@ async def fetch_chunk(
 async def _semantic_from_handle(
     source: DocumentSource, document_id: str, metadata_str: str | None,
 ) -> str:
-    """Fetch a semantic chunk's full text from a freshly acquired handle.
+    """Fetch a semantic chunk's full text through the source handle cache.
 
     The handle is acquired through the source's process-local handle cache.
     Chunk-level offsets stored in legacy metadata are stripped before the

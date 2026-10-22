@@ -28,8 +28,16 @@ class Base(DeclarativeBase):
 class DocumentChunk(Base):
     """A chunk of a document with its embedding.
 
-    Stores the text content, position within the document, and vector embedding
-    for semantic search.
+    Each row is an embedding unit, not an entire semantic chunk. ``order`` is
+    unique within the document; ``semantic_chunk_id`` repeats the order of the
+    semantic group's first row. The deferred self-reference permits grouped
+    writes while rejecting a missing semantic root at constraint checking.
+    ``semantic_length`` is repeated across the group to avoid metadata decoding.
+
+    ``metadata_str`` locates semantic content in the source; embedding_offset
+    and embedding_length are character coordinates within its decoded text.
+    ``summary_span`` identifies a covering ChunkSummary and is nullable before
+    summarization. Optional exact text is deferred on ordinary ORM loads.
     """
     __tablename__ = "document_chunk"
 

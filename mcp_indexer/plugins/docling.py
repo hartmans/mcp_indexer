@@ -7,7 +7,11 @@ the result as Markdown, and interprets that Markdown through a
 carries the same document ID (a delegate, not a subdocument). Extracted
 figures become :class:`~mcp_indexer.plugins.images.ImageDocument`
 subdocuments, and the Markdown's image references are mapped to their
-subdocument IDs when the mapping is unambiguous. Page boundaries are
+subdocument IDs when the mapping is unambiguous. Figure components use
+``fig-<reading-order index>-<first 12 hex characters of PNG SHA1>``; repeated
+conversion is best-effort stable, but rerendered bytes may change identity.
+Reference substitution precedes chunking so retained text and offsets address
+one representation. Page boundaries are
 preserved in the Markdown: each break carries a form feed, followed by an
 HTML comment naming the page that begins there, so machine consumers can
 split on the form feed and LLM consumers can read the annotation.
