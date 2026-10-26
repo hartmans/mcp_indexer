@@ -55,17 +55,15 @@ async def test_maintenance_refreshes_changed_and_deletes_immediately(monkeypatch
     source = SimpleNamespace(id="wiki", indexing_mode=mode, fetch_document=fetch)
     indexer = Indexer(context_for(session))
 
-    async def index_document(pointer, stats):
-        events.append(("refresh", pointer.document_id, stats.operation))
-
-    async def schedule(coroutine, stats):
-        await coroutine
+    async def index_document(source, document_id, *, pointer=None):
+        events.append(("index", document_id))
 
     monkeypatch.setattr(indexer, "index_document", index_document)
-    monkeypatch.setattr(indexer, "_schedule_document_task", schedule)
     await indexer.maintain_collection(source)
-    assert [event for event in events if isinstance(event, tuple) and event[0] == "refresh"] == [
-        ("refresh", "older", "refresh"), ("refresh", "updated", "refresh"),
+    # The refresh runs are queued; settle them before asserting.
+    await indexer.wait_for_idle()
+    assert [event for event in events if isinstance(event, tuple) and event[0] == "index"] == [
+        ("index", "older"), ("index", "updated"),
     ]
 
 

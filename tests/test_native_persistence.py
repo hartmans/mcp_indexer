@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import select, text, update
 
 from mcp_indexer.config import CollectionConfig, ServerConfig
-from mcp_indexer.indexer import Indexer, DocumentIndexingStats
+from mcp_indexer.indexer import Indexer
 from mcp_indexer.llm import VECTOR_DIMENSIONS
 from mcp_indexer.models import Document, DocumentChunk, ChunkSummary, FailedDocument
 from mcp_indexer.plugins.file_source import FileSource
@@ -58,8 +58,8 @@ async def test_refresh_failure_and_deletion_are_atomic(test_context, tmp_path, m
         raise RuntimeError("embedding failed")
     monkeypatch.setattr(indexer, "_embed_batch", fail)
     with pytest.raises(RuntimeError, match="embedding failed"):
-        await indexer.index_document(await source.fetch_document(path.name),
-                                     DocumentIndexingStats(path.name, "refresh", source=source))
+        await indexer.index_document(source, path.name,
+                                     pointer=await source.fetch_document(path.name))
     async with source.context.get_session() as session:
         kept = await session.get(Document, (source.id, path.name))
         assert kept.last_modified == old_mtime
@@ -151,7 +151,7 @@ async def test_indexing_normalizes_metadata_keywords(test_context, tmp_path, mon
 
     monkeypatch.setattr(pointer, "get_metadata", metadata)
     await indexer.index_document(
-        pointer, DocumentIndexingStats(pointer.document_id, "index", source=source),
+        source, pointer.document_id, pointer=pointer,
     )
     async with source.context.get_session() as session:
         document = await session.get(Document, (source.id, pointer.document_id))
@@ -341,8 +341,7 @@ async def test_refresh_shrinking_across_semantic_heads(test_context,
 
     path.write_text("# Short\nJust a short document.")
     await indexer.index_document(
-        await source.fetch_document(path.name),
-        DocumentIndexingStats(path.name, "refresh", source=source),
+        source, path.name, pointer=await source.fetch_document(path.name),
     )
     async with source.context.get_session() as session:
         after = (await session.execute(

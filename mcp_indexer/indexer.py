@@ -1,8 +1,12 @@
 import argparse
 import asyncio
+import heapq
+import itertools
 import json
 import logging
 import re
+import traceback
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,31 +76,42 @@ class ReconstructedSemanticChunk:
     text: str
 
 
-class DocumentIndexingStats:
-    def __init__(
-        self,
-        document_id: str,
-        operation: str = "index",
-        semantic_chunks: int = 0,
-        embedding_chunks: int = 0,
-        summary_spans: int = 0,
-        source: Any = None,
-    ):
-        self.document_id = document_id
-        self.operation = operation
-        self.semantic_chunks = semantic_chunks
-        self.embedding_chunks = embedding_chunks
-        self.summary_spans = summary_spans
-        self.source = source
+# Dispatch priorities for queued work; smaller is more urgent, and free
+# worker slots fill in this order. Work initiated by the request entries
+# (ensure_document_indexed, summarize_results) runs at the request's
+# priority so it fills free slots ahead of pass work.
+PRIORITY_ENSURE = 0
+PRIORITY_SUMMARIZE_RESULTS = 1
+PRIORITY_TRIGGERED_DOC_SUMMARY = 2
+PRIORITY_CHUNK_SUMMARY = 3
+PRIORITY_DOC_SUMMARY = 4
+PRIORITY_INDEX = 5
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "document_id": self.document_id,
-            "operation": self.operation,
-            "semantic_chunks": self.semantic_chunks,
-            "embedding_chunks": self.embedding_chunks,
-            "summary_spans": self.summary_spans,
-        }
+
+def _mark_exception_retrieved(fut: asyncio.Future) -> None:
+    """Keep a fire-and-forget failure from warning on collection."""
+    if not fut.cancelled():
+        with suppress(Exception):
+            fut.exception()
+
+
+@dataclass
+class _WorkItem:
+    """One unit of queued work.
+
+    ``dedup_key`` is the (factory, key) pair under which the run is
+    deduplicated; concurrent submissions for it share one run and one
+    future. ``dispatched`` marks runs the dispatcher has started.
+    """
+    factory: Callable[..., Any]
+    priority: int
+    order: int
+    source: DocumentSource
+    document_id: str
+    kwargs: dict
+    future: asyncio.Future
+    dedup_key: tuple | None = None
+    dispatched: bool = False
 
 
 class Indexer:
@@ -108,17 +123,27 @@ class Indexer:
         self.context = context
         self.server_config = context.config.get_server_config()
         self.debug = debug
-        self.sem = asyncio.Semaphore(INDEXING_WORKERS)
+        self._work_capacity = INDEXING_WORKERS
+        self._order = itertools.count()
+        # Queued work: the heap orders it by (priority, order); the
+        # pending map keeps items alive until dispatch, and a pop must
+        # only ever find live, up-to-date entries.
+        self._heap: list[tuple[int, int]] = []
+        self._pending: dict[int, _WorkItem] = {}
+        # Dispatched, unfinished work; the single source of truth for what
+        # is running, for the idle signal, and for the capacity gate.
+        self._in_flight: dict[asyncio.Task, _WorkItem] = {}
+        # Deduplicated runs, keyed by (factory, key); at most one queued or
+        # in-flight run per key, regardless of which caller submitted it.
+        self._live: dict[tuple, _WorkItem] = {}
+        # _wake wakes the dispatcher (submission, or capacity freed);
+        # _idle signals wait_for_idle (nothing queued or running).
+        self._wake = asyncio.Event()
         self._idle = asyncio.Event()
         self._idle.set()
-        self._running_documents: dict[asyncio.Task, DocumentIndexingStats] = {}
+        self._dispatcher: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._debug_stats_path = Path(DEBUG_STATS_FILENAME)
-        # One in-flight document summary run per (collection, document);
-        # triggers and the catch-up scan schedule at most one run, and the
-        # on-demand walk joins a run instead of duplicating it.
-        self._in_flight_summaries: dict[tuple[str, str], asyncio.Task] = {}
-        self._summary_lock = asyncio.Lock()
         # Pass-level document summarization; the trigger consults it. The MCP
         # path runs no passes and treats summarization as enabled.
         self._document_summaries_enabled = True
@@ -160,7 +185,7 @@ class Indexer:
             await session.commit()
         # A failed target no longer blocks its parent's readiness (failed
         # children are excluded), so the parent may be ready right now.
-        await self._trigger_document_summary(source, document_id, for_parent=True)
+        self._trigger_document_summary(source, document_id, for_parent=True)
 
     async def index_all(
         self,
@@ -228,13 +253,15 @@ class Indexer:
             if not rows:
                 return
             failed_docs = await self._get_failed_documents(source)
-            tasks = []
+            futures = []
             for document_id in rows:
-                task = await self._index_work_row(source, document_id, failed_docs)
-                if task is not None:
-                    tasks.append(task)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                future = await self._index_work_row(
+                    source, document_id, failed_docs, PRIORITY_INDEX,
+                )
+                if future is not None:
+                    futures.append(future)
+            if futures:
+                await asyncio.gather(*futures, return_exceptions=True)
 
     async def _retire_work(self, source: DocumentSource, document_id: str) -> None:
         """Delete the pending work entry targeting document_id, if any."""
@@ -267,12 +294,12 @@ class Indexer:
                 )
                 continue
 
-            stats = DocumentIndexingStats(
-                document_id=pointer.document_id, operation="index", source=source
-            )
-            await self._schedule_document_task(
-                self.index_document(pointer, stats),
-                stats,
+            self.submit(
+                PRIORITY_INDEX,
+                self.index_document,
+                source=source, document_id=pointer.document_id,
+                key=(source.id, pointer.document_id),
+                pointer=pointer,
             )
 
     async def maintain_collection(self, source: DocumentSource) -> None:
@@ -308,9 +335,12 @@ class Indexer:
                     logger.exception("Could not maintain %s:%s", source.id, document_id)
                     continue
                 if pointer.last_modified != last_modified:
-                    stats = DocumentIndexingStats(document_id, "refresh", source=source)
-                    await self._schedule_document_task(
-                        self.index_document(pointer, stats), stats,
+                    self.submit(
+                        PRIORITY_INDEX,
+                        self.index_document,
+                        source=source, document_id=document_id,
+                        key=(source.id, document_id),
+                        pointer=pointer,
                     )
             after = rows[-1][0]
 
@@ -323,10 +353,20 @@ class Indexer:
         has no ancestors in the database the missing ancestors are indexed
         first, from the root down to the requested child. Sibling subtrees
         are not completed; they remain ordinary discovered child work.
+
+        The request runs immediately in its caller; the index runs it
+        initiates are queued at the ensure priority, so they fill free
+        worker slots ahead of pass work.
         """
         async with self.context.get_session() as session:
             if await session.get(Document, (source.id, document_id)) is not None:
                 return
+        await self._ensure_indexed_walk(source, document_id, retry_failed=retry_failed)
+
+    async def _ensure_indexed_walk(
+        self, source: DocumentSource, document_id: str, *, retry_failed: bool,
+    ) -> None:
+        """Index missing ancestors, from the root down to the requested ID."""
         # Walk up the ID hierarchy, collecting missing ancestors.
         missing_ancestors: list[str] = []
         node = document_id
@@ -346,19 +386,21 @@ class Indexer:
     async def _ensure_document_row(
         self, source: DocumentSource, document_id: str, *, retry_failed: bool = False,
     ) -> None:
-        """Index a single document ID (callers establish ancestor rows)."""
+        """Index a single document ID (callers establish ancestor rows).
+
+        The index run is queued at the ensure priority; its failure record
+        is owned by its completion, so a failure simply raises to the caller.
+        """
         async with self.context.get_session() as session:
             failure = await session.get(FailedDocument, (source.id, document_id))
         if failure is not None and not retry_failed:
             raise RuntimeError(f"Previously failed document {document_id}: {failure.failure_reason}")
-        try:
-            await self.index_document(
-                await source.fetch_document(document_id),
-                DocumentIndexingStats(document_id, "index", source=source),
-            )
-        except Exception as exc:
-            await self._record_failure(source, document_id, str(exc))
-            raise
+        await self.submit(
+            PRIORITY_ENSURE,
+            self.index_document,
+            source=source, document_id=document_id,
+            key=(source.id, document_id),
+        )
 
     async def summarize_chunks_collection(self, source: DocumentSource):
         # Get set of failed document_ids to skip
@@ -383,12 +425,11 @@ class Indexer:
             return
 
         for document_id in document_ids:
-            stats = DocumentIndexingStats(
-                document_id=document_id, operation="chunk_summary", source=source
-            )
-            await self._schedule_document_task(
-                self.summarize_document_chunks(source, document_id),
-                stats,
+            self.submit(
+                PRIORITY_CHUNK_SUMMARY,
+                self.summarize_document_chunks,
+                source=source, document_id=document_id,
+                key=(source.id, document_id),
             )
 
         await self.wait_for_idle()
@@ -399,12 +440,15 @@ class Indexer:
         """Bring the requested documents' summary trees to summarized state.
 
         Each requested document is indexed first (establishing its row and
-        its ancestors'), and its tree is then summarized bottom-up to the
+        its ancestors), and its tree is then summarized bottom-up to the
         ultimate parent -- the full subtree, since a parent's summary is
-        built from its children's. The walk awaits only the work it
-        initiates (and runs already in flight for the same document); it
-        never waits on the process idle mechanism, and duplicate work with
-        concurrently scheduled runs is accepted. Failed documents follow the
+        built from its children's.
+
+        The request runs immediately in its caller and awaits only the work
+        it initiates (and runs already queued or in flight for the same
+        document); that work is queued at the summarize_results priority,
+        so it fills free worker slots ahead of pass work. The request never
+        waits on the process idle mechanism. Failed documents follow the
         general failure rules.
         """
         document_ids = set(document_ids)
@@ -412,13 +456,19 @@ class Indexer:
             return
 
         source = self.context.collections[collection_id]
+        await self._summarize_results_walk(source, sorted(document_ids))
+
+    async def _summarize_results_walk(
+        self, source: DocumentSource, document_ids: list[str],
+    ) -> None:
+        """Converge each requested document's tree, bottom-up, awaited."""
         failed_docs = await self._get_failed_documents(source)
-        for document_id in sorted(document_ids):
+        for document_id in document_ids:
             if document_id in failed_docs:
                 continue
             await self.ensure_document_indexed(source, document_id)
 
-        live_ids = sorted(document_ids - failed_docs)
+        live_ids = [document_id for document_id in document_ids if document_id not in failed_docs]
         ultimates = sorted({
             await self._ultimate_parent(source, document_id)
             for document_id in live_ids
@@ -471,9 +521,18 @@ class Indexer:
                 )
             )).scalar_one_or_none()
         if needs_summary == "":
-            await self._run_document_summary(
-                source, document_id, bounded=False, join=True,
+            # A failed run is recorded by its completion and simply yields
+            # no summary; the tree keeps converging through the triggers.
+            future = self.submit(
+                PRIORITY_SUMMARIZE_RESULTS,
+                self.summarize_document,
+                source=source, document_id=document_id,
+                key=(source.id, document_id),
             )
+            try:
+                await future
+            except Exception:
+                pass
 
     async def _index_subtree_work(
         self, source: DocumentSource, document_id: str,
@@ -496,28 +555,29 @@ class Indexer:
         if not rows:
             return
         failed_docs = await self._get_failed_documents(source)
-        tasks = []
+        futures = []
         for child_id in rows:
-            task = await self._index_work_row(source, child_id, failed_docs, bounded=False)
-            if task is not None:
-                tasks.append(task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            future = await self._index_work_row(
+                source, child_id, failed_docs, PRIORITY_SUMMARIZE_RESULTS,
+            )
+            if future is not None:
+                futures.append(future)
+        if futures:
+            await asyncio.gather(*futures, return_exceptions=True)
 
     async def _index_work_row(
         self,
         source: DocumentSource,
         document_id: str,
         failed_docs: set[str],
-        *,
-        bounded: bool = True,
-    ) -> asyncio.Task | None:
+        priority: int,
+    ) -> asyncio.Future | None:
         """Resolve one pending work row targeting document_id.
 
         Retires the row when the target is failed, gone, or unchanged since
-        it was last indexed; otherwise schedules an index and returns the
-        task. The row retires atomically with the index commit (or the
-        failure record).
+        it was last indexed; otherwise queues an index run at the caller's
+        priority and returns its future. The row retires atomically with the
+        index commit (or the failure record).
         """
         if document_id in failed_docs:
             # Failure exclusion: a failed target never stalls a parent or
@@ -537,15 +597,12 @@ class Indexer:
             # Unchanged since it was indexed; the work is done.
             await self._retire_work(source, document_id)
             return None
-        stats = DocumentIndexingStats(
-            document_id=document_id, operation="index", source=source,
-        )
-        if bounded:
-            return await self._schedule_document_task(
-                self.index_document(pointer, stats), stats,
-            )
-        return self._schedule_unbounded_document_task(
-            self.index_document(pointer, stats), stats,
+        return self.submit(
+            priority,
+            self.index_document,
+            source=source, document_id=document_id,
+            key=(source.id, document_id),
+            pointer=pointer,
         )
 
     async def _summarize_result_chunks(
@@ -563,13 +620,12 @@ class Indexer:
             needs_chunks = result.first() is not None
         if not needs_chunks:
             return
-        stats = DocumentIndexingStats(
-            document_id=document_id, operation="chunk_summary", source=source,
+        await self.submit(
+            PRIORITY_SUMMARIZE_RESULTS,
+            self.summarize_document_chunks,
+            source=source, document_id=document_id,
+            key=(source.id, document_id),
         )
-        task = self._schedule_unbounded_document_task(
-            self.summarize_document_chunks(source, document_id), stats,
-        )
-        await task
 
     async def _summarization_ready(self, source: DocumentSource, document_id: str) -> bool:
         """Tree readiness for bottom-up document summarization.
@@ -649,87 +705,166 @@ class Indexer:
                 continue
             if not await self._summarization_ready(source, document_id):
                 continue
-            await self._run_document_summary(
-                source, document_id, bounded=True, join=False,
+            self.submit(
+                PRIORITY_DOC_SUMMARY,
+                self.summarize_document,
+                source=source, document_id=document_id,
+                key=(source.id, document_id),
             )
 
-    async def _schedule_document_task(self, coro, stats: DocumentIndexingStats) -> asyncio.Task:
-        # Slot acquisition happens inside the task, not here: a parent that
-        # schedules its children while holding its own slot must not block on
-        # a child's slot acquisition (with one slot that would deadlock).
-        # Descendant work still participates in the same semaphore pool, task
-        # tracking, and idle machinery.
-        task = asyncio.create_task(self._run_with_semaphore(coro, stats))
-        self._track_task(task, stats)
-        task.add_done_callback(self._on_task_done)
-        return task
-
-    def _schedule_unbounded_document_task(
-        self, coro, stats: DocumentIndexingStats
-    ) -> asyncio.Task:
-        task = asyncio.create_task(coro)
-        self._track_task(task, stats)
-        task.add_done_callback(self._on_task_done)
-        return task
-
-    async def _run_with_semaphore(self, coro, stats: DocumentIndexingStats):
-        await self.sem.acquire()
-        try:
-            return await coro
-        except Exception as e:
-            logger.error(f"Error in {stats.operation} for {stats.document_id}: {e}")
-            raise
-        finally:
-            self.sem.release()
-
-    async def _run_document_summary(
+    def submit(
         self,
+        priority: int,
+        factory: Callable[..., Any],
+        *,
         source: DocumentSource,
         document_id: str,
-        *,
-        bounded: bool = True,
-        join: bool = True,
-    ) -> bool | None:
-        """Run summarize_document on the document, at most once at a time.
+        key: tuple | None = None,
+        **kwargs: Any,
+    ) -> asyncio.Future:
+        """Queue one unit of work and return a future for its result.
 
-        The in-flight map holds one summary run per (collection, document):
-        triggers and the catch-up scan schedule at most one run, and the
-        on-demand walk joins a run already in flight instead of duplicating
-        it. The entry is removed unconditionally when the run completes,
-        success or failure. With ``join`` the call awaits the run and returns
-        whether a summary was committed; otherwise it returns once the run is
-        scheduled.
+        A single dispatcher fills free worker slots with the most urgent
+        queued work; done callbacks free capacity and wake it. At
+        dispatch the queue starts the work with
+        ``factory(source=source, document_id=document_id, **kwargs)`` and
+        wraps whatever awaitable it returns, so the work's inputs are the
+        submission's own arguments.
+
+        ``key`` deduplicates per-document runs: the dedup key is the pair
+        (factory, key), so a submission under an existing key joins the
+        run already queued or in flight and returns a future on the same
+        result. A joining submission for a still-queued run may inflate
+        its priority; the latest submission's arguments win.
+
+        The returned future is shielded per submission: asyncio cancels
+        the future a task awaits when the task is cancelled, so each
+        wait is isolated -- cancelling one waiter abandons only that
+        wait, while the run and the remaining waiters are unaffected.
         """
-        key = (source.id, document_id)
-        async with self._summary_lock:
-            task = self._in_flight_summaries.get(key)
-            if task is None or task.done():
-                stats = DocumentIndexingStats(
-                    document_id=document_id, operation="document_summary",
-                    source=source,
-                )
-                coro = self.summarize_document(source, document_id)
-                if bounded:
-                    task = await self._schedule_document_task(coro, stats)
-                else:
-                    task = self._schedule_unbounded_document_task(coro, stats)
-                self._in_flight_summaries[key] = task
-                task.add_done_callback(
-                    lambda _t, k=key, t=task: (
-                        self._in_flight_summaries.pop(k, None)
-                        if self._in_flight_summaries.get(k) is t else None
-                    ),
-                )
-        if not join:
-            return None
-        try:
-            return bool(await task)
-        except Exception:
-            # The failure is recorded by the task's done handling; a failed
-            # run simply yields no summary.
-            return False
+        loop = asyncio.get_running_loop()
+        dedup_key = (factory, key) if key is not None else None
+        if dedup_key is not None:
+            existing = self._live.get(dedup_key)
+            if existing is not None:
+                if not existing.dispatched:
+                    existing.source = source
+                    existing.document_id = document_id
+                    existing.kwargs = kwargs
+                    if priority < existing.priority:
+                        self._inflate_priority(existing, priority)
+                return self._shielded(existing.future)
+        item = _WorkItem(
+            factory=factory,
+            priority=priority,
+            order=next(self._order),
+            source=source,
+            document_id=document_id,
+            kwargs=kwargs,
+            future=loop.create_future(),
+            dedup_key=dedup_key,
+        )
+        item.future.add_done_callback(_mark_exception_retrieved)
+        if dedup_key is not None:
+            self._live[dedup_key] = item
+        self._pending[item.order] = item
+        heapq.heappush(self._heap, (item.priority, item.order))
+        self._idle.clear()
+        self._wake.set()
+        self._ensure_dispatcher()
+        return self._shielded(item.future)
 
-    async def _trigger_document_summary(
+    @staticmethod
+    def _shielded(future: asyncio.Future) -> asyncio.Future:
+        """A shielded wait on a run's future, see submit.
+
+        The callback keeps a fire-and-forget failure on the shield from
+        warning: the run's own future is already covered.
+        """
+        shielded = asyncio.shield(future)
+        shielded.add_done_callback(_mark_exception_retrieved)
+        return shielded
+
+    def _inflate_priority(self, item: _WorkItem, priority: int) -> None:
+        """Raise a queued item's priority, invalidating its heap entry."""
+        del self._pending[item.order]
+        item.priority = priority
+        item.order = next(self._order)
+        self._pending[item.order] = item
+        heapq.heappush(self._heap, (item.priority, item.order))
+
+    def _ensure_dispatcher(self) -> None:
+        if self._dispatcher is None or self._dispatcher.done():
+            self._dispatcher = asyncio.create_task(self._dispatch_loop())
+
+    async def _dispatch_loop(self) -> None:
+        try:
+            while True:
+                self._dispatch_ready()
+                if not self._in_flight and not self._pending:
+                    return
+                self._wake.clear()
+                if self._dispatch_ready():
+                    # A submission raced the clear; loop and dispatch it.
+                    continue
+                await self._wake.wait()
+        finally:
+            if self._dispatcher is asyncio.current_task():
+                self._dispatcher = None
+
+    def _dispatch_ready(self) -> bool:
+        """Dispatch every queued item that can run now; report progress."""
+        dispatched = False
+        while self._heap:
+            priority, order = self._heap[0]
+            item = self._pending.get(order)
+            if item is None or item.priority != priority or item.order != order:
+                # Stale entry: the item was inflated after it was pushed.
+                heapq.heappop(self._heap)
+                continue
+            if len(self._in_flight) >= self._work_capacity:
+                break
+            heapq.heappop(self._heap)
+            del self._pending[item.order]
+            self._dispatch_item(item)
+            dispatched = True
+        return dispatched
+
+    def _dispatch_item(self, item: _WorkItem) -> None:
+        # Submission never waits for a slot (a parent scheduling children
+        # must not block on child capacity); the capacity gate is the
+        # check above, and the work itself runs in its own task. The runner
+        # keeps a synchronous factory failure from killing the dispatcher:
+        # it lands as an ordinary task failure.
+        item.dispatched = True
+        task = asyncio.ensure_future(self._run_item(item))
+        task.add_done_callback(lambda done, item=item: self._on_work_done(item, done))
+        self._in_flight[task] = item
+        self._ensure_monitor_task()
+
+    async def _run_item(self, item: _WorkItem) -> Any:
+        try:
+            return await item.factory(
+                source=item.source, document_id=item.document_id, **item.kwargs,
+            )
+        except Exception as exc:
+            # Record the failure inside the run so its record is committed
+            # before the task completes -- wait_for_idle therefore cannot
+            # return before the record lands. A recording failure must not
+            # mask the original error.
+            tb_str = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            if len(tb_str) > 1000:
+                tb_str = tb_str[:997] + "..."
+            with suppress(Exception):
+                await self._record_failure(
+                    item.source, item.document_id,
+                    f"{type(exc).__name__}: {exc}\n{tb_str}",
+                )
+            raise
+
+    def _trigger_document_summary(
         self, source: DocumentSource, document_id: str, *, for_parent: bool,
     ) -> None:
         """Completion trigger.
@@ -738,8 +873,8 @@ class Indexer:
         for one -- exactly one document's summary readiness just changed: the
         document itself for its own indexing/chunk work, its parent for a
         finished (or failed) child. If document summarization is enabled for
-        this run, schedule a summary on it; the in-flight map deduplicates
-        against concurrent triggers.
+        this run, queue a summary on it; the shared dedup key collapses
+        concurrent triggers for the same document into one run.
         """
         if not self._document_summaries_enabled:
             return
@@ -748,12 +883,12 @@ class Indexer:
             if parent is None:
                 return
             document_id = parent
-        await self._run_document_summary(source, document_id, bounded=True, join=False)
-
-    def _track_task(self, task: asyncio.Task, stats: DocumentIndexingStats) -> None:
-        self._running_documents[task] = stats
-        self._idle.clear()
-        self._ensure_monitor_task()
+        self.submit(
+            PRIORITY_TRIGGERED_DOC_SUMMARY,
+            self.summarize_document,
+            source=source, document_id=document_id,
+            key=(source.id, document_id),
+        )
 
     def _ensure_monitor_task(self) -> None:
         if self._monitor_task is None or self._monitor_task.done():
@@ -766,7 +901,7 @@ class Indexer:
         previous_tasks: set[asyncio.Task] = set()
         try:
             while True:
-                running_items = list(self._running_documents.items())
+                running_items = list(self._in_flight.items())
                 if not running_items:
                     return
                 await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
@@ -781,7 +916,7 @@ class Indexer:
                         MONITOR_STALL_THRESHOLD_SECONDS,
                     )
 
-                running_items = list(self._running_documents.items())
+                running_items = list(self._in_flight.items())
                 if not running_items:
                     return
 
@@ -789,61 +924,77 @@ class Indexer:
                 tasks_to_log = current_tasks & previous_tasks
                 previous_tasks = current_tasks
 
-                for task, stats in running_items:
+                for task, item in running_items:
                     if task not in tasks_to_log:
                         continue
                     logger.info(
-                        "Still running %s document_id=%s semantic_chunks=%d embedding_chunks=%d summary_spans=%d",
-                        stats.operation,
-                        stats.document_id,
-                        stats.semantic_chunks,
-                        stats.embedding_chunks,
-                        stats.summary_spans,
+                        "Still running priority-%d work for %s:%s",
+                        item.priority,
+                        item.source.id,
+                        item.document_id,
                     )
         except asyncio.CancelledError:
             raise
         finally:
             if self._monitor_task is asyncio.current_task():
                 self._monitor_task = None
-            # Set idle if monitor task completes and there are no running documents
-            if not self._running_documents:
+            # Set idle if monitor task completes and there is no queued
+            # or running work
+            if not self._in_flight and not self._pending:
                 self._idle.set()
 
-    def _on_task_done(self, fut: asyncio.Task) -> None:
-        stats = self._running_documents.pop(fut, None)
-        if stats is not None and self.debug:
-            self._append_debug_stats(stats)
+    def _on_work_done(self, item: _WorkItem, task: asyncio.Task) -> None:
+        self._in_flight.pop(task, None)
+        if item.dedup_key is not None and self._live.get(item.dedup_key) is item:
+            del self._live[item.dedup_key]
 
-        if not self._running_documents:
+        exc = None
+        if not task.cancelled():
+            exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "priority-%d work failed for %s:%s",
+                item.priority,
+                item.source.id,
+                item.document_id,
+                exc_info=exc,
+            )
+            # The run's own completion recorded the failure (it never
+            # retries); a failed target never blocks its parent's
+            # readiness or reappears on every restart.
+        if not item.future.done():
+            if task.cancelled():
+                item.future.cancel()
+            elif exc is not None:
+                item.future.set_exception(exc)
+            else:
+                item.future.set_result(task.result())
+
+        if self.debug:
+            self._append_debug_record(item, task)
+
+        self._wake.set()
+        if not self._in_flight and not self._pending:
+            self._idle.set()
+        if not self._in_flight:
             if self._monitor_task is not None and not self._monitor_task.done():
                 self._monitor_task.cancel()
-            self._idle.set()
 
-        try:
-            fut.result()
-        except Exception as e:
-            logger.exception(f"Task failed: {e}")
-            # Record failure if we have stats and a document_id
-            if stats is not None and hasattr(stats, "document_id") and stats.document_id:
-                import traceback
-                tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                # Truncate long tracebacks
-                if len(tb_str) > 1000:
-                    tb_str = tb_str[:997] + "..."
-                # Get source from stats.source if available, otherwise try to infer
-                source = getattr(stats, "source", None)
-                if source is not None:
-                    asyncio.create_task(
-                        self._record_failure(source, stats.document_id, f"{type(e).__name__}: {str(e)}\n{tb_str}")
-                    )
-                else:
-                    logger.warning(f"Cannot record failure for {stats.document_id}: no source available")
-
-    def _append_debug_stats(self, stats: DocumentIndexingStats) -> None:
-        import json
-
+    def _append_debug_record(self, item: _WorkItem, task: asyncio.Task) -> None:
+        if task.cancelled():
+            outcome = "cancelled"
+        elif task.exception() is not None:
+            outcome = "error"
+        else:
+            outcome = "ok"
+        record = {
+            "collection": item.source.id,
+            "document_id": item.document_id,
+            "priority": item.priority,
+            "outcome": outcome,
+        }
         with self._debug_stats_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(stats.to_dict()))
+            handle.write(json.dumps(record))
             handle.write("\n")
             handle.flush()
 
@@ -855,11 +1006,19 @@ class Indexer:
                 with suppress(asyncio.CancelledError):
                     await self._monitor_task
 
-            if not self._running_documents:
+            if not self._in_flight:
                 return
 
-    async def index_document(self, pointer, stats: DocumentIndexingStats):
-        source = pointer.source
+    async def index_document(self, source, document_id, *, pointer=None):
+        """Index one document: chunks, embeddings, subdocuments, and work rows.
+
+        Called as a queued work factory: ``index_document(source,
+        document_id, **kwargs)``. When the caller has the handle in hand it
+        passes it as ``pointer`` (the process-local cache keeps that cheap);
+        otherwise the document is acquired from the source here.
+        """
+        if pointer is None:
+            pointer = await source.fetch_document(document_id)
         embedding_texts: list[str] = []
         embedding_offsets: list[int] = []
         embedding_metadata: list[dict[str, Any]] = []
@@ -874,8 +1033,6 @@ class Indexer:
                 self.server_config.min_size,
                 self.server_config.max_size,
             )
-            stats.semantic_chunks += 1
-            stats.embedding_chunks += len(plan.embedding_chunks)
             # The first embedding chunk of this semantic chunk is the next
             # global row; every embedding chunk in the chunk points back to it.
             first_order = len(embedding_texts)
@@ -963,10 +1120,9 @@ class Indexer:
         )
 
         # Post-commit scheduling: reuse the already-enumerated handles
-        # (the process-local cache keeps them cheap) through the existing
-        # semaphore-limited task machinery, without waiting for child slot
-        # acquisition or completion. Failure exclusion applies here as
-        # well as to restart work.
+        # (the process-local cache keeps them cheap) through the priority
+        # queue, without waiting for child capacity or completion. Failure
+        # exclusion applies here as well as to restart work.
         failed_docs = await self._get_failed_documents(source)
         for child in child_handles:
             child_id = child.document_id
@@ -975,15 +1131,16 @@ class Indexer:
             stored_mtime = stored_children.get(child_id)
             if stored_mtime is not None and stored_mtime == child.last_modified:
                 continue
-            stats = DocumentIndexingStats(
-                document_id=child_id, operation="index", source=source,
-            )
-            await self._schedule_document_task(
-                self.index_document(child, stats), stats,
+            self.submit(
+                PRIORITY_INDEX,
+                self.index_document,
+                source=source, document_id=child_id,
+                key=(source.id, child_id),
+                pointer=child,
             )
         # Indexing complete: this document's own summary inputs may now
         # exist (a summary-only leaf, or freshly ingested chunks).
-        await self._trigger_document_summary(
+        self._trigger_document_summary(
             source, pointer.document_id, for_parent=False,
         )
 
@@ -1068,7 +1225,7 @@ class Indexer:
             doc.summaries = doc_summaries
             await session.commit()
         # Span summaries are the document's own summary inputs.
-        await self._trigger_document_summary(
+        self._trigger_document_summary(
             source, document_id, for_parent=False,
         )
         return True
@@ -1090,9 +1247,10 @@ class Indexer:
         if doc is None:
             return False
         # Tree readiness: descendant work has completed or failed, and
-        # available child summaries have been produced. The check never
-        # waits, so it holds no semaphore slot that descendants need; a
-        # not-ready document is left for a later round.
+        # available child summaries have been produced. The check is a pure
+        # read: it never waits on descendant work, so a not-ready document
+        # yields its run (and its capacity) to the queue; the document is
+        # left for a completion trigger or a later pass.
         if not await self._summarization_ready(source, document_id):
             return False
         expected_mtime = doc.last_modified
@@ -1201,7 +1359,7 @@ class Indexer:
                             normalize_keywords(metadata_dict.get("keywords", [])))
             await session.commit()
         # This summary is now an input to the parent's summary.
-        await self._trigger_document_summary(
+        self._trigger_document_summary(
             source, document_id, for_parent=True,
         )
         return True
@@ -1414,7 +1572,7 @@ async def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help=f"Write per-document indexing statistics to {DEBUG_STATS_FILENAME}",
+        help=f"Write per-run completion records to {DEBUG_STATS_FILENAME}",
     )
     parser.add_argument("--index", action="store_true", help="Run chunk indexing")
     parser.add_argument("--maintenance", action="store_true",
