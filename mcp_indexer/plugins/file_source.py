@@ -17,10 +17,12 @@ from mcp_indexer.plugins.plugin import DocumentPlugin, HANDLER_REGISTRY
 class FileSourceConfig(BaseModel):
     """Base configuration for directory-based sources.
 
-    Carries the source-level text settings: the encoding of the source's
-    files and ``summary_length``, the size cap below which a document
-    summary may be generated. b/e metadata and chunk decoding are
-    byte-based; everything else in the pipeline is char-based.
+    Carries source-level text settings: the default encoding used by text
+    documents and Python's text fallback, plus ``summary_length``, the size
+    cap below which a document summary may be generated. Python documents
+    honor their per-file encoding declaration when parsing. b/e metadata and
+    chunk decoding are byte-based; everything else in the pipeline is
+    char-based.
     """
     directory: Path
     include: List[str] = Field(default_factory=list, description="Glob patterns to include")
@@ -132,6 +134,12 @@ DOCLING_POLICY: dict[str, Any] = {
     "handler": "docling",
 }
 
+# Python uses syntax-aware chunking by default. The plugin itself supplies
+# the parser and offset metadata; no extra policy is required.
+PYTHON_POLICY: dict[str, Any] = {
+    "handler": "python",
+}
+
 _EXTENSION_POLICIES: dict[str, dict[str, Any]] = {
     ".md": MARKDOWN_POLICY,
     ".markdown": MARKDOWN_POLICY,
@@ -146,6 +154,7 @@ _EXTENSION_POLICIES: dict[str, dict[str, Any]] = {
     ".ppt": DOCLING_POLICY,
     ".pptx": DOCLING_POLICY,
     ".rtf": DOCLING_POLICY,
+    ".py": PYTHON_POLICY,
 }
 
 
@@ -170,8 +179,8 @@ class FileSource(DocumentSource[P]):
     overrides it with the collection's configured plugin entries. The
     policy's ``handler`` name picks the plugin class, resolved through
     the handler-name registry, so enumeration and direct fetch select
-    consistently. The document's encoding and summary length come from
-    the source's config, not per-document arguments.
+    consistently. Text fallback encoding and summary length come from the
+    source config; Python parsing detects encoding per file.
     """
     source_prefix = "file"
     safe_document_path_chars = "/-_.!@+[]()"
