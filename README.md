@@ -113,8 +113,7 @@ Use repeated `--config` arguments to apply deployment-specific overrides.
 
 A file source uses `type = "file"`. Its required `directory` is the corpus root.
 Optional `include` and `exclude` are lists of glob patterns, both defaulting to
-empty lists. `encoding` defaults to `"utf-8"` and is used by text documents and
-the Python text fallback; Python parsing honors a file's encoding declaration.
+empty lists. `encoding` defaults to `"utf-8"` and sets the fallback encoding used by text documents.
 `summary_length` defaults to `65536` and controls the source text summary size cap.
 
 Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`), and RST (`.rst`) have built-in
