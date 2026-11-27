@@ -44,6 +44,7 @@ wikipedia = [
 test = [
     "pytest",
     "pytest-asyncio",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]
