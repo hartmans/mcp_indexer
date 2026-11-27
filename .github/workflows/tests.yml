@@ -2,7 +2,9 @@ name: Tests
 
 on:
   push:
+    branches: [subdocs]
   pull_request:
+    branches: [subdocs]
 
 permissions:
   contents: read

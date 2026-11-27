@@ -14,7 +14,7 @@ dependencies = [
     "langchain",
     "langchain-openai",
     "pgvector",
-    "sqlalchemy",
+    "sqlalchemy[asyncio]",
     "psycopg[binary]",
     "PyYAML",
 ]
