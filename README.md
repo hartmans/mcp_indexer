@@ -113,14 +113,25 @@ Use repeated `--config` arguments to apply deployment-specific overrides.
 
 A file source uses `type = "file"`. Its required `directory` is the corpus root.
 Optional `include` and `exclude` are lists of glob patterns, both defaulting to
-empty lists. `encoding` defaults to `"utf-8"`; `summary_length` defaults to `65536`
-and controls the source text summary size cap.
+empty lists. `encoding` defaults to `"utf-8"` and sets the fallback encoding used by text documents.
+`summary_length` defaults to `65536` and controls the source text summary size cap.
 
 Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`), and RST (`.rst`) have built-in
 text policies. Textual markup is preserved. Markdown and HTML use major headings
 as semantic boundaries; RST recognizes `=` and `-` title adornments. Other text
 uses separator lines, with paragraph boundaries as embedding candidates. Unknown
 extensions and extensionless files fall back to text interpretation.
+
+Python (`.py`) uses the standard-library tokenizer and AST to create semantic
+chunks for module-level functions and classes, with methods as embedding
+boundaries inside classes. Classes larger than the configured `max_size` are
+split into a class preamble and method chunks. Decorators remain with their
+definition. Python source encodings are detected from the BOM or encoding
+declaration and stored with chunk byte ranges, so fetching a chunk does not
+reparse the file. If encoding detection or parsing fails, the file uses the
+text handler's separator and paragraph boundaries. A module docstring longer
+than 200 characters is used with a compact definition outline as the document
+summary; this summary is capped at `max_size` characters.
 
 Install the optional converter with `pip install '.[docling]'` from this checkout
 for `.pdf`, `.docx`, `.odt`, `.ods`, `.ppt`, `.pptx`, `.doc`, and `.rtf`. These files

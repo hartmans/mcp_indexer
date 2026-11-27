@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy import event, select
-from sqlalchemy.exc import MissingGreenlet
+from sqlalchemy.exc import MissingGreenlet, StatementError
 
 from mcp_indexer.config import CollectionConfig
 from mcp_indexer.context import Context
@@ -183,8 +183,12 @@ async def test_text_column_is_deferred_in_entity_loads(test_context, tmp_path):
         ))).scalars().one()
         # Entity loads omit the deferred column; async access cannot
         # lazy-load it, so no code can silently trigger a text load.
-        with pytest.raises(MissingGreenlet):
+        with pytest.raises((MissingGreenlet, StatementError)) as exc_info:
             chunk.text
+        # SQLAlchemy 2.1 wraps the async lazy-load failure in StatementError;
+        # 2.0 exposes MissingGreenlet directly.
+        if isinstance(exc_info.value, StatementError):
+            assert isinstance(exc_info.value.orig, MissingGreenlet)
     # Column-level selects still retrieve it.
     async with test_context.session_factory() as session:
         value = (await session.execute(select(DocumentChunk.text).where(

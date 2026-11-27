@@ -14,7 +14,7 @@ dependencies = [
     "langchain",
     "langchain-openai",
     "pgvector",
-    "sqlalchemy",
+    "sqlalchemy[asyncio]",
     "psycopg[binary]",
     "PyYAML",
 ]
@@ -44,6 +44,7 @@ wikipedia = [
 test = [
     "pytest",
     "pytest-asyncio",
+    "torch",
 ]
 
 [tool.setuptools.packages.find]

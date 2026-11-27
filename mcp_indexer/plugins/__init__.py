@@ -3,5 +3,6 @@ from . import bridges
 from . import docling
 from . import images
 from . import plugin
+from . import python_document
 from . import text_document
 from . import wikipedia
