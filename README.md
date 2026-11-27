@@ -113,8 +113,23 @@ Use repeated `--config` arguments to apply deployment-specific overrides.
 
 A file source uses `type = "file"`. Its required `directory` is the corpus root.
 Optional `include` and `exclude` are lists of glob patterns, both defaulting to
-empty lists. `encoding` defaults to `"utf-8"`; `summary_length` defaults to `65536`
-and controls the source text summary size cap.
+empty lists. The `excludes_file` setting defaults to `.excludes`, read from the
+top level of the corpus directory. It contains one source-relative file path per
+line; blank lines and lines beginning with `#` are ignored. Paths are exact
+matches, and a leading `./` is optional. Absolute paths and paths that escape
+the corpus directory are errors. The excludes file itself is not indexed. Set
+`excludes_file = ""` to disable file-based exclusions (including the default
+control-file exclusion). The file may be changed by setting `excludes_file` to
+another path relative to the corpus directory.
+
+To turn a list of file-source document IDs into an excludes file, run
+`python scripts/document_ids_to_excludes.py ids.txt -o .excludes`. The script
+decodes URL-escaped paths, removes duplicates, and sorts the output. For IDs
+prefixed with a collection ID, add `--collection-id COLLECTION`; input may also
+be read from standard input by omitting `ids.txt`.
+
+`encoding` defaults to `"utf-8"`; `summary_length` defaults to `65536` and
+controls the source text summary size cap.
 
 Markdown (`.md`, `.markdown`), HTML (`.html`, `.htm`), and RST (`.rst`) have built-in
 text policies. Textual markup is preserved. Markdown and HTML use major headings
