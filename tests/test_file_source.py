@@ -8,6 +8,7 @@ from mcp_indexer.plugins.file_source import (
     FileSource, FileSourceConfig,
     MARKDOWN_POLICY, HTML_POLICY, RST_POLICY, TEXT_POLICY, extension_policy,
 )
+from mcp_indexer.plugins.base import DocumentNotFoundError
 from mcp_indexer.plugins.plugin import HANDLER_REGISTRY
 from mcp_indexer.plugins.text_document import TextDocument, split_text
 from mcp_indexer.plugins.wikipedia import WikipediaDocument
@@ -351,3 +352,65 @@ async def test_file_source_document_id_escapes_unsafe_path_characters(tmp_path, 
     pointer = await source.fetch_document(document_id)
     async with pointer.bridge.path() as resolved:
         assert resolved == weird_path
+
+
+@pytest.mark.asyncio
+async def test_excludes_file_filters_discovery_and_direct_fetch(tmp_path):
+    (tmp_path / ".excludes").write_text(
+        "# generated exclusions\nfoo/bar/baz.txt\n./foo/other.txt\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "foo" / "bar").mkdir(parents=True)
+    (tmp_path / "foo" / "bar" / "baz.txt").write_text("skip", encoding="utf-8")
+    (tmp_path / "foo" / "other.txt").write_text("skip", encoding="utf-8")
+    (tmp_path / "foo" / "keep.txt").write_text("keep", encoding="utf-8")
+    source = FileSource("col", context=None, collection_config=SimpleCfg(tmp_path))
+
+    assert {doc.document_id async for doc in source.get_documents()} == {"foo/keep.txt"}
+    with pytest.raises(DocumentNotFoundError, match="excluded"):
+        await source.fetch_document("foo/bar/baz.txt")
+    # The control file itself is not ingested.
+    with pytest.raises(DocumentNotFoundError, match="excluded"):
+        await source.fetch_document(".excludes")
+
+
+@pytest.mark.asyncio
+async def test_excludes_file_can_be_configured_or_disabled(tmp_path):
+    (tmp_path / "custom.txt").write_text("hidden", encoding="utf-8")
+    (tmp_path / "included.txt").write_text("visible", encoding="utf-8")
+    (tmp_path / "custom-excludes").write_text("custom.txt\n", encoding="utf-8")
+
+    configured = FileSource(
+        "col", context=None,
+        collection_config=SimpleCfg(tmp_path, excludes_file="custom-excludes"),
+    )
+    assert {doc.document_id async for doc in configured.get_documents()} == {"included.txt"}
+    assert ".excludes" not in {doc.document_id async for doc in configured.get_documents()}
+
+    disabled = FileSource(
+        "col", context=None,
+        collection_config=SimpleCfg(tmp_path, excludes_file=""),
+    )
+    assert {doc.document_id async for doc in disabled.get_documents()} == {
+        "custom.txt", "custom-excludes", "included.txt"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["/tmp/absolute.txt", r"C:\\absolute.txt", "../outside.txt"])
+async def test_excludes_file_rejects_absolute_and_escaping_paths(
+    tmp_path, entry
+):
+    (tmp_path / ".excludes").write_text(entry + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        FileSource("col", context=None, collection_config=SimpleCfg(tmp_path))
+
+
+def test_document_ids_to_excludes_paths_decode_and_deduplicate():
+    from scripts.document_ids_to_excludes import document_ids_to_paths
+
+    assert document_ids_to_paths([
+        "col:foo%20bar/baz.txt",
+        "./foo bar/baz.txt",
+        "other.txt",
+    ], collection_id="col") == ["foo bar/baz.txt", "other.txt"]

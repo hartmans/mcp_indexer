@@ -1,4 +1,5 @@
 import asyncio
+import ntpath
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +26,10 @@ class FileSourceConfig(BaseModel):
     directory: Path
     include: List[str] = Field(default_factory=list, description="Glob patterns to include")
     exclude: List[str] = Field(default_factory=list, description="Glob patterns to exclude")
+    excludes_file: str = Field(
+        default=".excludes",
+        description="UTF-8 file of relative document paths to exclude; empty disables it",
+    )
     encoding: str = "utf-8"
     summary_length: int = 65536
 
@@ -188,8 +193,56 @@ class FileSource(DocumentSource[P]):
         # extension-to-policy map (merged defaults and collection
         # entries) overrides per extension.
         self._extension_map = {**_EXTENSION_POLICIES, **collection_config.plugin}
+        self._excluded_paths = self._load_excluded_paths()
+
+    @staticmethod
+    def _normalize_excluded_path(value: str, *, source: str) -> str:
+        """Validate and normalize one source-relative exclusion path."""
+        if Path(value).is_absolute() or ntpath.isabs(value) or ntpath.splitdrive(value)[0]:
+            raise ValueError(f"Absolute path in {source}: {value!r}")
+        parts = []
+        for part in Path(value).parts:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not parts:
+                    raise ValueError(f"Path escapes source directory in {source}: {value!r}")
+                parts.pop()
+            else:
+                parts.append(part)
+        return Path(*parts).as_posix()
+
+    def _load_excluded_paths(self) -> set[str]:
+        configured = self.source_config.excludes_file
+        if configured == "":
+            return set()
+        if (Path(configured).is_absolute() or ntpath.isabs(configured)
+                or ntpath.splitdrive(configured)[0]):
+            raise ValueError("excludes_file must be relative to the source directory")
+
+        normalized_config = self._normalize_excluded_path(
+            configured, source="excludes_file"
+        )
+        excludes_path = self.source_config.directory / configured
+        excluded = {normalized_config}
+        try:
+            lines = excludes_path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return excluded
+        except UnicodeError as exc:
+            raise ValueError(f"Cannot decode excludes file as UTF-8: {excludes_path}") from exc
+        for line_number, line in enumerate(lines, start=1):
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            excluded.add(self._normalize_excluded_path(
+                value, source=f"{excludes_path}:{line_number}"
+            ))
+        return excluded
 
     def _is_included(self, path: Path) -> bool:
+        if path.as_posix() in self._excluded_paths:
+            return False
         if self.source_config.include:
             if not any(path.match(pattern) for pattern in self.source_config.include):
                 return False
@@ -234,11 +287,11 @@ class FileSource(DocumentSource[P]):
         root = self.source_config.directory
         self._check_root()
         for path in root.rglob("*"):
-            if path.is_file() and self._is_included(path):
+            relative_path = path.relative_to(root)
+            if path.is_file() and self._is_included(relative_path):
                 mtime = datetime.fromtimestamp(path.stat().st_mtime)
                 if last_modified is None or mtime > last_modified:
-                    relative_path = path.relative_to(root).as_posix()
-                    encoded_path = self.encode_document_path(relative_path)
+                    encoded_path = self.encode_document_path(relative_path.as_posix())
                     full_doc_id = encoded_path
                     yield await self.fetch_document(full_doc_id)
 

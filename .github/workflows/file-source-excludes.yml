@@ -1,0 +1,24 @@
+name: File source excludes
+
+on:
+  pull_request:
+    branches: [subdocs]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project and test dependencies
+        run: python -m pip install -e '.[test]' 'sqlalchemy[asyncio]'
+      - name: Test exclusions behavior
+        run: >-
+          python -m pytest tests/test_file_source.py
+          -k 'excludes_file or document_ids_to_excludes' -q
