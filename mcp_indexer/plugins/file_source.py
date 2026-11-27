@@ -18,9 +18,8 @@ class FileSourceConfig(BaseModel):
     """Base configuration for directory-based sources.
 
     Carries source-level text settings: the default encoding used by text
-    documents and Python's text fallback, plus ``summary_length``, the size
-    cap below which a document summary may be generated. Python documents
-    honor their per-file encoding declaration when parsing. b/e metadata and
+    documents and ``summary_length``, the size cap below which a document
+    summary may be generated. b/e metadata and
     chunk decoding are byte-based; everything else in the pipeline is
     char-based.
     """
@@ -179,8 +178,8 @@ class FileSource(DocumentSource[P]):
     overrides it with the collection's configured plugin entries. The
     policy's ``handler`` name picks the plugin class, resolved through
     the handler-name registry, so enumeration and direct fetch select
-    consistently. Text fallback encoding and summary length come from the
-    source config; Python parsing detects encoding per file.
+    consistently. The configured fallback encoding and summary length
+    come from the source config.
     """
     source_prefix = "file"
     safe_document_path_chars = "/-_.!@+[]()"
